@@ -7,39 +7,45 @@
   <meta name="theme-color" content="#000000" />
   <link rel="manifest" href="manifest.json" />
   <style>
-    html, body { margin:0; padding:0; width:100%; height:100%; background:#0b0b0b; color:#eaeaea; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    :root { --bg:#0b0b0b; --fg:#eaeaea; --muted:#999; --me:#2b6cb0; --other:#2d2d2d; --bubble-me:#1f6feb; --bubble-other:#202124; }
+    html, body { margin:0; padding:0; width:100%; height:100%; background:var(--bg); color:var(--fg); font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
     #app { display:flex; flex-direction:column; height:100%; }
     header { padding:12px 16px; background:#111; border-bottom:1px solid #222; }
     header h1 { margin:0; font-size:16px; }
+    #status { color:var(--muted); margin-top:4px; }
     main { flex:1; display:grid; grid-template-rows:auto 1fr auto; }
-    .controls { display:grid; grid-template-columns:1fr 1fr auto; gap:8px; padding:12px 16px; border-bottom:1px solid #222; }
-    .controls input, .controls button { padding:10px; border-radius:10px; border:1px solid #333; background:#151515; color:#eaeaea; }
+    .controls { display:grid; grid-template-columns:1fr auto; gap:8px; padding:12px 16px; border-bottom:1px solid #222; }
+    .controls input, .controls button { padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
     .controls button { cursor:pointer; }
-    .messages { overflow:auto; padding:12px 16px; }
-    .msg { margin:8px 0; padding:10px 12px; background:#141414; border:1px solid #232323; border-radius:12px; }
-    .msg small { color:#aaa; display:block; margin-top:6px; }
+    .label { font-size:12px; color:var(--muted); margin-top:-4px; grid-column:1 / span 2; }
+    .messages { overflow:auto; padding:12px 12px 4px; display:flex; flex-direction:column; gap:8px; }
+    .bubble { max-width:75%; padding:10px 12px; border-radius:16px; line-height:1.25; position:relative; word-wrap:break-word; }
+    .row { display:flex; width:100%; }
+    .me   { justify-content:flex-end; }
+    .me .bubble { background:var(--bubble-me); color:white; border-top-right-radius:6px; }
+    .other { justify-content:flex-start; }
+    .other .bubble { background:var(--bubble-other); color:#eaeaea; border-top-left-radius:6px; }
+    .meta { margin-top:4px; font-size:11px; color:#bbb; }
     .composer { display:grid; grid-template-columns:1fr auto; gap:8px; padding:12px 16px; border-top:1px solid #222; }
     .composer input, .composer button { padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
     footer { padding:8px 16px; font-size:12px; color:#999; border-top:1px solid #222; }
-    .muted { color:#7a7a7a; }
-    .keybox { margin-top:8px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; }
+    .keyhint { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#a7b; overflow-wrap:anywhere; }
   </style>
 </head>
 <body>
   <div id="app">
     <header>
       <h1>WS Messenger</h1>
-      <div id="status" class="muted">Not connected</div>
-      <div id="keys" class="keybox"></div>
+      <div id="status">Not connected</div>
     </header>
 
     <main>
       <div class="controls">
-        <input id="roomId" placeholder="Room ID (base64url public key)" />
-        <input id="privateKey" placeholder="Private key (base64url) — keep secret" />
+        <input id="secretKey" placeholder="Secret room key (share to invite) — base64url" />
         <button id="btnJoin">Join</button>
-        <input id="nickname" placeholder="Nickname (optional, plaintext)" style="grid-column:1 / span 2" />
-        <button id="btnCreate" style="grid-column:3">Create Room</button>
+        <div class="label">This single secret is enough. The app derives the room ID (public key) automatically.</div>
+        <input id="nickname" placeholder="Nickname (optional, plaintext)" />
+        <button id="btnCreate">New Secret</button>
       </div>
 
       <div id="messages" class="messages"></div>
@@ -51,13 +57,13 @@
     </main>
 
     <footer>
-      This PWA caches assets for offline install. Encrypted with libsodium sealed boxes. Server relays/stores ciphertext only.
+      Installable PWA. E2E via sealed boxes. Identity bubbles are based on a device key stored locally.
+      <div id="identityInfo" class="keyhint"></div>
     </footer>
   </div>
 
-  <!-- libsodium (cached by SW) -->
   <script src="vendor/sodium/sodium.js"></script>
-
+  
   <script type="module">
     fetch('./manifest.json')
       .then(r => r.json())
@@ -73,9 +79,7 @@
 
   <script>
     if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').then(() => {
-        console.log('Service Worker Registered');
-      });
+      navigator.serviceWorker.register('sw.js').then(() => console.log('Service Worker Registered'));
     }
   </script>
 </body>

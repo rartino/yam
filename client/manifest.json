@@ -1,6 +1,6 @@
 {
   "name": "WS Messenger",
-  "short_name": "SecMsg",
+  "short_name": "WSMessenger",
   "start_url": ".",
   "display": "standalone",
   "background_color": "#000000",
@@ -9,5 +9,5 @@
     { "src": "android-chrome-192x192.png", "sizes": "192x192", "type": "image/png" },
     { "src": "android-chrome-512x512.png", "sizes": "512x512", "type": "image/png" }
   ],
-  "version": "0.1.0"
+  "version": "0.2.0"
 }

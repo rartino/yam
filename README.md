@@ -12,7 +12,7 @@ pip install -r requirements.txt
 python server.py
 ```
 
-Server listens on `http://localhost:5000` and exposes `ws://localhost:5000/ws`.
+Server listens on `http://localhost:8080` and exposes `ws://localhost:8080/ws`.
 
 2. **Client**
 
