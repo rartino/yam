@@ -1,4 +1,8 @@
 /* global sodium */
+
+const RELAY_HTTP_BASE = 'https://rartino.pythonanywhere.com';
+const RELAY_WS_URL    = RELAY_HTTP_BASE.replace(/^http/, 'ws') + '/ws';
+
 const ui = {
   status: document.getElementById('status'),
   keys: document.getElementById('keys'),
@@ -60,7 +64,7 @@ async function createRoom() {
   `;
 
   // Register room on the relay (stores only public key)
-  const res = await fetch('/rooms', {
+  const res = await fetch(`${RELAY_HTTP_BASE}/rooms`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ room_id: roomId, ed25519_public_key_b64u: roomId })
   });
@@ -80,9 +84,7 @@ async function joinRoom() {
   currentRoomId = roomId;
 
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${proto}//${location.host}/ws?room=${encodeURIComponent(roomId)}`;
-
-  if (ws) { try { ws.close(); } catch (_) {} }
+  const wsUrl = `${RELAY_WS_URL}?room=${encodeURIComponent(roomId)}`;
   ws = new WebSocket(wsUrl);
 
   ws.onopen = () => { setStatus('Connecting…'); };

@@ -56,10 +56,9 @@
   </div>
 
   <!-- libsodium (cached by SW) -->
-  <script src="https://cdn.jsdelivr.net/npm/libsodium-wrappers-sumo@0.7.13/dist/libsodium-wrappers.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/libsodium-wrappers@0.7.13/dist/modules/libsodium-wrappers.min.js" integrity="sha256-YLfTWRTAK+9mqajfSPB2vBLLaNEJpo2Mr3yaip+h2eQ=" crossorigin="anonymous"></script>
 
   <script type="module">
-    // Load versioned client script like your game did
     fetch('./manifest.json')
       .then(r => r.json())
       .then(manifest => {

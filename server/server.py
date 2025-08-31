@@ -7,12 +7,15 @@ from urllib.parse import urlparse, parse_qs
 
 from flask import Flask, request, jsonify, send_from_directory
 from flask_sock import Sock
+from flask_cors import CORS
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 from nacl import utils
 
 APP = Flask(__name__, static_folder=None)
+app = APP
 SOCK = Sock(APP)
+CORS(APP, resources={r"/rooms": {"origins": ["https://rickard.armiento.se/wsmessenger"]}})
 DB_PATH = os.path.join(os.path.dirname(__file__), 'messages.db')
 
 # --- Database helpers ---
