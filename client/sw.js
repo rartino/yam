@@ -14,7 +14,7 @@ fetch('./manifest.json')
       './offline.html',
       './android-chrome-192x192.png',
       './android-chrome-512x512.png',
-      'https://cdn.jsdelivr.net/npm/libsodium-wrappers-sumo@0.7.13/dist/libsodium-wrappers.js'
+      './vendor/sodium/sodium.js'
     ];
 
     self.addEventListener('install', event => {
