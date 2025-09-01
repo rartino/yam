@@ -1,5 +1,3 @@
-/* global sodium */
-// === Relay config (update to your domain) ===
 const RELAY_HTTP_BASE = 'https://rartino.pythonanywhere.com';
 const RELAY_WS_URL    = RELAY_HTTP_BASE.replace(/^http/, 'ws') + '/ws';
 const SETTINGS_KEY = 'secmsg_settings_v1';
@@ -64,7 +62,10 @@ function clearMessagesUI() {
 }
 
 function scrollToEnd() {
-  ui.messages.scrollTop = ui.messages.scrollHeight;
+  const el = ui.messages;
+  requestAnimationFrame(() => {
+    requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
+  });
 }
 
 function renderMessage({ text, ts, nickname, senderId, verified }) {
@@ -91,7 +92,6 @@ function renderMessage({ text, ts, nickname, senderId, verified }) {
   row.appendChild(wrap);
 
   ui.messages.appendChild(row);
-  ui.messages.scrollTop = ui.messages.scrollHeight;
 
   scrollToEnd();
 }
@@ -184,8 +184,7 @@ async function connectFromSettings() {
 
       // Request last 7 days
       ws.send(JSON.stringify({ type: 'history', since: sevenDaysAgoMs() }));
-
-      requestAnimationFrame(scrollToEnd);
+      requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
 
       // Heartbeat every 25s to keep proxies from idling us out
       if (heartbeatTimer) clearInterval(heartbeatTimer);
@@ -196,6 +195,7 @@ async function connectFromSettings() {
     } else if (m.type === 'history') {
        for (const item of m.messages) handleIncoming(item);
        scrollToEnd();
+       requestAnimationFrame(scrollToEnd);
 
     } else if (m.type === 'message') {
       handleIncoming(m);

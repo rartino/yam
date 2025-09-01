@@ -31,7 +31,7 @@
       overflow: hidden; /* prevent the page/body from scrolling */
       flex:1;
       display:grid;
-      grid-template-rows:auto 1fr auto;
+      grid-template-rows: 1fr auto; /* messages grows, composer sits at bottom */
     }
     .controls { display:grid; grid-template-columns:1fr auto; gap:8px; padding:12px 16px; border-bottom:1px solid #222; }
     .controls input, .controls button { padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
@@ -48,7 +48,15 @@
     .other { justify-content:flex-start; }
     .other .bubble { background:var(--bubble-other); color:#eaeaea; border-top-left-radius:6px; }
     .meta { margin-top:4px; font-size:11px; color:#bbb; }
-    .composer { position: sticky; bottom: 0; background: #0b0b0b; padding-bottom: max(12px, env(safe-area-inset-bottom)); }
+    .composer{
+      display:grid;
+      grid-template-columns: 1fr auto;
+      gap:8px;
+      background:#0b0b0b;
+      padding:12px 16px;
+      border-top:1px solid #222;
+      padding-bottom: max(12px, env(safe-area-inset-bottom));
+    }
     .composer input, .composer button { padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
     footer { padding:8px 16px; font-size:12px; color:#999; border-top:1px solid #222; }
     .keyhint { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#a7b; overflow-wrap:anywhere; }
