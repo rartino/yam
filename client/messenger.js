@@ -352,7 +352,6 @@ function handleIncoming(m) {
       const sig = fromB64u(m.sig);
       const ciphertext = fromB64u(m.ciphertext);
       verified = sodium.crypto_sign_verify_detached(sig, ciphertext, senderPk);
-      if (m.sender_id && m.sender_id === myPeerId) { if (DEBUG_SIG) dbg('SIG/RX', 'echo-drop', { sender: m.sender_id }); return; }
     } catch { verified = false; }
   }
 
