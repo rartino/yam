@@ -6,6 +6,7 @@ from urllib.parse import parse_qs
 
 from flask import Flask, request, jsonify
 from flask_sock import Sock
+from flask_cors import CORS
 from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 from nacl import utils
@@ -189,7 +190,7 @@ def ws_handler(ws):
         broadcast(room_id, {
           'type': 'message', 'ts': ts, 'nickname': nickname,
           'sender_id': sender_id_b64u, 'sig': sig_b64u, 'ciphertext': ciph_b64u
-        })
+        }, exclude=ws)
 
       elif t == 'ping':
         ws.send(json.dumps({"type": "pong", "ts": now_ms()}))

@@ -4,7 +4,12 @@
 const RELAY_HTTP_BASE = 'https://rartino.pythonanywhere.com';
 const RELAY_WS_URL    = RELAY_HTTP_BASE.replace(/^http/, 'ws') + '/ws';
 const SETTINGS_KEY = 'secmsg_settings_v1';
-const RTC_CONFIG = { iceServers: [{ urls: ['stun:stun.l.google.com:19302'] }] };
+const RTC_CONFIG = {
+  iceServers: [
+    { urls: ['stun:stun.l.google.com:19302'] },
+    // { urls: 'turn:your.turn.server:3478', username: 'user', credential: 'pass' }
+  ]
+};
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks for file send
 
 //
@@ -120,6 +125,19 @@ async function sha256_b64u(blob) {
   const digest = await crypto.subtle.digest('SHA-256', buf);
   const bytes = new Uint8Array(digest);
   return b64u(bytes);
+}
+
+function iceToJSON(c) {
+  if (!c) return null;
+  // Some browsers support .toJSON(); otherwise pick the fields we need
+  return typeof c.toJSON === 'function'
+    ? c.toJSON()
+    : {
+        candidate: c.candidate,
+        sdpMid: c.sdpMid,
+        sdpMLineIndex: c.sdpMLineIndex,
+        usernameFragment: c.usernameFragment
+      };
 }
 
 // ====== Identity & Settings ======
@@ -269,6 +287,13 @@ async function sendTextMessage(text) {
     sig: signCiphertextB64(ciphertextB64),
   };
   ws.send(JSON.stringify(payload));
+  renderTextMessage({
+    text,
+    ts: nowMs(),
+    nickname: SETTINGS.username || undefined,
+    senderId: myPeerId,
+    verified: true
+  });
 }
 
 async function sendFileMetadata(meta) {
@@ -294,6 +319,7 @@ function handleIncoming(m) {
       const sig = fromB64u(m.sig);
       const ciphertext = fromB64u(m.ciphertext);
       verified = sodium.crypto_sign_verify_detached(sig, ciphertext, senderPk);
+      if (m.sender_id && m.sender_id === myPeerId) return;
     } catch { verified = false; }
   }
 
@@ -358,16 +384,21 @@ async function requestFile(hash) {
   };
 
   pc.onicecandidate = (e) => {
-    if (e.candidate && state.remotePeerId) {
+    const cand = iceToJSON(e.candidate);
+    if (!cand) return; // ignore null end-of-candidates
+    if (state.remotePeerId) {
       ws.send(JSON.stringify({
-        type: 'webrtc-ice', request_id: reqId,
-        candidate: e.candidate, to: state.remotePeerId, from: myPeerId
+          type: 'webrtc-ice',
+          request_id: reqId,
+          candidate: cand,
+          to: state.remotePeerId,
+	  from: myPeerId
       }));
-    } else if (e.candidate && !state.remotePeerId) {
-      state.iceBuf.push(e.candidate);
+    } else {
+	state.iceBuf.push(cand);
     }
   };
-
+    
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
 
@@ -424,13 +455,17 @@ async function serveFileIfWeHaveIt(msg) {
   };
 
   pc.onicecandidate = (e) => {
-    if (e.candidate) {
+    const cand = iceToJSON(e.candidate);
+    if (!cand) return;
       ws.send(JSON.stringify({
-        type: 'webrtc-ice', request_id, candidate: e.candidate, to: from, from: myPeerId
-      }));
-    }
+      type: 'webrtc-ice',
+      request_id,
+      candidate: cand,
+      to: from,
+      from: myPeerId
+    }));
   };
-
+    
   await pc.setRemoteDescription(offer);
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
@@ -459,12 +494,12 @@ async function handleWebRtcResponse(msg) {
 
 async function handleWebRtcIce(msg) {
   const { request_id, candidate } = msg;
+  if (!candidate) return;
+  const ice = new RTCIceCandidate(candidate);
   if (pendingRequests.has(request_id)) {
-    const st = pendingRequests.get(request_id);
-    try { await st.pc.addIceCandidate(candidate); } catch {}
+    try { await pendingRequests.get(request_id).pc.addIceCandidate(ice); } catch {}
   } else if (serveRequests.has(request_id)) {
-    const st = serveRequests.get(request_id);
-    try { await st.pc.addIceCandidate(candidate); } catch {}
+    try { await serveRequests.get(request_id).pc.addIceCandidate(ice); } catch {}
   }
 }
 
