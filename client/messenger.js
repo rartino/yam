@@ -326,13 +326,6 @@ async function sendTextMessage(text) {
   };
   if (DEBUG_SIG) dbg('SIG/TX', 'send:text', { len: text.length });
   ws.send(JSON.stringify(payload));
-  renderTextMessage({
-    text,
-    ts: nowMs(),
-    nickname: SETTINGS.username || undefined,
-    senderId: myPeerId,
-    verified: true
-  });
 }
 
 async function sendFileMetadata(meta) {
@@ -366,17 +359,21 @@ function handleIncoming(m) {
   // Try parse JSON
   try {
     const obj = JSON.parse(pt);
-    if (obj && obj.kind === 'file' && obj.hash) {
-      const bubble = fileBubbleSkeleton({ meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
-      // If we have it → render; otherwise start P2P request
-      renderFileIfAvailable(bubble, obj).then((hasIt) => {
-        if (!hasIt) requestFile(obj.hash);
-        else scrollToEnd();
-      });
+      if (obj && obj.kind === 'file' && obj.hash) {
+	const bubble = fileBubbleSkeleton({ meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
+	renderFileIfAvailable(bubble, obj).then((hasIt) => {
+	  if (!hasIt) {
+	    // show pending + allow manual retry, and also auto-request
+	    showPendingBubble(bubble, obj);
+	    requestFile(obj.hash);
+	  } else {
+	    scrollToEnd();
+	  }
+	});
       return;
     }
   } catch (_) { /* not JSON */ }
-
+    
   // Plain text
   renderTextMessage({ text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
 }
@@ -656,6 +653,35 @@ function scheduleReconnect() {
   reconnectTimer = setTimeout(() => connectFromSettings(), delay);
 }
 
+function showPendingBubble(bubbleEl, meta) {
+  bubbleEl.innerHTML = '';
+  const wrap = document.createElement('div'); wrap.className = 'pending';
+
+  const label = document.createElement('span');
+  label.textContent = meta.mime && meta.mime.startsWith('image/') ? 'Image pending…' : 'File pending…';
+
+  const btn = document.createElement('button');
+  btn.className = 'retry-btn'; btn.type = 'button'; btn.title = 'Retry';
+  btn.innerHTML = `
+    <svg class="retry-icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+      <path d="M12 5v2.5l3.5-3.5L12 0.5V3a9 9 0 1 0 9 9h-2a7 7 0 1 1-7-7z"/>
+    </svg>
+  `;
+
+  btn.addEventListener('click', async () => {
+    // Try local again first (maybe IDB finished opening)
+    const ok = await renderFileIfAvailable(bubbleEl, meta);
+    if (!ok) {
+      if (DEBUG_SIG) dbg('PENDING', 'retry request', { hash: meta.hash });
+      requestFile(meta.hash);
+    }
+  });
+
+  wrap.appendChild(label);
+  wrap.appendChild(btn);
+  bubbleEl.appendChild(wrap);
+}
+
 // ====== Events ======
 ui.btnSend.addEventListener('click', async () => {
   const text = ui.msgInput.value.trim();
@@ -679,17 +705,12 @@ ui.fileInput.addEventListener('change', async (e) => {
   if (!ws || ws.readyState !== WebSocket.OPEN || !authed) { alert('Not connected'); return; }
 
   const hash = await sha256_b64u(file);
-  // Store locally before sending metadata (so we can serve others immediately)
+  // Store locally first so we can serve others and render on echo/history
   await idbPut(hash, file);
 
   const meta = { hash, name: file.name, mime: file.type || 'application/octet-stream', size: file.size|0 };
   await sendFileMetadata(meta);
-
-  // Optional: show your own bubble immediately
-  const bubble = fileBubbleSkeleton({ meta, ts: nowMs(), nickname: SETTINGS.username, senderId: myPeerId, verified: true });
-  await renderFileIfAvailable(bubble, meta);
-  scrollToEnd();
-
+    
   // clear file input
   ui.fileInput.value = '';
 });

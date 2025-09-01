@@ -202,7 +202,7 @@ def ws_handler(ws):
             'type': 'message',
             'ts': ts, 'nickname': nickname,
             'sender_id': sender_id_b64u, 'sig': sig_b64u, 'ciphertext': ciph_b64u
-        }, exclude=ws)
+        })
         LOG("send", "room=", room_id, "bytes=", len(ciphertext), "fanout=", sent)
 
       elif t == 'ping':
