@@ -2,6 +2,8 @@
 // === Relay config (update to your domain) ===
 const RELAY_HTTP_BASE = 'https://rartino.pythonanywhere.com';
 const RELAY_WS_URL    = RELAY_HTTP_BASE.replace(/^http/, 'ws') + '/ws';
+const SETTINGS_KEY = 'secmsg_settings_v1';
+let SETTINGS = { username: '', roomSkB64: '' };
 
 const ui = {
   status: document.getElementById('status'),
@@ -13,6 +15,17 @@ const ui = {
   msgInput: document.getElementById('messageInput'),
   btnSend: document.getElementById('btnSend'),
   identityInfo: document.getElementById('identityInfo'),
+};
+
+ui.btnSettings = document.getElementById('btnSettings');
+
+const dlg = document.getElementById('settingsModal');
+const f = {
+  name: document.getElementById('setName'),
+  room: document.getElementById('setRoomCode'),
+  gen: document.getElementById('btnGenRoom'),
+  save: document.getElementById('btnSaveSettings'),
+  cancel: document.getElementById('btnCancelSettings'),
 };
 
 let ws = null;
@@ -33,24 +46,37 @@ function nowMs() { return Date.now(); }
 function sevenDaysAgoMs() { return nowMs() - 7 * 24 * 60 * 60 * 1000; }
 function setStatus(text) { ui.status.textContent = text; }
 
+function loadSettings() {
+  try { SETTINGS = { ...SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; }
+  catch {}
+}
+function saveSettings() {
+  localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETTINGS));
+}
+
 function renderMessage({ text, ts, nickname, senderId, verified }) {
   const row = document.createElement('div');
   const isMe = senderId && myIdPk && senderId === b64u(myIdPk);
   row.className = 'row ' + (isMe ? 'me' : 'other');
 
+  const who = nickname || (senderId ? shortId(senderId) : 'room');
+  const when = new Date(ts || nowMs()).toLocaleString();
+
+  const wrap = document.createElement('div');
+  wrap.className = 'wrap';
+
+  const label = document.createElement('div');
+  label.className = 'name-label';
+  label.textContent = `${who} • ${when}${verified === false ? ' • ⚠︎ unverified' : ''}`;
+
   const bubble = document.createElement('div');
   bubble.className = 'bubble';
   bubble.textContent = text;
 
-  const meta = document.createElement('div');
-  meta.className = 'meta';
-  const when = new Date(ts || nowMs()).toLocaleString();
-  const who = nickname || (senderId ? shortId(senderId) : 'room');
-  meta.textContent = `${who} • ${when}${verified === false ? ' • ⚠︎ unverified' : ''}`;
+  wrap.appendChild(label);
+  wrap.appendChild(bubble);
+  row.appendChild(wrap);
 
-  bubble.appendChild(document.createElement('br'));
-  bubble.appendChild(meta);
-  row.appendChild(bubble);
   ui.messages.appendChild(row);
   ui.messages.scrollTop = ui.messages.scrollHeight;
 }
@@ -73,62 +99,45 @@ function persistIdentity() {
   ui.identityInfo.textContent = `Your device ID: ${shortId(b64u(myIdPk))} (stored locally)`;
 }
 
-async function ensureIdentity() {
-  await ensureSodium();
-  const pk = localStorage.getItem('secmsg_id_pk');
-  const sk = localStorage.getItem('secmsg_id_sk');
-  if (pk && sk) {
-    myIdPk = fromB64u(pk); myIdSk = fromB64u(sk);
-  } else {
-    const pair = sodium.crypto_sign_keypair();
-    myIdPk = pair.publicKey; myIdSk = pair.privateKey;
-    persistIdentity();
-  }
-  ui.identityInfo.textContent = `Your device ID: ${shortId(b64u(myIdPk))} (stored locally)`;
+function rotateIdentityWithName(newName) {
+  const pair = sodium.crypto_sign_keypair();
+  myIdPk = pair.publicKey; myIdSk = pair.privateKey;
+  SETTINGS.username = newName.trim();
+  saveSettings();
+  localStorage.setItem('secmsg_id_pk', b64u(myIdPk));
+  localStorage.setItem('secmsg_id_sk', b64u(myIdSk));
 }
 
-async function createRoom() {
-  await ensureSodium();
-  const { publicKey, privateKey } = sodium.crypto_sign_keypair();
-  edPk = publicKey; edSk = privateKey;
+function setRoomFromSecret(skB64) {
+  edSk = fromB64u(skB64);
+  edPk = derivePubFromSk(edSk);
   curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(edPk);
   curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(edSk);
   currentRoomId = b64u(edPk);
+}
 
-  // Show the single secret to user
-  ui.secretKey.value = b64u(edSk);
-
-  // Register room (server stores only the public key)
+async function registerRoomIfNeeded() {
   try {
     await fetch(`${RELAY_HTTP_BASE}/rooms`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ room_id: currentRoomId, ed25519_public_key_b64u: currentRoomId })
     });
-  } catch (e) {
-    // non-fatal
-  }
+  } catch {}
 }
 
-async function joinWithSecret() {
+async function connectFromSettings() {
+  if (!SETTINGS.roomSkB64) return;
   await ensureSodium();
-  const skStr = ui.secretKey.value.trim();
-  if (!skStr) { alert('Paste the secret room key'); return; }
-  edSk = fromB64u(skStr);
-  edPk = derivePubFromSk(edSk);
-  curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(edPk);
-  curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(edSk);
-  currentRoomId = b64u(edPk);
+  setRoomFromSecret(SETTINGS.roomSkB64);
 
-  // Connect WS
-  const wsUrl = `${RELAY_WS_URL}?room=${encodeURIComponent(currentRoomId)}`;
   if (ws) { try { ws.close(); } catch(_){} }
-  ws = new WebSocket(wsUrl);
+  ws = new WebSocket(`${RELAY_WS_URL}?room=${encodeURIComponent(currentRoomId)}`);
 
-  ws.onopen = () => setStatus('Connecting…');
+  ws.onopen  = () => setStatus('Connecting…');
   ws.onerror = () => setStatus('WebSocket error');
   ws.onclose = () => { setStatus('Disconnected'); authed = false; };
 
-  ws.onmessage = async (evt) => {
+  ws.onmessage = (evt) => {
     const m = JSON.parse(evt.data);
     if (m.type === 'challenge') {
       const nonce = fromB64u(m.nonce);
@@ -145,6 +154,17 @@ async function joinWithSecret() {
       renderMessage({ text: `Server error: ${m.error}`, ts: nowMs(), nickname: 'server' });
     }
   };
+}
+
+async function ensureIdentity() {
+  await ensureSodium();
+  const pk = localStorage.getItem('secmsg_id_pk');
+  const sk = localStorage.getItem('secmsg_id_sk');
+  if (pk && sk) {
+    myIdPk = fromB64u(pk); myIdSk = fromB64u(sk);
+  } else {
+    rotateIdentityWithName(SETTINGS.username || 'Me');
+  }
 }
 
 function decryptToString(cipherB64u) {
@@ -184,18 +204,63 @@ async function sendMessage() {
     type: 'send',
     ciphertext: ciphertextB64,
     ts_client: nowMs(),
-    nickname: ui.nickname.value.trim() || undefined,
+    nickname: SETTINGS.username || undefined,
     sender_id: b64u(myIdPk),
     sig: b64u(sig)
   };
+
   ws.send(JSON.stringify(payload));
   ui.msgInput.value = '';
 }
 
-ui.btnCreate.addEventListener('click', createRoom);
-ui.btnJoin.addEventListener('click', joinWithSecret);
+ui.btnSettings.addEventListener('click', () => {
+  f.name.value = SETTINGS.username || '';
+  f.room.value = SETTINGS.roomSkB64 || '';
+  dlg.showModal();
+});
+
+f.gen.addEventListener('click', async () => {
+  await ensureSodium();
+  const { privateKey } = sodium.crypto_sign_keypair();
+  f.room.value = b64u(privateKey);
+});
+
+f.save.addEventListener('click', async () => {
+  const newName = (f.name.value || '').trim() || 'Me';
+  const newRoomSk = (f.room.value || '').trim();
+
+  if (!newRoomSk) { alert('Room code is required.'); return; }
+
+  // Enforce: changing name rotates identity
+  if ((SETTINGS.username || '') !== newName) {
+    await ensureSodium();
+    rotateIdentityWithName(newName);
+  }
+
+  const roomChanged = SETTINGS.roomSkB64 !== newRoomSk;
+  SETTINGS.roomSkB64 = newRoomSk;
+  saveSettings();
+
+  dlg.close();
+
+  await ensureSodium();
+  setRoomFromSecret(SETTINGS.roomSkB64);
+  if (roomChanged) await registerRoomIfNeeded();
+  connectFromSettings();
+});
+
+f.cancel.addEventListener('click', () => dlg.close());
 ui.btnSend.addEventListener('click', sendMessage);
 ui.msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 
+loadSettings();
 await ensureIdentity();
 setStatus('Ready');
+
+if (SETTINGS.roomSkB64) {
+  await registerRoomIfNeeded(); // harmless if already exists
+  connectFromSettings();
+} else {
+  // first run: prompt user to fill Name + Room code (or Generate)
+  dlg.showModal();
+}
