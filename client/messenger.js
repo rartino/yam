@@ -65,6 +65,8 @@ let myPeerId = null; // base64url of myIdPk
 // WebRTC maps
 const pendingRequests = new Map(); // request_id -> { pc, dc, hash, remotePeerId?, iceBuf? }
 const serveRequests   = new Map(); // request_id -> { pc, dc, hash } (we are sender)
+const preServeIce     = new Map(); // request_id -> RTCIceCandidateInit[]
+
 
 // ====== UTIL ======
 function b64u(bytes) { return sodium.to_base64(bytes, sodium.base64_variants.URLSAFE_NO_PADDING); }
@@ -422,31 +424,42 @@ async function serveFileIfWeHaveIt(msg) {
 
   const pc = new RTCPeerConnection(RTC_CONFIG);
 
+  // Register EARLY so incoming ICE has somewhere to land
+  serveRequests.set(request_id, { pc, hash: checksum, iceBuf: [] });
+
   pc.ondatachannel = (evt) => {
     const dc = evt.channel;
     dc.binaryType = 'arraybuffer';
+
     dc.onopen = async () => {
       if (DEBUG_RTC) dbg('RTC/RESP', 'dc open', { request_id });
-      const header = { kind: 'file', name: blob.name || 'file', mime: blob.type || 'application/octet-stream', size: blob.size || blob.size, hash: checksum };
+
+      // Header first
+      const header = { kind: 'file', name: blob.name || 'file', mime: blob.type || 'application/octet-stream', size: blob.size, hash: checksum };
       dc.send(new TextEncoder().encode(JSON.stringify(header)));
 
-      const reader = blob.stream().getReader();
-      let sent = 0;
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (value.byteLength <= CHUNK_SIZE) dc.send(value);
-        else for (let i = 0; i < value.byteLength; i += CHUNK_SIZE) dc.send(value.slice(i, i + CHUNK_SIZE));
-        sent += value.byteLength;
-        if (DEBUG_RTC && sent % (512*1024) < CHUNK_SIZE) dbg('RTC/RESP', 'sent', { request_id, sent, size: blob.size });
-        while (dc.bufferedAmount > 8 * CHUNK_SIZE) await new Promise(r => setTimeout(r, 10));
+      // Send file by slices (compat > streams)
+      const total = blob.size | 0;
+      for (let offset = 0; offset < total; offset += CHUNK_SIZE) {
+        const slice = blob.slice(offset, Math.min(offset + CHUNK_SIZE, total));
+        const buf = new Uint8Array(await slice.arrayBuffer());
+        dc.send(buf);
+
+        if (DEBUG_RTC && (offset % (512 * 1024)) === 0) {
+          dbg('RTC/RESP', 'sent', { request_id, offset, total });
+        }
+        while (dc.bufferedAmount > 8 * CHUNK_SIZE) {
+          await new Promise(r => setTimeout(r, 10));
+        }
       }
-      if (DEBUG_RTC) dbg('RTC/RESP', 'complete', { request_id, sent });
+
+      if (DEBUG_RTC) dbg('RTC/RESP', 'complete', { request_id, total });
 
       try { dc.close(); } catch {}
       try { pc.close(); } catch {}
       serveRequests.delete(request_id);
     };
+
     dc.onclose = () => { if (DEBUG_RTC) dbg('RTC/RESP', 'dc close', { request_id }); };
     dc.onerror = (e) => { if (DEBUG_RTC) dbg('RTC/RESP', 'dc error', { request_id, e }); };
   };
@@ -458,15 +471,27 @@ async function serveFileIfWeHaveIt(msg) {
     ws.send(JSON.stringify({ type: 'webrtc-ice', request_id, candidate: cand, to: from, from: myPeerId }));
   };
 
+  // Apply remote offer
   await pc.setRemoteDescription(offer);
+  if (DEBUG_RTC) dbg('RTC/RESP', 'offer applied', { request_id });
+
+  // Flush any ICE that arrived before we were ready
+  const buffered = preServeIce.get(request_id);
+  if (buffered && buffered.length) {
+    if (DEBUG_RTC) dbg('RTC/RESP', 'flush buffered ICE', { request_id, count: buffered.length });
+    for (const cand of buffered) {
+      try { await pc.addIceCandidate(new RTCIceCandidate(cand)); } catch (e) { if (DEBUG_RTC) dbg('RTC/RESP', 'flush addIce error', e); }
+    }
+    preServeIce.delete(request_id);
+  }
+
+  // Create/send answer
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
   if (DEBUG_RTC) dbg('RTC/RESP', 'answer created', { request_id, sdpLen: (answer.sdp||'').length });
 
-  serveRequests.set(request_id, { pc, hash: checksum });
-
-  if (DEBUG_SIG) dbg('SIG/TX', 'webrtc-response', { request_id, to: from, sdpLen: (answer.sdp||'').length });
   ws.send(JSON.stringify({ type: 'webrtc-response', request_id, answer, to: from, from: myPeerId, checksum }));
+  if (DEBUG_SIG) dbg('SIG/TX', 'webrtc-response', { request_id, to: from, sdpLen: (answer.sdp||'').length });
 }
 
 async function handleWebRtcResponse(msg) {
@@ -488,15 +513,27 @@ async function handleWebRtcResponse(msg) {
 async function handleWebRtcIce(msg) {
   const { request_id, candidate, from } = msg;
   if (!candidate) return;
-  const ice = new RTCIceCandidate(candidate);
+  const iceInit = candidate;                       // already JSON
+  const ice = new RTCIceCandidate(iceInit);
+
   if (pendingRequests.has(request_id)) {
-    if (DEBUG_SIG) dbg('SIG/RX', 'ice to requester', { request_id, from, mid: candidate.sdpMid, mline: candidate.sdpMLineIndex });
-    try { await pendingRequests.get(request_id).pc.addIceCandidate(ice); } catch (e) { if (DEBUG_RTC) dbg('RTC/REQ', 'addIce error', e); }
+    // We are the requester
+    if (DEBUG_SIG) dbg('SIG/RX', 'ice to requester', { request_id, from, mid: iceInit.sdpMid, mline: iceInit.sdpMLineIndex });
+    try { await pendingRequests.get(request_id).pc.addIceCandidate(ice); }
+    catch (e) { if (DEBUG_RTC) dbg('RTC/REQ', 'addIce error', e); }
+
   } else if (serveRequests.has(request_id)) {
-    if (DEBUG_SIG) dbg('SIG/RX', 'ice to responder', { request_id, from, mid: candidate.sdpMid, mline: candidate.sdpMLineIndex });
-    try { await serveRequests.get(request_id).pc.addIceCandidate(ice); } catch (e) { if (DEBUG_RTC) dbg('RTC/RESP', 'addIce error', e); }
+    // We are the responder and already set up
+    if (DEBUG_SIG) dbg('SIG/RX', 'ice to responder', { request_id, from, mid: iceInit.sdpMid, mline: iceInit.sdpMLineIndex });
+    try { await serveRequests.get(request_id).pc.addIceCandidate(ice); }
+    catch (e) { if (DEBUG_RTC) dbg('RTC/RESP', 'addIce error', e); }
+
   } else {
-    if (DEBUG_SIG) dbg('SIG/RX', 'ice orphan', { request_id });
+    // Not ready yet -> buffer it
+    const arr = preServeIce.get(request_id) || [];
+    arr.push(iceInit);
+    preServeIce.set(request_id, arr);
+    if (DEBUG_SIG) dbg('SIG/RX', 'ice buffered (no serve)', { request_id, count: arr.length });
   }
 }
 
