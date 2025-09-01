@@ -91,6 +91,39 @@ function scrollToEnd() {
 
 function clearMessagesUI() { ui.messages.innerHTML = ''; }
 
+
+// Wait until all queued bytes have left the datachannel, or timeout
+async function waitForDrain(dc, { settleMs = 200, timeoutMs = 5000 } = {}) {
+  if (!dc || dc.readyState !== 'open') return;
+  return new Promise((resolve) => {
+    let done = false;
+    const start = performance.now();
+
+    function maybeDone() {
+      if (done) return;
+      if (dc.readyState !== 'open') { done = true; return resolve(); }
+      if (dc.bufferedAmount === 0) {
+        // give the network a short settle period to ship the last packets
+        setTimeout(() => { done = true; resolve(); }, settleMs);
+      } else if (performance.now() - start > timeoutMs) {
+        done = true; resolve();
+      } else {
+        // wait for next low-watermark or poll again
+        // (some browsers don’t always fire 'bufferedamountlow')
+        setTimeout(maybeDone, 50);
+      }
+    }
+
+    // Use low-watermark event when available
+    try {
+      dc.bufferedAmountLowThreshold = Math.max(16384, CHUNK_SIZE >> 2);
+      const onLow = () => maybeDone();
+      dc.addEventListener('bufferedamountlow', onLow, { once: true });
+    } catch {}
+    maybeDone();
+  });
+}
+
 // ====== IndexedDB (files by hash) ======
 const DB_NAME = 'secmsg_files_db';
 const STORE = 'files';
@@ -441,17 +474,20 @@ async function serveFileIfWeHaveIt(msg) {
       // Send file by slices (compat > streams)
       const total = blob.size | 0;
       for (let offset = 0; offset < total; offset += CHUNK_SIZE) {
-        const slice = blob.slice(offset, Math.min(offset + CHUNK_SIZE, total));
-        const buf = new Uint8Array(await slice.arrayBuffer());
-        dc.send(buf);
+	const slice = blob.slice(offset, Math.min(offset + CHUNK_SIZE, total));
+	const buf = new Uint8Array(await slice.arrayBuffer());
+	dc.send(buf);
 
-        if (DEBUG_RTC && (offset % (512 * 1024)) === 0) {
-          dbg('RTC/RESP', 'sent', { request_id, offset, total });
-        }
-        while (dc.bufferedAmount > 8 * CHUNK_SIZE) {
-          await new Promise(r => setTimeout(r, 10));
-        }
+	if (DEBUG_RTC && (offset % (512 * 1024)) === 0) dbg('RTC/RESP', 'sent', { request_id, offset, total });
+
+	// Backpressure: keep the send queue bounded
+	while (dc.bufferedAmount > 8 * CHUNK_SIZE && dc.readyState === 'open') {
+	  await new Promise(r => setTimeout(r, 10));
+	}
       }
+
+      // *** NEW: wait for the channel buffer to drain before closing ***
+      await waitForDrain(dc, { settleMs: 300, timeoutMs: 8000 });
 
       if (DEBUG_RTC) dbg('RTC/RESP', 'complete', { request_id, total });
 
@@ -488,6 +524,7 @@ async function serveFileIfWeHaveIt(msg) {
   // Create/send answer
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
+  await new Promise(r => setTimeout(r, 50));
   if (DEBUG_RTC) dbg('RTC/RESP', 'answer created', { request_id, sdpLen: (answer.sdp||'').length });
 
   ws.send(JSON.stringify({ type: 'webrtc-response', request_id, answer, to: from, from: myPeerId, checksum }));
@@ -529,11 +566,13 @@ async function handleWebRtcIce(msg) {
     catch (e) { if (DEBUG_RTC) dbg('RTC/RESP', 'addIce error', e); }
 
   } else {
-    // Not ready yet -> buffer it
-    const arr = preServeIce.get(request_id) || [];
-    arr.push(iceInit);
-    preServeIce.set(request_id, arr);
-    if (DEBUG_SIG) dbg('SIG/RX', 'ice buffered (no serve)', { request_id, count: arr.length });
+    // Not ready yet -> buffer it only if we might become responder for this request
+    if (!serveRequests.has(request_id)) {
+      const arr = preServeIce.get(request_id) || [];
+      arr.push(iceInit);
+      preServeIce.set(request_id, arr);
+      if (DEBUG_SIG) dbg('SIG/RX', 'ice buffered (no serve)', { request_id, count: arr.length });
+    }
   }
 }
 
