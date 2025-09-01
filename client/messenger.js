@@ -62,9 +62,12 @@ function clearMessagesUI() {
 
 function scrollToEnd() {
   const el = ui.messages;
-  requestAnimationFrame(() => {
-    requestAnimationFrame(() => { el.scrollTop = el.scrollHeight; });
-  });
+  if (!el) return;
+  const doScroll = () => { el.scrollTop = el.scrollHeight; };
+  // try immediately, then after layout, then after paint
+  doScroll();
+  requestAnimationFrame(doScroll);
+  setTimeout(doScroll, 0);
 }
 
 function renderMessage({ text, ts, nickname, senderId, verified }) {
@@ -331,6 +334,9 @@ ui.btnSend.addEventListener('click', sendMessage);
 ui.msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 ui.msgInput.addEventListener('focus', scrollToEnd);
 ui.msgInput.addEventListener('input', scrollToEnd);
+
+window.addEventListener('resize', scrollToEnd);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) scrollToEnd(); });
 
 loadSettings();
 await ensureIdentity();
