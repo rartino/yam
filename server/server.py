@@ -202,6 +202,9 @@ def ws_handler(ws):
                     'ciphertext': ciph_b64u
                 })
 
+            elif t == 'ping':
+                ws.send(json.dumps({ "type": "pong", "ts": now_ms() }))
+
             else:
                 ws.send(json.dumps({"type": "error", "error": f"unknown type: {t}"}))
 

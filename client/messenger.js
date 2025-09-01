@@ -24,8 +24,8 @@ const f = {
   name: document.getElementById('setName'),
   room: document.getElementById('setRoomCode'),
   gen: document.getElementById('btnGenRoom'),
-  save: document.getElementById('btnSaveSettings'),
-  cancel: document.getElementById('btnCancelSettings'),
+  connect: document.getElementById('btnConnectSettings'),
+  close: document.getElementById('btnCloseSettings'),
 };
 
 let ws = null;
@@ -35,6 +35,9 @@ let curvePk = null; // for sealed boxes
 let curveSk = null;
 let currentRoomId = null;
 let authed = false;
+let reconnectTimer = null;
+let reconnectAttempt = 0;
+let heartbeatTimer = null;
 
 // Per-device identity for "me" bubbles
 let myIdPk = null; // Uint8Array
@@ -52,6 +55,10 @@ function loadSettings() {
 }
 function saveSettings() {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETTINGS));
+}
+
+function clearMessagesUI() {
+  ui.messages.innerHTML = '';
 }
 
 function renderMessage({ text, ts, nickname, senderId, verified }) {
@@ -127,33 +134,79 @@ async function registerRoomIfNeeded() {
 
 async function connectFromSettings() {
   if (!SETTINGS.roomSkB64) return;
+
   await ensureSodium();
   setRoomFromSecret(SETTINGS.roomSkB64);
 
-  if (ws) { try { ws.close(); } catch(_){} }
-  ws = new WebSocket(`${RELAY_WS_URL}?room=${encodeURIComponent(currentRoomId)}`);
+  // Cancel any pending reconnects/heartbeats
+  if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+  if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+
+  // Close old socket (if any)
+  if (ws) { try { ws.onclose = null; ws.close(); } catch(_){} ws = null; }
+
+  // Start fresh
+  const url = `${RELAY_WS_URL}?room=${encodeURIComponent(currentRoomId)}`;
+  ws = new WebSocket(url);
 
   ws.onopen  = () => setStatus('Connecting…');
   ws.onerror = () => setStatus('WebSocket error');
-  ws.onclose = () => { setStatus('Disconnected'); authed = false; };
+
+  ws.onclose = () => {
+    authed = false;
+    setStatus('Disconnected');
+    scheduleReconnect();
+  };
 
   ws.onmessage = (evt) => {
     const m = JSON.parse(evt.data);
+
     if (m.type === 'challenge') {
       const nonce = fromB64u(m.nonce);
       const sig = sodium.crypto_sign_detached(nonce, edSk);
       ws.send(JSON.stringify({ type: 'auth', room_id: currentRoomId, signature: b64u(sig) }));
+
     } else if (m.type === 'ready') {
-      authed = true; setStatus('Connected');
+      authed = true;
+      setStatus('Connected');
+      reconnectAttempt = 0;
+
+      // Clear UI to prevent duplicates on (re)connect
+      clearMessagesUI();
+
+      // Request last 7 days
       ws.send(JSON.stringify({ type: 'history', since: sevenDaysAgoMs() }));
+
+      // Heartbeat every 25s to keep proxies from idling us out
+      if (heartbeatTimer) clearInterval(heartbeatTimer);
+      heartbeatTimer = setInterval(() => {
+        try { ws.send(JSON.stringify({ type: 'ping', ts: nowMs() })); } catch {}
+      }, 25000);
+
     } else if (m.type === 'history') {
       for (const item of m.messages) handleIncoming(item);
+
     } else if (m.type === 'message') {
       handleIncoming(m);
+
+    } else if (m.type === 'pong') {
+      // no-op
+
     } else if (m.type === 'error') {
       renderMessage({ text: `Server error: ${m.error}`, ts: nowMs(), nickname: 'server' });
     }
   };
+}
+
+function scheduleReconnect() {
+  if (!SETTINGS.roomSkB64) return;
+  const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempt)); // 1s,2s,4s,... max 30s
+  reconnectAttempt++;
+  setStatus(`Disconnected — reconnecting in ${Math.round(delay/1000)}s`);
+  if (reconnectTimer) clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    connectFromSettings();
+  }, delay);
 }
 
 async function ensureIdentity() {
@@ -225,19 +278,21 @@ f.gen.addEventListener('click', async () => {
   f.room.value = b64u(privateKey);
 });
 
-f.save.addEventListener('click', async () => {
+f.close.addEventListener('click', () => dlg.close());
+
+f.connect.addEventListener('click', async () => {
   const newName = (f.name.value || '').trim() || 'Me';
   const newRoomSk = (f.room.value || '').trim();
-
   if (!newRoomSk) { alert('Room code is required.'); return; }
 
-  // Enforce: changing name rotates identity
+  // Enforce: changing name rotates device identity
   if ((SETTINGS.username || '') !== newName) {
     await ensureSodium();
     rotateIdentityWithName(newName);
   }
 
   const roomChanged = SETTINGS.roomSkB64 !== newRoomSk;
+  SETTINGS.username = newName;
   SETTINGS.roomSkB64 = newRoomSk;
   saveSettings();
 
@@ -246,10 +301,10 @@ f.save.addEventListener('click', async () => {
   await ensureSodium();
   setRoomFromSecret(SETTINGS.roomSkB64);
   if (roomChanged) await registerRoomIfNeeded();
+
   connectFromSettings();
 });
 
-f.cancel.addEventListener('click', () => dlg.close());
 ui.btnSend.addEventListener('click', sendMessage);
 ui.msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
 
@@ -258,9 +313,8 @@ await ensureIdentity();
 setStatus('Ready');
 
 if (SETTINGS.roomSkB64) {
-  await registerRoomIfNeeded(); // harmless if already exists
+  await registerRoomIfNeeded();
   connectFromSettings();
 } else {
-  // first run: prompt user to fill Name + Room code (or Generate)
   dlg.showModal();
 }
