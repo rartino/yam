@@ -1,3 +1,4 @@
+// Versioned cache via manifest.json
 fetch('./manifest.json')
   .then(r => r.json())
   .then(manifest => {
@@ -18,31 +19,23 @@ fetch('./manifest.json')
     ];
 
     self.addEventListener('install', event => {
-      event.waitUntil(
-        caches.open(CACHE_NAME).then(cache => cache.addAll(urlsToCache))
-      );
+      event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(urlsToCache)));
       self.skipWaiting();
     });
 
     self.addEventListener('activate', event => {
       event.waitUntil(
-        caches.keys().then(names => Promise.all(
-          names.map(n => n !== CACHE_NAME && caches.delete(n))
-        ))
+        caches.keys().then(names => Promise.all(names.map(n => n !== CACHE_NAME && caches.delete(n))))
       );
       self.clients.claim();
     });
 
-    // Stale-while-revalidate for static assets; offline fallback for navigations
     self.addEventListener('fetch', event => {
       const req = event.request;
-      if (req.method !== 'GET') return; // don't touch mutating requests
+      if (req.method !== 'GET') return;
 
-      // HTML navigations → offline fallback
       if (req.mode === 'navigate') {
-        event.respondWith(
-          fetch(req).catch(() => caches.match('./offline.html'))
-        );
+        event.respondWith(fetch(req).catch(() => caches.match('./offline.html')));
         return;
       }
 

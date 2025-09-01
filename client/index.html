@@ -10,118 +10,111 @@
     :root { --bg:#0b0b0b; --fg:#eaeaea; --muted:#999; --me:#2b6cb0; --other:#2d2d2d; --bubble-me:#1f6feb; --bubble-other:#202124; }
     html, body { margin:0; padding:0; width:100%; height:100dvh; overflow:hidden; background:var(--bg); color:var(--fg); }
     #app { height:100dvh; display:flex; flex-direction:column; }
+
     header{
-      position: sticky;
-      top: 0;
-      z-index: 50;
-      background:#111;              /* solid bg so content doesn't show through */
-      padding-top: max(12px, env(safe-area-inset-top)); /* iOS notch friendly */
-      border-bottom: 1px solid #222;
-      display:flex;
-      align-items:center;
-      justify-content:space-between;
+      position: sticky; top: 0; z-index: 50;
+      background:#111; padding-top: max(12px, env(safe-area-inset-top));
+      border-bottom: 1px solid #222; display:flex; align-items:center; justify-content:space-between;
     }
     .hdr-left{ display:flex; flex-direction:column; }
     .icon-btn{ background:transparent; border:0; padding:8px; border-radius:10px; color:#ccc; }
     .icon-btn:active{ transform:scale(0.98); }
     header h1 { margin:0; font-size:16px; }
     #status { color:var(--muted); margin-top:4px; }
+    .version { color: var(--muted); margin-left: 6px; font-weight: 400; }
+
     main{
-      min-height: 0;    /* important for CSS grid overflow math */
-      overflow: hidden; /* prevent the page/body from scrolling */
-      flex:1;
-      display:grid;
-      grid-template-rows: 1fr auto; /* messages grows, composer sits at bottom */
+      min-height: 0; overflow: hidden; flex:1;
+      display:grid; grid-template-rows: 1fr auto; /* messages grows; composer fixed */
     }
-    .controls { display:grid; grid-template-columns:1fr auto; gap:8px; padding:12px 16px; border-bottom:1px solid #222; }
-    .controls input, .controls button { padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
-    .controls button { cursor:pointer; }
-    .label { font-size:12px; color:var(--muted); margin-top:-4px; grid-column:1 / span 2; }
-    .messages {
-	min-height:0;
-	-webkit-overflow-scrolling: touch;
-	overflow:auto;
-	padding:12px 12px 4px;
-	display:flex; flex-direction:column; gap:8px;
+    .messages{
+      min-height:0; -webkit-overflow-scrolling: touch; overflow:auto;
+      padding:12px 12px 4px; display:flex; flex-direction:column; gap:8px;
     }
-    .bubble { max-width:75%; padding:10px 12px; border-radius:16px; line-height:1.25; position:relative; word-wrap:break-word; }
     .row { display:flex; width:100%; }
+    .row .wrap{ max-width:75%; display:flex; flex-direction:column; }
+    .name-label{ font-size:11px; color:#bbb; margin:2px 8px 4px; }
+    .bubble { max-width:100%; padding:10px 12px; border-radius:16px; line-height:1.25; position:relative; word-wrap:break-word; }
     .me   { justify-content:flex-end; }
     .me .bubble { background:var(--bubble-me); color:white; border-top-right-radius:6px; }
     .other { justify-content:flex-start; }
     .other .bubble { background:var(--bubble-other); color:#eaeaea; border-top-left-radius:6px; }
-    .meta { margin-top:4px; font-size:11px; color:#bbb; }
+    .bubble img { max-width: 68vw; height: auto; display:block; border-radius:12px; }
+    .file-link { color:#cdd; text-decoration: underline; word-break: break-all; }
+
     .composer{
-      display:grid;
-      grid-template-columns: 1fr auto;
-      gap:8px;
-      background:#0b0b0b;
-      padding:12px 16px;
-      border-top:1px solid #222;
+      display:grid; grid-template-columns: auto 1fr auto; gap:8px;
+      background:#0b0b0b; padding:12px 16px; border-top:1px solid #222;
       padding-bottom: max(12px, env(safe-area-inset-bottom));
     }
-    .composer input, .composer button { padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
+    .composer input, .composer button {
+      padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea;
+    }
+    .attach-btn { display:flex; align-items:center; justify-content:center; width:44px; }
+    .attach-btn svg { display:block; }
+
     footer { padding:8px 16px; font-size:12px; color:#999; border-top:1px solid #222; }
     .keyhint { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#a7b; overflow-wrap:anywhere; }
-    /* Name label above bubbles */
-    .name-label{ font-size:11px; color:#bbb; margin:2px 8px 4px; }
-    .row .wrap{ max-width:75%; display:flex; flex-direction:column; }
+
     /* Dialog */
     dialog{ position:relative; border:1px solid #333; border-radius:14px; padding:16px; background:#121212; color:#eaeaea; width:min(560px,94vw); }
     dialog::backdrop{ background:rgba(0,0,0,.6); }
     .dialog-close{ position:absolute; top:8px; right:10px; background:transparent; border:0; color:#aaa; font-size:22px; line-height:1; cursor:pointer; }
+
     .settings-stack{ display:flex; flex-direction:column; gap:14px; }
     .field label{ display:block; font-size:12px; color:#bbb; margin:0 0 6px; }
     .field input{ width:100%; padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
     .row-buttons{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
-    .row-buttons button,
-    .settings-actions button{ padding:12px; border-radius:12px; border:1px solid #333; background:#1a1a1a; color:#eaeaea; }
-    .row-buttons button:active,
-    .settings-actions button:active{ transform:scale(0.98); }
+    .row-buttons button, .settings-actions button{
+      padding:12px; border-radius:12px; border:1px solid #333; background:#1a1a1a; color:#eaeaea;
+    }
+    .row-buttons button:active, .settings-actions button:active{ transform:scale(0.98); }
     .help{ margin:6px 0 0; }
     .settings-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
-    .version { color: var(--muted); margin-left: 6px; font-weight: 400; }
   </style>
 </head>
-<dialog id="settingsModal">
-<button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
-  <form method="dialog">
-    <h3 style="margin:0 0 10px">Settings</h3>
-
-    <div class="settings-stack">
-      <div class="field">
-	<label for="setName">Name</label>
-	<input id="setName" placeholder="Your display name" />
-      </div>
-      
-      <div class="field">
-	<label for="setRoomCode">Room code</label>
-	<input id="setRoomCode" placeholder="Secret (base64url)" />
-	<div class="row-buttons">
-          <button type="button" id="btnGenRoom">Generate new</button>
-          <button type="button" id="btnCopyRoom">Copy</button>
-	</div>
-	<p class="muted help">Share the Room code to invite others. The app derives the room ID automatically.</p>
-      </div>
-    </div>
-    
-    <div class="settings-actions">
-      <button type="button" id="btnConnectSettings">Connect</button>
-    </div>
-  </form>
-</dialog>
 <body>
+
+  <!-- Settings dialog -->
+  <dialog id="settingsModal">
+    <button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
+    <form method="dialog">
+      <h3 style="margin:0 0 10px">Settings</h3>
+
+      <div class="settings-stack">
+        <div class="field">
+          <label for="setName">Name</label>
+          <input id="setName" placeholder="Your display name" />
+        </div>
+
+        <div class="field">
+          <label for="setRoomCode">Room code</label>
+          <input id="setRoomCode" placeholder="Secret (base64url)" />
+          <div class="row-buttons">
+            <button type="button" id="btnGenRoom">Generate new</button>
+            <button type="button" id="btnCopyRoom">Copy</button>
+          </div>
+          <p class="muted help">Share the Room code to invite others. The app derives the room ID automatically.</p>
+        </div>
+      </div>
+
+      <div class="settings-actions">
+        <button type="button" id="btnConnectSettings">Connect</button>
+      </div>
+    </form>
+  </dialog>
+
   <div id="app">
     <header>
       <div class="hdr-left">
-	<h1>WS Messenger <span id="appVersion" class="version"></span></h1>
-	<div id="status">Not connected</div>
+        <h1>WS Messenger <span id="appVersion" class="version"></span></h1>
+        <div id="status">Not connected</div>
       </div>
-      <button id="btnSettings" class="icon-btn" aria-label="Settings">
-	<!-- gear icon -->
-	<svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-	  <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8.94 3.24-.97-.56a7.96 7.96 0 0 0-.26-1l.73-.89a.7.7 0 0 0-.08-.98l-1.1-1.1a.7.7 0 0 0-.98-.08l-.89.73c-.32-.12-.66-.21-1-.26l-.56-.97a.7.7 0 0 0-.62-.36h-1.56a.7.7 0 0 0-.62.36l-.56.97c-.34.05-.68.14-1 .26l-.89-.73a.7.7 0 0 0-.98.08l-1.1 1.1a.7.7 0 0 0-.08.98l.73.89c-.12.32-.21.66-.26 1l-.97.56a.7.7 0 0 0-.36.62v1.56c0 .26.14.5.36.62l.97.56c.05.34.14.68.26 1l-.73.89a.7.7 0 0 0 .08.98l1.1 1.1c.25.25.64.27.92.08l.89-.73c.32.12.66.21 1 .26l.56.97c.12.22.36.36.62.36h1.56c.26 0 .5-.14.62-.36l.56-.97c.34-.05.68-.14 1-.26l.89.73c.28.2.67.17.92-.08l1.1-1.1c.25-.25.27-.64.08-.92l-.73-.89c.12-.32.21-.66.26-1l.97-.56c.22-.12.36-.36.36-.62v-1.56a.7.7 0 0 0-.36-.62Z"/>
-	</svg>
+      <button id="btnSettings" class="icon-btn" aria-label="Settings" title="Settings">
+        <!-- gear icon -->
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+          <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8.94 3.24-.97-.56a7.96 7.96 0 0 0-.26-1l.73-.89a.7.7 0 0 0-.08-.98l-1.1-1.1a.7.7 0 0 0-.98-.08l-.89.73c-.32-.12-.66-.21-1-.26l-.56-.97a.7.7 0 0 0-.62-.36h-1.56a.7.7 0 0 0-.62.36l-.56.97c-.34.05-.68.14-1 .26l-.89-.73a.7.7 0 0 0-.98.08l-1.1 1.1a.7.7 0 0 0-.08.98l.73.89c-.12.32-.21.66-.26 1l-.97.56a.7.7 0 0 0-.36.62v1.56c0 .26.14.5.36.62l.97.56c.05.34.14.68.26 1l-.73.89a.7.7 0 0 0 .08.98l1.1 1.1c.25.25.64.27.92.08l.89-.73c.32.12.66.21 1 .26l.56.97c.12.22.36.36.62.36h1.56c.26 0 .5-.14.62-.36l.56-.97c.34-.05.68-.14 1-.26l.89.73c.28.2.67.17.92-.08l1.1-1.1c.25-.25.27-.64.08-.92l-.73-.89c.12-.32.21-.66.26-1l.97-.56c.22-.12.36-.36.36-.62v-1.56a.7.7 0 0 0-.36-.62Z"/>
+        </svg>
       </button>
     </header>
 
@@ -129,14 +122,26 @@
       <div id="messages" class="messages"></div>
 
       <div class="composer">
+        <button id="btnAttach" class="attach-btn" title="Attach">
+          <!-- paperclip -->
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+            <path d="M16.5,6.5 L8.5,14.5 C7.1,15.9 7.1,18.1 8.5,19.5 C9.9,20.9 12.1,20.9 13.5,19.5 L19,14 C21,12 21,8.9 19,6.9 C17,4.9 13.9,4.9 11.9,6.9 L6,12.8"/>
+          </svg>
+        </button>
         <input id="messageInput" placeholder="Type a message…" />
         <button id="btnSend">Send</button>
+        <input id="fileInput" type="file" style="display:none" />
       </div>
     </main>
+
+    <footer>
+      Installable PWA. E2E via sealed boxes. Identity bubbles are based on a device key stored locally.
+      <div id="identityInfo" class="keyhint"></div>
+    </footer>
   </div>
 
   <script src="vendor/sodium/sodium.js"></script>
-  
+
   <script type="module">
     fetch('./manifest.json')
       .then(r => r.json())
