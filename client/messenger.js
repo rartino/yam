@@ -12,7 +12,6 @@ const ui = {
   messages: document.getElementById('messages'),
   msgInput: document.getElementById('messageInput'),
   btnSend: document.getElementById('btnSend'),
-  identityInfo: document.getElementById('identityInfo'),
 };
 
 ui.btnSettings = document.getElementById('btnSettings');
@@ -111,7 +110,6 @@ function derivePubFromSk(sk) {
 function persistIdentity() {
   localStorage.setItem('secmsg_id_pk', b64u(myIdPk));
   localStorage.setItem('secmsg_id_sk', b64u(myIdSk));
-  ui.identityInfo.textContent = `Your device ID: ${shortId(b64u(myIdPk))} (stored locally)`;
 }
 
 function rotateIdentityWithName(newName) {
