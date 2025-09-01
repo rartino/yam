@@ -54,12 +54,17 @@ function loadSettings() {
   try { SETTINGS = { ...SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; }
   catch {}
 }
+
 function saveSettings() {
   localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETTINGS));
 }
 
 function clearMessagesUI() {
   ui.messages.innerHTML = '';
+}
+
+function scrollToEnd() {
+  ui.messages.scrollTop = ui.messages.scrollHeight;
 }
 
 function renderMessage({ text, ts, nickname, senderId, verified }) {
@@ -87,6 +92,8 @@ function renderMessage({ text, ts, nickname, senderId, verified }) {
 
   ui.messages.appendChild(row);
   ui.messages.scrollTop = ui.messages.scrollHeight;
+
+  scrollToEnd();
 }
 
 function shortId(idB64u) { return idB64u.slice(0, 6) + '…' + idB64u.slice(-6); }
@@ -178,6 +185,8 @@ async function connectFromSettings() {
       // Request last 7 days
       ws.send(JSON.stringify({ type: 'history', since: sevenDaysAgoMs() }));
 
+      requestAnimationFrame(scrollToEnd);
+
       // Heartbeat every 25s to keep proxies from idling us out
       if (heartbeatTimer) clearInterval(heartbeatTimer);
       heartbeatTimer = setInterval(() => {
@@ -185,7 +194,8 @@ async function connectFromSettings() {
       }, 25000);
 
     } else if (m.type === 'history') {
-      for (const item of m.messages) handleIncoming(item);
+       for (const item of m.messages) handleIncoming(item);
+       scrollToEnd();
 
     } else if (m.type === 'message') {
       handleIncoming(m);
@@ -321,6 +331,8 @@ f.copy.addEventListener('click', async () => {
 
 ui.btnSend.addEventListener('click', sendMessage);
 ui.msgInput.addEventListener('keydown', e => { if (e.key === 'Enter') sendMessage(); });
+ui.msgInput.addEventListener('focus', scrollToEnd);
+ui.msgInput.addEventListener('input', scrollToEnd);
 
 loadSettings();
 await ensureIdentity();
