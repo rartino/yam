@@ -11,6 +11,10 @@ from nacl.signing import VerifyKey
 from nacl.exceptions import BadSignatureError
 from nacl import utils
 
+def LOG(*args):
+    ts = time.strftime('%H:%M:%S')
+    print(f"[WSR {ts}]", *args, flush=True)
+
 APP = Flask(__name__, static_folder=None)
 app = APP
 SOCK = Sock(APP)
@@ -86,6 +90,7 @@ def root():
 def ws_handler(ws):
   query = ws.environ.get('QUERY_STRING', '')
   room_id = (parse_qs(query).get('room') or [None])[0]
+  LOG("WS connect", "room=", room_id)
   if not room_id:
     ws.send(json.dumps({"type": "error", "error": "room parameter required"}))
     ws.close(); return
@@ -123,11 +128,14 @@ def ws_handler(ws):
     ws.send(json.dumps({"type": "error", "error": "verification error"}))
     ws.close(); return
 
+  LOG("Auth OK", "room=", room_id)
+    
   # Register connection
   ROOM_CONNECTIONS.setdefault(room_id, set()).add(ws)
   ROOM_PEERS.setdefault(room_id, {})
 
   ws.send(json.dumps({"type": "ready"}))
+  LOG("Joined", "room=", room_id, "conns=", len(ROOM_CONNECTIONS.get(room_id, set())))
 
   peer_id = None  # b64 string after announce
 
@@ -140,16 +148,17 @@ def ws_handler(ws):
       except Exception:
         ws.send(json.dumps({"type": "error", "error": "invalid JSON"}))
         continue
-
+      
       t = m.get('type')
+      LOG("RX", t)
 
       if t == 'announce':
         # Client announces its device id (base64url of Ed25519 pubkey)
         pid = m.get('peer_id')
         if isinstance(pid, str) and pid:
-          # map device id to this socket
-          ROOM_PEERS[room_id][pid] = ws
-          peer_id = pid
+            ROOM_PEERS[room_id][pid] = ws
+            LOG("announce", "room=", room_id, "peer=", pid, "peers=", len(ROOM_PEERS[room_id]))
+            peer_id = pid
 
       elif t == 'history':
         since = int(m.get('since') or (now_ms() - 7*24*60*60*1000))
@@ -164,6 +173,8 @@ def ws_handler(ws):
           'sig': base64url_encode(row['sig']) if row['sig'] is not None else None,
           'ciphertext': base64url_encode(row['ciphertext'])
         } for row in cur.fetchall()]
+        
+        LOG("history", "room=", room_id, "since=", since, "count=", len(items))
         ws.send(json.dumps({"type": "history", "messages": items}))
 
       elif t == 'send':
@@ -187,83 +198,93 @@ def ws_handler(ws):
             (room_id, ts, nickname, sender_id, sig, ciphertext)
           )
 
-        broadcast(room_id, {
-          'type': 'message', 'ts': ts, 'nickname': nickname,
-          'sender_id': sender_id_b64u, 'sig': sig_b64u, 'ciphertext': ciph_b64u
+        sent = broadcast(room_id, {
+            'type': 'message',
+            'ts': ts, 'nickname': nickname,
+            'sender_id': sender_id_b64u, 'sig': sig_b64u, 'ciphertext': ciph_b64u
         }, exclude=ws)
+        LOG("send", "room=", room_id, "bytes=", len(ciphertext), "fanout=", sent)
 
       elif t == 'ping':
         ws.send(json.dumps({"type": "pong", "ts": now_ms()}))
 
       # --- WebRTC signaling (volatile; not stored) ---
       elif t == 'webrtc-request':
-        # Relay to everyone else in room
-        payload = {
-          'type': 'webrtc-request',
-          'request_id': m.get('request_id'),
-          'checksum': m.get('checksum'),
-          'offer': m.get('offer'),
-          'from': m.get('from')
-        }
-        broadcast(room_id, payload, exclude=ws)
+          payload = {
+              'type': 'webrtc-request',
+              'request_id': m.get('request_id'),
+              'checksum': m.get('checksum'),
+              'offer': m.get('offer'),
+              'from': m.get('from')
+          }
+          fanout = broadcast(room_id, payload, exclude=ws)
+          LOG("rtc/request", "room=", room_id, "req=", m.get('request_id'), "hash=", m.get('checksum'), "from=", m.get('from'), "fanout=", fanout)
 
       elif t == 'webrtc-response':
-        target = m.get('to')
-        if target:
+          target = m.get('to')
           payload = {
-            'type': 'webrtc-response',
-            'request_id': m.get('request_id'),
-            'answer': m.get('answer'),
-            'from': m.get('from'),
-            'checksum': m.get('checksum')
+              'type': 'webrtc-response',
+              'request_id': m.get('request_id'),
+              'answer': m.get('answer'),
+              'from': m.get('from'),
+              'checksum': m.get('checksum')
           }
-          unicast(room_id, target, payload)
+          ok = unicast(room_id, target, payload)
+          LOG("rtc/response", "room=", room_id, "req=", m.get('request_id'), "to=", target, "ok=", ok)
 
       elif t == 'webrtc-ice':
-        target = m.get('to')
-        if target:
+          target = m.get('to')
           payload = {
-            'type': 'webrtc-ice',
-            'request_id': m.get('request_id'),
-            'candidate': m.get('candidate'),
-            'from': m.get('from')
+              'type': 'webrtc-ice',
+              'request_id': m.get('request_id'),
+              'candidate': m.get('candidate'),
+              'from': m.get('from')
           }
-          unicast(room_id, target, payload)
+          ok = unicast(room_id, target, payload)
+          LOG("rtc/ice", "room=", room_id, "req=", m.get('request_id'), "to=", target, "ok=", ok)
 
       else:
         ws.send(json.dumps({"type": "error", "error": f"unknown type: {t}"}))
 
   finally:
-    try:
-      ROOM_CONNECTIONS.get(room_id, set()).discard(ws)
-      # remove peer mapping if present
-      if peer_id and ROOM_PEERS.get(room_id):
-        if ROOM_PEERS[room_id].get(peer_id) is ws:
-          ROOM_PEERS[room_id].pop(peer_id, None)
-    except Exception:
-      pass
+      try:
+          ROOM_CONNECTIONS.get(room_id, set()).discard(ws)
+          if peer_id and ROOM_PEERS.get(room_id):
+              if ROOM_PEERS[room_id].get(peer_id) is ws:
+                  ROOM_PEERS[room_id].pop(peer_id, None)
+          LOG("Left", "room=", room_id, "conns=", len(ROOM_CONNECTIONS.get(room_id, set())), "peers=", len(ROOM_PEERS.get(room_id, {})))
+      except Exception:
+          pass
 
 # helpers
 def broadcast(room_id, payload, exclude=None):
-  dead = []
-  for sock in list(ROOM_CONNECTIONS.get(room_id, set())):
-    if exclude is not None and sock is exclude:
-      continue
-    try:
-      sock.send(json.dumps(payload))
-    except Exception:
-      dead.append(sock)
-  for d in dead:
-    try: ROOM_CONNECTIONS.get(room_id, set()).discard(d)
-    except Exception: pass
+    dead, sent = [], 0
+    for sock in list(ROOM_CONNECTIONS.get(room_id, set())):
+        if exclude is not None and sock is exclude:
+            continue
+        try:
+            sock.send(json.dumps(payload))
+            sent += 1
+        except Exception:
+            dead.append(sock)
+    for d in dead:
+        try: ROOM_CONNECTIONS.get(room_id, set()).discard(d)
+        except Exception: pass
+    return sent
 
 def unicast(room_id, peer_id_b64, payload):
-  ws = ROOM_PEERS.get(room_id, {}).get(peer_id_b64)
-  if not ws: return
-  try: ws.send(json.dumps(payload))
-  except Exception:
-    try: ROOM_CONNECTIONS.get(room_id, set()).discard(ws)
-    except Exception: pass
+    ws = ROOM_PEERS.get(room_id, {}).get(peer_id_b64)
+    if not ws:
+        LOG("unicast-miss", "room=", room_id, "peer=", peer_id_b64)
+        return False
+    try:
+        ws.send(json.dumps(payload))
+        return True
+    except Exception:
+        try: ROOM_CONNECTIONS.get(room_id, set()).discard(ws)
+        except Exception: pass
+        LOG("unicast-error", "room=", room_id, "peer=", peer_id_b64)
+        return False
 
 def base64url_encode(b: bytes) -> str:
   import base64

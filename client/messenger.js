@@ -1,5 +1,3 @@
-/* global sodium */
-//
 // ====== CONFIG ======
 const RELAY_HTTP_BASE = 'https://rartino.pythonanywhere.com';
 const RELAY_WS_URL    = RELAY_HTTP_BASE.replace(/^http/, 'ws') + '/ws';
@@ -11,6 +9,15 @@ const RTC_CONFIG = {
   ]
 };
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks for file send
+
+// ====== DEBUG ======
+const DEBUG_SIG = true;     // WebSocket signaling logs
+const DEBUG_RTC = true;     // WebRTC flow logs
+
+function dbg(tag, ...args){
+  const ts = new Date().toISOString().split('T')[1].replace('Z','');
+  console.log(`[${ts}] ${tag}`, ...args);
+}
 
 //
 // ====== UI REFS ======
@@ -129,15 +136,11 @@ async function sha256_b64u(blob) {
 
 function iceToJSON(c) {
   if (!c) return null;
-  // Some browsers support .toJSON(); otherwise pick the fields we need
-  return typeof c.toJSON === 'function'
+  const j = typeof c.toJSON === 'function'
     ? c.toJSON()
-    : {
-        candidate: c.candidate,
-        sdpMid: c.sdpMid,
-        sdpMLineIndex: c.sdpMLineIndex,
-        usernameFragment: c.usernameFragment
-      };
+    : { candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex, usernameFragment: c.usernameFragment };
+  if (DEBUG_RTC) dbg('RTC/ICE->JSON', { hasCandidate: !!j.candidate, mid: j.sdpMid, mline: j.sdpMLineIndex });
+  return j;
 }
 
 // ====== Identity & Settings ======
@@ -286,6 +289,7 @@ async function sendTextMessage(text) {
     sender_id: myPeerId,
     sig: signCiphertextB64(ciphertextB64),
   };
+  if (DEBUG_SIG) dbg('SIG/TX', 'send:text', { len: text.length });
   ws.send(JSON.stringify(payload));
   renderTextMessage({
     text,
@@ -307,6 +311,7 @@ async function sendFileMetadata(meta) {
     sender_id: myPeerId,
     sig: signCiphertextB64(ciphertextB64),
   };
+  if (DEBUG_SIG) dbg('SIG/TX', 'send:file-meta', { hash: meta.hash, name: meta.name, mime: meta.mime, size: meta.size }); 
   ws.send(JSON.stringify(payload));
 }
 
@@ -319,7 +324,7 @@ function handleIncoming(m) {
       const sig = fromB64u(m.sig);
       const ciphertext = fromB64u(m.ciphertext);
       verified = sodium.crypto_sign_verify_detached(sig, ciphertext, senderPk);
-      if (m.sender_id && m.sender_id === myPeerId) return;
+      if (m.sender_id && m.sender_id === myPeerId) { if (DEBUG_SIG) dbg('SIG/RX', 'echo-drop', { sender: m.sender_id }); return; }
     } catch { verified = false; }
   }
 
@@ -348,6 +353,7 @@ function randomIdB64(n=16) {
 
 async function requestFile(hash) {
   if (!ws || ws.readyState !== WebSocket.OPEN) return;
+  if (DEBUG_RTC) dbg('RTC/REQ', 'start', { hash });
 
   const pc = new RTCPeerConnection(RTC_CONFIG);
   const dc = pc.createDataChannel('file');
@@ -357,25 +363,29 @@ async function requestFile(hash) {
   pendingRequests.set(reqId, state);
 
   dc.binaryType = 'arraybuffer';
-  // Receiving data (header JSON then binary chunks)
+
+  dc.onopen = () => { if (DEBUG_RTC) dbg('RTC/REQ', 'dc open', { reqId }); };
+  dc.onclose = () => { if (DEBUG_RTC) dbg('RTC/REQ', 'dc close', { reqId }); };
+  dc.onerror = (e) => { if (DEBUG_RTC) dbg('RTC/REQ', 'dc error', { reqId, e }); };
+
   let header = null, chunks = [], received = 0, expected = 0;
 
   dc.onmessage = async (evt) => {
     if (!header) {
-      // first message is header JSON
       header = JSON.parse(new TextDecoder().decode(evt.data));
       expected = header.size|0;
+      if (DEBUG_RTC) dbg('RTC/REQ', 'header', { reqId, hash, expected, mime: header.mime, name: header.name });
       return;
     }
     chunks.push(evt.data);
     received += evt.data.byteLength || (evt.data.size||0);
+    if (DEBUG_RTC && received % (512*1024) < CHUNK_SIZE) dbg('RTC/REQ', 'chunk', { reqId, received, expected });
     if (expected && received >= expected) {
+      if (DEBUG_RTC) dbg('RTC/REQ', 'complete', { reqId, received });
       const blob = new Blob(chunks, { type: header.mime || 'application/octet-stream' });
       await idbPut(hash, blob);
-      // Update any existing bubble with this hash
       const bubble = ui.messages.querySelector(`.bubble[data-hash="${hash}"]`);
       if (bubble) await renderFileIfAvailable(bubble, header);
-      // Close connection after transfer
       try { dc.close(); } catch {}
       try { pc.close(); } catch {}
       pendingRequests.delete(reqId);
@@ -385,104 +395,87 @@ async function requestFile(hash) {
 
   pc.onicecandidate = (e) => {
     const cand = iceToJSON(e.candidate);
-    if (!cand) return; // ignore null end-of-candidates
+    if (!cand) { if (DEBUG_RTC) dbg('RTC/REQ', 'ice end', { reqId }); return; }
     if (state.remotePeerId) {
-      ws.send(JSON.stringify({
-          type: 'webrtc-ice',
-          request_id: reqId,
-          candidate: cand,
-          to: state.remotePeerId,
-	  from: myPeerId
-      }));
+      if (DEBUG_SIG) dbg('SIG/TX', 'ice (req->resp)', { reqId, mid: cand.sdpMid, mline: cand.sdpMLineIndex });
+      ws.send(JSON.stringify({ type: 'webrtc-ice', request_id: reqId, candidate: cand, to: state.remotePeerId, from: myPeerId }));
     } else {
-	state.iceBuf.push(cand);
+      state.iceBuf.push(cand);
+      if (DEBUG_RTC) dbg('RTC/REQ', 'ice buffered', { reqId, count: state.iceBuf.length });
     }
   };
-    
+
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
+  if (DEBUG_RTC) dbg('RTC/REQ', 'offer created', { reqId, sdpLen: (offer.sdp||'').length });
 
-  // Send request to all peers in room
-  ws.send(JSON.stringify({
-    type: 'webrtc-request',
-    request_id: reqId,
-    checksum: hash,
-    offer,
-    from: myPeerId
-  }));
+  if (DEBUG_SIG) dbg('SIG/TX', 'webrtc-request', { reqId, hash, sdpLen: (offer.sdp||'').length });
+  ws.send(JSON.stringify({ type: 'webrtc-request', request_id: reqId, checksum: hash, offer, from: myPeerId }));
 }
 
 async function serveFileIfWeHaveIt(msg) {
   const { request_id, checksum, from, offer } = msg;
   const blob = await idbGet(checksum);
-  if (!blob) return; // don't respond if we don't have it
+  if (!blob) { if (DEBUG_RTC) dbg('RTC/RESP', 'no-file', { request_id, checksum }); return; }
+
+  if (DEBUG_RTC) dbg('RTC/RESP', 'serve', { request_id, checksum, size: blob.size, mime: blob.type, from });
 
   const pc = new RTCPeerConnection(RTC_CONFIG);
 
   pc.ondatachannel = (evt) => {
     const dc = evt.channel;
     dc.binaryType = 'arraybuffer';
-
     dc.onopen = async () => {
-      // Send header then chunks
+      if (DEBUG_RTC) dbg('RTC/RESP', 'dc open', { request_id });
       const header = { kind: 'file', name: blob.name || 'file', mime: blob.type || 'application/octet-stream', size: blob.size || blob.size, hash: checksum };
       dc.send(new TextEncoder().encode(JSON.stringify(header)));
 
       const reader = blob.stream().getReader();
-      let done, value;
+      let sent = 0;
       while (true) {
-        ({ done, value } = await reader.read());
+        const { done, value } = await reader.read();
         if (done) break;
-        // value is a Uint8Array chunk; slice to max size if needed
-        if (value.byteLength <= CHUNK_SIZE) {
-          dc.send(value);
-        } else {
-          for (let i = 0; i < value.byteLength; i += CHUNK_SIZE) {
-            dc.send(value.slice(i, i + CHUNK_SIZE));
-          }
-        }
-        // backpressure
-        while (dc.bufferedAmount > 8 * CHUNK_SIZE) {
-          await new Promise(r => setTimeout(r, 10));
-        }
+        if (value.byteLength <= CHUNK_SIZE) dc.send(value);
+        else for (let i = 0; i < value.byteLength; i += CHUNK_SIZE) dc.send(value.slice(i, i + CHUNK_SIZE));
+        sent += value.byteLength;
+        if (DEBUG_RTC && sent % (512*1024) < CHUNK_SIZE) dbg('RTC/RESP', 'sent', { request_id, sent, size: blob.size });
+        while (dc.bufferedAmount > 8 * CHUNK_SIZE) await new Promise(r => setTimeout(r, 10));
       }
+      if (DEBUG_RTC) dbg('RTC/RESP', 'complete', { request_id, sent });
 
-      // close after send
       try { dc.close(); } catch {}
       try { pc.close(); } catch {}
       serveRequests.delete(request_id);
     };
+    dc.onclose = () => { if (DEBUG_RTC) dbg('RTC/RESP', 'dc close', { request_id }); };
+    dc.onerror = (e) => { if (DEBUG_RTC) dbg('RTC/RESP', 'dc error', { request_id, e }); };
   };
 
   pc.onicecandidate = (e) => {
     const cand = iceToJSON(e.candidate);
-    if (!cand) return;
-      ws.send(JSON.stringify({
-      type: 'webrtc-ice',
-      request_id,
-      candidate: cand,
-      to: from,
-      from: myPeerId
-    }));
+    if (!cand) { if (DEBUG_RTC) dbg('RTC/RESP', 'ice end', { request_id }); return; }
+    if (DEBUG_SIG) dbg('SIG/TX', 'ice (resp->req)', { request_id, mid: cand.sdpMid, mline: cand.sdpMLineIndex });
+    ws.send(JSON.stringify({ type: 'webrtc-ice', request_id, candidate: cand, to: from, from: myPeerId }));
   };
-    
+
   await pc.setRemoteDescription(offer);
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
+  if (DEBUG_RTC) dbg('RTC/RESP', 'answer created', { request_id, sdpLen: (answer.sdp||'').length });
 
   serveRequests.set(request_id, { pc, hash: checksum });
 
-  ws.send(JSON.stringify({
-    type: 'webrtc-response',
-    request_id, answer, to: from, from: myPeerId, checksum
-  }));
+  if (DEBUG_SIG) dbg('SIG/TX', 'webrtc-response', { request_id, to: from, sdpLen: (answer.sdp||'').length });
+  ws.send(JSON.stringify({ type: 'webrtc-response', request_id, answer, to: from, from: myPeerId, checksum }));
 }
 
 async function handleWebRtcResponse(msg) {
   const { request_id, answer, from } = msg;
   const st = pendingRequests.get(request_id);
   if (!st) return;
+  if (DEBUG_SIG) dbg('SIG/RX', 'webrtc-response', { request_id, from, sdpLen: (answer.sdp||'').length });
   await st.pc.setRemoteDescription(answer);
+  if (DEBUG_RTC) dbg('RTC/REQ', 'answer applied', { request_id });
   st.remotePeerId = from;
 
   // Flush any buffered ICE
@@ -493,13 +486,17 @@ async function handleWebRtcResponse(msg) {
 }
 
 async function handleWebRtcIce(msg) {
-  const { request_id, candidate } = msg;
+  const { request_id, candidate, from } = msg;
   if (!candidate) return;
   const ice = new RTCIceCandidate(candidate);
   if (pendingRequests.has(request_id)) {
-    try { await pendingRequests.get(request_id).pc.addIceCandidate(ice); } catch {}
+    if (DEBUG_SIG) dbg('SIG/RX', 'ice to requester', { request_id, from, mid: candidate.sdpMid, mline: candidate.sdpMLineIndex });
+    try { await pendingRequests.get(request_id).pc.addIceCandidate(ice); } catch (e) { if (DEBUG_RTC) dbg('RTC/REQ', 'addIce error', e); }
   } else if (serveRequests.has(request_id)) {
-    try { await serveRequests.get(request_id).pc.addIceCandidate(ice); } catch {}
+    if (DEBUG_SIG) dbg('SIG/RX', 'ice to responder', { request_id, from, mid: candidate.sdpMid, mline: candidate.sdpMLineIndex });
+    try { await serveRequests.get(request_id).pc.addIceCandidate(ice); } catch (e) { if (DEBUG_RTC) dbg('RTC/RESP', 'addIce error', e); }
+  } else {
+    if (DEBUG_SIG) dbg('SIG/RX', 'ice orphan', { request_id });
   }
 }
 
@@ -515,16 +512,15 @@ async function connectFromSettings() {
   if (ws) { try { ws.onclose = null; ws.close(); } catch(_){} ws = null; }
 
   ws = new WebSocket(`${RELAY_WS_URL}?room=${encodeURIComponent(currentRoomId)}`);
+  if (DEBUG_SIG) dbg('SIG/WS', 'opening', { room: currentRoomId });
 
-  ws.onopen  = () => setStatus('Connecting…');
-  ws.onerror = () => setStatus('WebSocket error');
-
-  ws.onclose = () => {
-    authed = false; setStatus('Disconnected'); scheduleReconnect();
-  };
+  ws.onopen  = () => { if (DEBUG_SIG) dbg('SIG/WS', 'open'); setStatus('Connecting…'); };
+  ws.onerror = (e) => { setStatus('WebSocket error'); if (DEBUG_SIG) dbg('SIG/WS', 'error', e); };
+  ws.onclose = (e) => { authed = false; setStatus('Disconnected'); if (DEBUG_SIG) dbg('SIG/WS', 'close', { code:e.code, reason:e.reason }); scheduleReconnect(); };
 
   ws.onmessage = async (evt) => {
     const m = JSON.parse(evt.data);
+    if (DEBUG_SIG) dbg('SIG/RX', m.type, Object.assign({}, m, { ciphertext: m.ciphertext ? `<${m.ciphertext.length} chars>`: undefined, offer: m.offer ? { type:m.offer.type, sdpLen: (m.offer.sdp||'').length } : undefined, answer: m.answer ? { type:m.answer.type, sdpLen: (m.answer.sdp||'').length } : undefined, candidate: m.candidate ? { has: true } : undefined }));
 
     if (m.type === 'challenge') {
       const nonce = fromB64u(m.nonce);
@@ -534,9 +530,11 @@ async function connectFromSettings() {
     } else if (m.type === 'ready') {
       authed = true; setStatus('Connected'); reconnectAttempt = 0;
       // Announce our device id for signaling
+      if (DEBUG_SIG) dbg('SIG/TX', 'announce', { peer_id: myPeerId });
       ws.send(JSON.stringify({ type: 'announce', peer_id: myPeerId }));
 
       clearMessagesUI();
+      if (DEBUG_SIG) dbg('SIG/TX', 'history', { since: sevenDaysAgoMs() });
       ws.send(JSON.stringify({ type: 'history', since: sevenDaysAgoMs() }));
       requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
 
@@ -545,7 +543,9 @@ async function connectFromSettings() {
         try { ws.send(JSON.stringify({ type: 'ping', ts: nowMs() })); } catch {}
       }, 25000);
 
+
     } else if (m.type === 'history') {
+      if (DEBUG_SIG) dbg('SIG/RX', 'history', { count: (m.messages||[]).length });
       for (const item of m.messages) handleIncoming(item);
       scrollToEnd(); requestAnimationFrame(scrollToEnd);
 
