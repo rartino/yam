@@ -37,37 +37,43 @@
     .name-label{ font-size:11px; color:#bbb; margin:2px 8px 4px; }
     .row .wrap{ max-width:75%; display:flex; flex-direction:column; }
     /* Dialog */
-    dialog{ position:relative; border:1px solid #333; border-radius:14px; padding:16px; background:#121212; color:#eaeaea; width:min(520px,92vw); }
+    dialog{ position:relative; border:1px solid #333; border-radius:14px; padding:16px; background:#121212; color:#eaeaea; width:min(560px,94vw); }
     dialog::backdrop{ background:rgba(0,0,0,.6); }
-    .settings-grid{ display:grid; grid-template-columns:1fr auto; gap:10px; }
-    .settings-grid input{ padding:10px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
-    .settings-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
     .dialog-close{ position:absolute; top:8px; right:10px; background:transparent; border:0; color:#aaa; font-size:22px; line-height:1; cursor:pointer; }
-    .settings-grid{ display:grid; grid-template-columns: 120px 1fr auto; gap:10px; align-items:center; }
-    .settings-grid input{ padding:10px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
-    .settings-grid label{ font-size:12px; color:#bbb; }
+    .settings-stack{ display:flex; flex-direction:column; gap:14px; }
+    .field label{ display:block; font-size:12px; color:#bbb; margin:0 0 6px; }
+    .field input{ width:100%; padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
+    .row-buttons{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
+    .row-buttons button,
+    .settings-actions button{ padding:12px; border-radius:12px; border:1px solid #333; background:#1a1a1a; color:#eaeaea; }
+    .row-buttons button:active,
+    .settings-actions button:active{ transform:scale(0.98); }
+    .help{ margin:6px 0 0; }
     .settings-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
   </style>
 </head>
 <dialog id="settingsModal">
-  <button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
+<button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
   <form method="dialog">
     <h3 style="margin:0 0 10px">Settings</h3>
 
-    <div class="settings-grid">
-      <label for="setName">Name</label>
-      <input id="setName" placeholder="Your display name" />
-      <div></div>
-
-      <label for="setRoomCode">Room code</label>
-      <input id="setRoomCode" placeholder="Secret (base64url)" />
-      <button type="button" id="btnGenRoom">Generate new</button>
-
-      <span class="muted" style="grid-column:1 / -1; font-size:12px">
-        Share the Room code to invite others. The app derives the room ID automatically.
-      </span>
+    <div class="settings-stack">
+      <div class="field">
+	<label for="setName">Name</label>
+	<input id="setName" placeholder="Your display name" />
+      </div>
+      
+      <div class="field">
+	<label for="setRoomCode">Room code</label>
+	<input id="setRoomCode" placeholder="Secret (base64url)" />
+	<div class="row-buttons">
+          <button type="button" id="btnGenRoom">Generate new</button>
+          <button type="button" id="btnCopyRoom">Copy</button>
+	</div>
+	<p class="muted help">Share the Room code to invite others. The app derives the room ID automatically.</p>
+      </div>
     </div>
-
+    
     <div class="settings-actions">
       <button type="button" id="btnConnectSettings">Connect</button>
     </div>

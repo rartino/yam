@@ -26,6 +26,7 @@ const f = {
   gen: document.getElementById('btnGenRoom'),
   connect: document.getElementById('btnConnectSettings'),
   close: document.getElementById('btnCloseSettings'),
+  copy: document.getElementById('btnCopyRoom'),  
 };
 
 let ws = null;
@@ -303,6 +304,19 @@ f.connect.addEventListener('click', async () => {
   if (roomChanged) await registerRoomIfNeeded();
 
   connectFromSettings();
+});
+
+f.copy.addEventListener('click', async () => {
+  const val = (f.room.value || '').trim();
+  if (!val) { alert('No room code to copy'); return; }
+  try {
+    await navigator.clipboard.writeText(val);
+    f.copy.textContent = 'Copied';
+  } catch {
+    // Fallback for older browsers
+    try { f.room.select(); document.execCommand('copy'); f.copy.textContent = 'Copied'; } catch {}
+  }
+  setTimeout(() => { f.copy.textContent = 'Copy'; }, 1500);
 });
 
 ui.btnSend.addEventListener('click', sendMessage);
