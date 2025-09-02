@@ -36,6 +36,25 @@
   - The profile data contains the same kind of metadata packages as when images are transmitted in the chat.
   - A client that misses the avatar image in its internal storage requests it the same way as for other images (i.e., an RTC request)
 
+* Download further history from other clients
+
+  - Use the webrtc channel feature to request history from other clients.
+  - At the top of history, there is a button "Request history from others", clicking this sends out a request for an RTC handshake to download history from others.
+
+* Direct messaging
+
+  - Set up some handling around rooms and client IDs so that it is obvious how to set up a 1-to-1 DM room between two users.
+    When receiving such a message, the client sets up a DM room in the room list.
+
+* Better security around invite URLs.
+
+  - Alter the handling of Room URLs so that an invite to a room instead refences the DM room plus the public key of the invite room.
+    When the Room URL is visited in the browser, the server handles an RTC handshake between the inviter and the invitee, and the proper secret key is transmitted of that channel.
+
+* Rethink security
+
+  - Should perhaps all client know all other clients public keys and encrypt the messages for all of them; to avoid the major sensitivity of room keys.
+
 Other links:
 
 - https://learn.microsoft.com/en-us/microsoft-edge/progressive-web-apps/
