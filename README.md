@@ -1,5 +1,6 @@
-# wsmessenger
-Simple client-server messaging PWA app
+# YAM: yet another messenger [WIP]
+
+A PWA app for a very no-nonsense messaging app with the expected featureset to be useful (users, rooms, stickers), with a simple workflow to invite new users.
 
 ## How to run
 
@@ -27,7 +28,6 @@ Open `http://localhost:8000` in your browser. (For production, put behind HTTPS 
 
 3. **Flow**
 
-* Click **Create Room** → copy **Room ID** (public key, base64url) and **Private key** (keep secret!)
-* Server receives only the **public key** via `POST /rooms`.
-* On another client, paste Room ID + Private key → **Join**. The client signs the server’s challenge to authenticate.
-* Messages are **sealed** to the room’s public key. The server stores only ciphertext in SQLite and can’t decrypt. On join, the client requests the last **7 days**.
+* Visit the client static web pages in your browser.
+* Create a new room in the popup dialog.
+* Open the cog icon top right, and send the room URL to people you want to invite (note that the URL is security sensitive: use a trusted channel).
