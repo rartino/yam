@@ -387,10 +387,13 @@ async function requestFile(hash) {
   if (DEBUG_RTC) dbg('RTC/REQ', 'start', { hash });
 
   const pc = new RTCPeerConnection(RTC_CONFIG);
+  pc.oniceconnectionstatechange = () => dbg('RTC/REQ iceState', pc.iceConnectionState);
+  pc.onconnectionstatechange = () => dbg('RTC/REQ pcState', pc.connectionState);
+    
   const dc = pc.createDataChannel('file');
   const reqId = randomIdB64(16);
 
-  const state = { pc, dc, hash, remotePeerId: null, iceBuf: [] };
+  const state = { pc, dc, hash, remotePeerId: null, iceBuf: [], incomingIceBuf: [], haveAnswer: false };
   pendingRequests.set(reqId, state);
 
   dc.binaryType = 'arraybuffer';
@@ -452,6 +455,8 @@ async function serveFileIfWeHaveIt(msg) {
   if (DEBUG_RTC) dbg('RTC/RESP', 'serve', { request_id, checksum, size: blob.size, mime: blob.type, from });
 
   const pc = new RTCPeerConnection(RTC_CONFIG);
+  pc.oniceconnectionstatechange = () => dbg('RTC/RESP iceState', pc.iceConnectionState);
+  pc.onconnectionstatechange = () => dbg('RTC/RESP pcState', pc.connectionState);
 
   // Register EARLY so incoming ICE has somewhere to land
   serveRequests.set(request_id, { pc, hash: checksum, iceBuf: [] });
@@ -531,44 +536,75 @@ async function handleWebRtcResponse(msg) {
   const { request_id, answer, from } = msg;
   const st = pendingRequests.get(request_id);
   if (!st) return;
-  if (DEBUG_SIG) dbg('SIG/RX', 'webrtc-response', { request_id, from, sdpLen: (answer.sdp||'').length });
-  await st.pc.setRemoteDescription(answer);
-  if (DEBUG_RTC) dbg('RTC/REQ', 'answer applied', { request_id });
-  st.remotePeerId = from;
 
-  // Flush any buffered ICE
+  if (DEBUG_SIG) dbg('SIG/RX', 'webrtc-response', { request_id, from, sdpLen: (answer.sdp||'').length });
+
+  // If we already picked a responder, ignore other replies
+  if (st.remotePeerId && st.remotePeerId !== from) {
+    if (DEBUG_RTC) dbg('RTC/REQ', 'ignore secondary answer', { request_id, from, chosen: st.remotePeerId });
+    return;
+  }
+
+  await st.pc.setRemoteDescription(answer);
+  st.remotePeerId = from;
+  st.haveAnswer = true;
+  if (DEBUG_RTC) dbg('RTC/REQ', 'answer applied', { request_id });
+
+  // Flush any buffered OUTGOING ICE we generated before we knew who to send to
   for (const cand of st.iceBuf) {
     ws.send(JSON.stringify({ type:'webrtc-ice', request_id, candidate: cand, to: from, from: myPeerId }));
   }
   st.iceBuf = [];
+
+  // **** NEW: Flush any buffered INCOMING ICE that arrived before answer ****
+  if (st.incomingIceBuf.length) {
+    if (DEBUG_RTC) dbg('RTC/REQ', 'flush buffered incoming ICE', { request_id, count: st.incomingIceBuf.length });
+    for (const cInit of st.incomingIceBuf) {
+      try { await st.pc.addIceCandidate(new RTCIceCandidate(cInit)); }
+      catch (e) { if (DEBUG_RTC) dbg('RTC/REQ', 'flush addIce error', e); }
+    }
+    st.incomingIceBuf = [];
+  }
 }
 
 async function handleWebRtcIce(msg) {
   const { request_id, candidate, from } = msg;
   if (!candidate) return;
-  const iceInit = candidate;                       // already JSON
-  const ice = new RTCIceCandidate(iceInit);
+  const iceInit = candidate;
 
   if (pendingRequests.has(request_id)) {
     // We are the requester
+    const st = pendingRequests.get(request_id);
+
+    // If we've already chosen a responder and this ICE is from someone else, ignore it
+    if (st.remotePeerId && from && from !== st.remotePeerId) {
+      if (DEBUG_SIG) dbg('SIG/RX', 'ice from non-selected responder ignored', { request_id, from, chosen: st.remotePeerId });
+      return;
+    }
+
+    // If we don't have an answer yet, we can't add ICE—buffer it
+    if (!st.haveAnswer) {
+      st.incomingIceBuf.push(iceInit);
+      if (DEBUG_SIG) dbg('SIG/RX', 'ice buffered (no remoteDescription yet)', { request_id, count: st.incomingIceBuf.length });
+      return;
+    }
+
     if (DEBUG_SIG) dbg('SIG/RX', 'ice to requester', { request_id, from, mid: iceInit.sdpMid, mline: iceInit.sdpMLineIndex });
-    try { await pendingRequests.get(request_id).pc.addIceCandidate(ice); }
+    try { await st.pc.addIceCandidate(new RTCIceCandidate(iceInit)); }
     catch (e) { if (DEBUG_RTC) dbg('RTC/REQ', 'addIce error', e); }
 
   } else if (serveRequests.has(request_id)) {
-    // We are the responder and already set up
+    // We are the responder; PC exists—add immediately
     if (DEBUG_SIG) dbg('SIG/RX', 'ice to responder', { request_id, from, mid: iceInit.sdpMid, mline: iceInit.sdpMLineIndex });
-    try { await serveRequests.get(request_id).pc.addIceCandidate(ice); }
+    try { await serveRequests.get(request_id).pc.addIceCandidate(new RTCIceCandidate(iceInit)); }
     catch (e) { if (DEBUG_RTC) dbg('RTC/RESP', 'addIce error', e); }
 
   } else {
-    // Not ready yet -> buffer it only if we might become responder for this request
-    if (!serveRequests.has(request_id)) {
-      const arr = preServeIce.get(request_id) || [];
-      arr.push(iceInit);
-      preServeIce.set(request_id, arr);
-      if (DEBUG_SIG) dbg('SIG/RX', 'ice buffered (no serve)', { request_id, count: arr.length });
-    }
+    // Not requester or responder yet -> buffer for responder setup (race)
+    const arr = preServeIce.get(request_id) || [];
+    arr.push(iceInit);
+    preServeIce.set(request_id, arr);
+    if (DEBUG_SIG) dbg('SIG/RX', 'ice buffered (no serve)', { request_id, count: arr.length });
   }
 }
 
