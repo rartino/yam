@@ -81,6 +81,23 @@
     .retry-btn:active { transform:scale(0.96); }
     .retry-icon { width:16px; height:16px; display:block; }
 
+    .hdr-center{ position: absolute; left:50%; transform:translateX(-50%); display:flex; align-items:center; }
+    .room-button{
+      display:flex; align-items:center; gap:6px; background:transparent; border:1px solid #333; color:#eaeaea;
+      border-radius:12px; padding:6px 10px; cursor:pointer;
+    }
+    .room-button .chev{ opacity:.7; }
+    .room-menu{
+      position:absolute; top:calc(100% + 8px); left:50%; transform:translateX(-50%);
+      min-width:220px; background:#121212; border:1px solid #333; border-radius:12px; padding:6px; z-index:60;
+      box-shadow: 0 8px 24px rgba(0,0,0,.4);
+    }
+    .room-item{ display:flex; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:10px; cursor:pointer; }
+    .room-item:hover{ background:#1a1a1a; }
+    .room-item .sub{ font-size:11px; color:#aaa; }
+    .room-create{ margin-top:6px; padding:8px 10px; border-top:1px solid #222; cursor:pointer; color:#cde; }
+    .room-create:hover{ background:#161616; }
+    
   </style>
 </head>
 <body>
@@ -89,36 +106,55 @@
   <dialog id="settingsModal">
     <button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
-      <h3 style="margin:0 0 10px">Settings</h3>
-
+      <h3 style="margin:0 0 10px">Configure room</h3>
       <div class="settings-stack">
-        <div class="field">
-          <label for="setName">Name</label>
-          <input id="setName" placeholder="Your display name" />
-        </div>
-
-        <div class="field">
-          <label for="setRoomCode">Room code</label>
-          <input id="setRoomCode" placeholder="Secret (base64url)" />
-          <div class="row-buttons">
-            <button type="button" id="btnGenRoom">Generate new</button>
-            <button type="button" id="btnCopyRoom">Copy</button>
-          </div>
-          <p class="muted help">Share the Room code to invite others. The app derives the room ID automatically.</p>
-        </div>
+	<div class="field">
+	  <label for="cfgRoomName">Room name</label>
+	  <input id="cfgRoomName" placeholder="Room name" />
+	</div>
       </div>
-
-      <div class="settings-actions">
-        <button type="button" id="btnConnectSettings">Connect</button>
+      <div class="settings-actions" style="justify-content:space-between">
+	<button type="button" id="btnRemoveRoom" style="border-color:#7a1a1a;background:#2a0e0e;color:#ffb3b3">Remove room</button>
+	<div>
+	  <button type="button" id="btnSaveRoomCfg">Save</button>
+	</div>
       </div>
     </form>
   </dialog>
-
+  <dialog id="createRoomModal">
+    <button id="btnCloseCreateRoom" class="dialog-close" aria-label="Close">×</button>
+    <form method="dialog">
+      <h3 style="margin:0 0 10px">Create new room</h3>
+      <div class="settings-stack">
+	<div class="field">
+	  <label for="newRoomName">Room name</label>
+	  <input id="newRoomName" placeholder="e.g., Family chat" />
+	</div>
+	<div class="field">
+	  <label for="newServerUrl">Server URL</label>
+	  <input id="newServerUrl" placeholder="https://rartino.pythonanywhere.com" />
+	  <p class="muted help">Use the base URL of your relay server (no trailing slash).</p>
+	</div>
+      </div>
+      <div class="settings-actions">
+	<button type="button" id="btnCreateRoom">Create room</button>
+      </div>
+    </form>
+  </dialog>
   <div id="app">
     <header>
       <div class="hdr-left">
-        <h1>WS Messenger <span id="appVersion" class="version"></span></h1>
+        <h1>Yam<span id="appVersion" class="version"></span></h1>
         <div id="status">Not connected</div>
+      </div>
+      <div class="hdr-center">
+	<button id="btnRoomMenu" class="room-button" aria-haspopup="true" aria-expanded="false">
+	  <span id="currentRoomName">No room</span>
+	  <svg class="chev" viewBox="0 0 24 24" width="16" height="16" fill="currentColor" aria-hidden="true">
+	    <path d="M7 10l5 5 5-5z"/>
+	  </svg>
+	</button>
+	<div id="roomMenu" class="room-menu" hidden></div>
       </div>
       <button id="btnSettings" class="icon-btn" aria-label="Settings" title="Settings">
         <!-- gear icon -->

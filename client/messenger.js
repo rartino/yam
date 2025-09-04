@@ -1,6 +1,6 @@
 // ====== CONFIG ======
-const RELAY_HTTP_BASE = 'https://rartino.pythonanywhere.com';
-const RELAY_WS_URL    = RELAY_HTTP_BASE.replace(/^http/, 'ws') + '/ws';
+const ROOMS_KEY = 'secmsg_rooms_v1';
+const CURRENT_ROOM_KEY = 'secmsg_current_room_id';
 const SETTINGS_KEY = 'secmsg_settings_v1';
 const RTC_CONFIG = {
   iceServers: [
@@ -30,21 +30,32 @@ const ui = {
   fileInput: document.getElementById('fileInput'),
   identityInfo: document.getElementById('identityInfo'),
   btnSettings: document.getElementById('btnSettings'),
+  btnRoomMenu   = document.getElementById('btnRoomMenu');
+  roomMenu      = document.getElementById('roomMenu');
+  currentRoomName = document.getElementById('currentRoomName');
 };
 
-const dlg = document.getElementById('settingsModal');
-const f = {
-  name: document.getElementById('setName'),
-  room: document.getElementById('setRoomCode'),
-  gen: document.getElementById('btnGenRoom'),
-  connect: document.getElementById('btnConnectSettings'),
-  close: document.getElementById('btnCloseSettings'),
-  copy: document.getElementById('btnCopyRoom'),
+const cr = {
+  dlg: document.getElementById('createRoomModal'),
+  name: document.getElementById('newRoomName'),
+  server: document.getElementById('newServerUrl'),
+  btnCreate: document.getElementById('btnCreateRoom'),
+  btnClose: document.getElementById('btnCloseCreateRoom'),
+};
+
+const cfg = {
+  dlg: document.getElementById('settingsModal'),
+  name: document.getElementById('cfgRoomName'),
+  btnSave: document.getElementById('btnSaveRoomCfg'),
+  btnRemove: document.getElementById('btnRemoveRoom'),
+  btnClose: document.getElementById('btnCloseSettings'),
 };
 
 //
 // ====== STATE ======
 let SETTINGS = { username: '', roomSkB64: '' };
+let RELAY_HTTP_BASE = null;
+let RELAY_WS_URL = null;
 
 let ws = null;
 let authed = false;
@@ -61,6 +72,9 @@ let currentRoomId = null;
 let myIdPk = null; // device identity public key (Uint8Array)
 let myIdSk = null; // device identity private key (Uint8Array)
 let myPeerId = null; // base64url of myIdPk
+
+let rooms = [];            // [{id, name, server, roomSkB64, roomId, createdAt}]
+let currentRoomId = null;  // string id = roomId (ed25519 pk b64u)
 
 // WebRTC maps
 const pendingRequests = new Map(); // request_id -> { pc, dc, hash, remotePeerId?, iceBuf? }
@@ -91,6 +105,101 @@ function scrollToEnd() {
 
 function clearMessagesUI() { ui.messages.innerHTML = ''; }
 
+function loadRooms(){
+  try { rooms = JSON.parse(localStorage.getItem(ROOMS_KEY) || '[]'); } catch { rooms = []; }
+  currentRoomId = localStorage.getItem(CURRENT_ROOM_KEY) || null;
+
+  // Migration: if legacy single-room settings exist, lift them into rooms
+  if (!rooms.length && getCurrentRoom().roomSkB64) {
+    const migratedServer = RELAY_HTTP_BASE || 'https://rartino.pythonanywhere.com';
+    const tmpSk = getCurrentRoom().roomSkB64;
+    try {
+      const sk = fromB64u(tmpSk);
+      const pk = derivePubFromSk(sk);
+      const rid = b64u(pk);
+      rooms.push({ id: rid, name: 'Room 1', server: migratedServer, roomSkB64: tmpSk, roomId: rid, createdAt: nowMs() });
+      currentRoomId = rid;
+      localStorage.removeItem(SETTINGS_KEY); // old structure not needed for room code
+    } catch {}
+  }
+
+  // If no current room but we have rooms, pick first
+  if (!currentRoomId && rooms.length) currentRoomId = rooms[0].id;
+}
+function saveRooms(){
+  localStorage.setItem(ROOMS_KEY, JSON.stringify(rooms));
+  if (currentRoomId) localStorage.setItem(CURRENT_ROOM_KEY, currentRoomId);
+}
+
+function getCurrentRoom(){
+  return rooms.find(r => r.id === currentRoomId) || null;
+}
+
+function setCurrentRoom(roomId){
+  currentRoomId = roomId;
+  saveRooms();
+  const r = getCurrentRoom();
+  document.getElementById('currentRoomName').textContent = r ? r.name : 'No room';
+  setRelayFromServer(r ? r.server : '');
+}
+
+function renderRoomMenu(){
+  const menu = document.getElementById('roomMenu');
+  const r = getCurrentRoom();
+  menu.innerHTML = '';
+  rooms.forEach(room => {
+    const div = document.createElement('div');
+    div.className = 'room-item';
+    div.innerHTML = `
+      <div>
+        <div>${room.name}</div>
+        <div class="sub">${room.server}</div>
+      </div>
+      ${room.id === currentRoomId ? '<div class="sub">✓</div>' : ''}
+    `;
+    div.addEventListener('click', () => {
+      menu.hidden = true;
+      if (room.id !== currentRoomId) openRoom(room.id);
+    });
+    menu.appendChild(div);
+  });
+  const create = document.createElement('div');
+  create.className = 'room-create';
+  create.textContent = 'Create room…';
+  create.addEventListener('click', () => {
+    menu.hidden = true;
+    openCreateRoomDialog();
+  });
+  menu.appendChild(create);
+}
+
+async function openRoom(roomId){
+  setCurrentRoom(roomId);
+  const r = getCurrentRoom();
+  if (!r) return;
+  // set keys for this room
+  await ensureSodium();
+  edSk = fromB64u(r.roomSkB64);
+  edPk = derivePubFromSk(edSk);
+  curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(edPk);
+  curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(edSk);
+  currentRoomId = r.id; // equals b64u(edPk)
+  await registerRoomIfNeeded(r.server);
+  await connectToCurrentRoom();
+}
+
+function normServer(url){
+  if (!url) return '';
+  let u = url.trim();
+  if (u.endsWith('/')) u = u.slice(0,-1);
+  if (!/^https?:\/\//i.test(u)) u = 'https://' + u;
+  return u;
+}
+
+function setRelayFromServer(serverUrl){
+  RELAY_HTTP_BASE = normServer(serverUrl);
+  RELAY_WS_URL = RELAY_HTTP_BASE.replace(/^http/i, 'ws') + '/ws';
+}
 
 // Wait until all queued bytes have left the datachannel, or timeout
 async function waitForDrain(dc, { settleMs = 200, timeoutMs = 5000 } = {}) {
@@ -217,14 +326,33 @@ function setRoomFromSecret(skB64) {
   currentRoomId = b64u(edPk);
 }
 
-async function registerRoomIfNeeded() {
+async function registerRoomIfNeeded(serverUrl) {
   try {
-    await fetch(`${RELAY_HTTP_BASE}/rooms`, {
+    await fetch(`${normServer(serverUrl)}/rooms`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ room_id: currentRoomId, ed25519_public_key_b64u: currentRoomId })
     });
   } catch {}
 }
+
+function openCreateRoomDialog(){
+  cr.name.value = '';
+  cr.server.value = RELAY_HTTP_BASE || 'https://rartino.pythonanywhere.com';
+  cr.dlg.showModal();
+}
+cr.btnClose.addEventListener('click', () => cr.dlg.close());
+cr.btnCreate.addEventListener('click', async () => {
+  const name = (cr.name.value || '').trim() || 'New room';
+  const server = normServer(cr.server.value || '');
+  if (!server) { alert('Server URL is required'); return; }
+  await ensureSodium();
+  const { privateKey } = sodium.crypto_sign_keypair();
+  const rid = b64u(derivePubFromSk(privateKey));
+  const room = { id: rid, name, server, roomSkB64: b64u(privateKey), roomId: rid, createdAt: nowMs() };
+  rooms.push(room); saveRooms();
+  cr.dlg.close();
+  await openRoom(room.id);
+});
 
 // ====== Rendering ======
 function renderTextMessage({ text, ts, nickname, senderId, verified }) {
@@ -609,26 +737,37 @@ async function handleWebRtcIce(msg) {
 }
 
 // ====== Connection lifecycle ======
-async function connectFromSettings() {
-  if (!SETTINGS.roomSkB64) return;
+async function connectToCurrentRoom() {
+  const room = getCurrentRoom();
+  if (!room) return;
 
-  await ensureSodium();
-  setRoomFromSecret(SETTINGS.roomSkB64);
-
+  // cancel timers
   if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
   if (heartbeatTimer) { clearInterval(heartbeatTimer); heartbeatTimer = null; }
+
+  // close previous socket
   if (ws) { try { ws.onclose = null; ws.close(); } catch(_){} ws = null; }
 
-  ws = new WebSocket(`${RELAY_WS_URL}?room=${encodeURIComponent(currentRoomId)}`);
-  if (DEBUG_SIG) dbg('SIG/WS', 'opening', { room: currentRoomId });
+  setRelayFromServer(room.server);
+  const url = `${RELAY_WS_URL}?room=${encodeURIComponent(currentRoomId)}`;
+  ws = new WebSocket(url);
 
   ws.onopen  = () => { if (DEBUG_SIG) dbg('SIG/WS', 'open'); setStatus('Connecting…'); };
   ws.onerror = (e) => { setStatus('WebSocket error'); if (DEBUG_SIG) dbg('SIG/WS', 'error', e); };
-  ws.onclose = (e) => { authed = false; setStatus('Disconnected'); if (DEBUG_SIG) dbg('SIG/WS', 'close', { code:e.code, reason:e.reason }); scheduleReconnect(); };
+  ws.onclose = (e) => {
+    authed = false; setStatus('Disconnected');
+    if (DEBUG_SIG) dbg('SIG/WS', 'close', { code:e.code, reason:e.reason });
+    scheduleReconnect();
+  };
 
   ws.onmessage = async (evt) => {
     const m = JSON.parse(evt.data);
-    if (DEBUG_SIG) dbg('SIG/RX', m.type, Object.assign({}, m, { ciphertext: m.ciphertext ? `<${m.ciphertext.length} chars>`: undefined, offer: m.offer ? { type:m.offer.type, sdpLen: (m.offer.sdp||'').length } : undefined, answer: m.answer ? { type:m.answer.type, sdpLen: (m.answer.sdp||'').length } : undefined, candidate: m.candidate ? { has: true } : undefined }));
+    if (DEBUG_SIG) dbg('SIG/RX', m.type, Object.assign({}, m, {
+      ciphertext: m.ciphertext ? `<${m.ciphertext.length} chars>`: undefined,
+      offer: m.offer ? { type:m.offer.type, sdpLen: (m.offer.sdp||'').length } : undefined,
+      answer: m.answer ? { type:m.answer.type, sdpLen: (m.answer.sdp||'').length } : undefined,
+      candidate: m.candidate ? { has: true } : undefined
+    }));
 
     if (m.type === 'challenge') {
       const nonce = fromB64u(m.nonce);
@@ -637,31 +776,22 @@ async function connectFromSettings() {
 
     } else if (m.type === 'ready') {
       authed = true; setStatus('Connected'); reconnectAttempt = 0;
-      // Announce our device id for signaling
-      if (DEBUG_SIG) dbg('SIG/TX', 'announce', { peer_id: myPeerId });
       ws.send(JSON.stringify({ type: 'announce', peer_id: myPeerId }));
-
       clearMessagesUI();
-      if (DEBUG_SIG) dbg('SIG/TX', 'history', { since: sevenDaysAgoMs() });
       ws.send(JSON.stringify({ type: 'history', since: sevenDaysAgoMs() }));
       requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
-
       if (heartbeatTimer) clearInterval(heartbeatTimer);
-      heartbeatTimer = setInterval(() => {
-        try { ws.send(JSON.stringify({ type: 'ping', ts: nowMs() })); } catch {}
-      }, 25000);
-
+      heartbeatTimer = setInterval(() => { try { ws.send(JSON.stringify({ type: 'ping', ts: nowMs() })); } catch {} }, 25000);
 
     } else if (m.type === 'history') {
       if (DEBUG_SIG) dbg('SIG/RX', 'history', { count: (m.messages||[]).length });
-      for (const item of m.messages) handleIncoming(item);
+      for (const item of m.messages) handleIncoming(item, /*fromHistory=*/true);
       scrollToEnd(); requestAnimationFrame(scrollToEnd);
 
     } else if (m.type === 'message') {
       handleIncoming(m);
 
     } else if (m.type === 'webrtc-request') {
-      // Someone is asking for a file by checksum
       serveFileIfWeHaveIt(m);
 
     } else if (m.type === 'webrtc-response') {
@@ -672,7 +802,6 @@ async function connectFromSettings() {
 
     } else if (m.type === 'pong') {
       // no-op
-
     } else if (m.type === 'error') {
       renderTextMessage({ text: `Server error: ${m.error}`, ts: nowMs(), nickname: 'server', senderId: null });
     }
@@ -680,12 +809,13 @@ async function connectFromSettings() {
 }
 
 function scheduleReconnect() {
-  if (!SETTINGS.roomSkB64) return;
+  const r = getCurrentRoom();
+  if (!r) return;
   const delay = Math.min(30000, 1000 * Math.pow(2, reconnectAttempt));
   reconnectAttempt++;
   setStatus(`Disconnected — reconnecting in ${Math.round(delay/1000)}s`);
   if (reconnectTimer) clearTimeout(reconnectTimer);
-  reconnectTimer = setTimeout(() => connectFromSettings(), delay);
+  reconnectTimer = setTimeout(() => connectToCurrentRoom(), delay);
 }
 
 function showPendingBubble(bubbleEl, meta) {
@@ -752,44 +882,65 @@ ui.fileInput.addEventListener('change', async (e) => {
 
 // Settings dialog
 ui.btnSettings.addEventListener('click', () => {
-  f.name.value = SETTINGS.username || '';
-  f.room.value = SETTINGS.roomSkB64 || '';
-  dlg.showModal();
+  const r = getCurrentRoom();
+  if (!r) { openCreateRoomDialog(); return; }
+  cfg.name.value = r.name || '';
+  cfg.dlg.showModal();
 });
-f.gen.addEventListener('click', async () => {
-  await ensureSodium();
-  const { privateKey } = sodium.crypto_sign_keypair();
-  f.room.value = b64u(privateKey);
+cfg.btnClose.addEventListener('click', () => cfg.dlg.close());
+
+cfg.btnSave.addEventListener('click', () => {
+  const r = getCurrentRoom(); if (!r) return;
+  r.name = (cfg.name.value || '').trim() || r.name;
+  saveRooms();
+  setCurrentRoom(r.id);
+  renderRoomMenu();
+  cfg.dlg.close();
 });
-f.close.addEventListener('click', () => dlg.close());
-f.copy.addEventListener('click', async () => {
-  const val = (f.room.value || '').trim();
-  if (!val) { alert('No room code to copy'); return; }
-  try { await navigator.clipboard.writeText(val); f.copy.textContent = 'Copied'; }
-  catch { try { f.room.select(); document.execCommand('copy'); f.copy.textContent = 'Copied'; } catch {} }
-  setTimeout(() => { f.copy.textContent = 'Copy'; }, 1500);
+
+cfg.btnRemove.addEventListener('click', () => {
+  const r = getCurrentRoom(); if (!r) return;
+  if (!confirm(`Remove room “${r.name}”?`)) return;
+  rooms = rooms.filter(x => x.id !== r.id);
+  saveRooms();
+  cfg.dlg.close();
+  if (rooms.length) {
+    openRoom(rooms[0].id);
+  } else {
+    // No rooms left; disconnect and prompt create
+    if (ws) { try { ws.close(); } catch{} ws = null; }
+    clearMessagesUI();
+    setStatus('No room');
+    document.getElementById('currentRoomName').textContent = 'No room';
+    openCreateRoomDialog();
+  }
 });
-f.connect.addEventListener('click', async () => {
-  const newName = (f.name.value || '').trim() || 'Me';
-  const newRoomSk = (f.room.value || '').trim();
-  if (!newRoomSk) { alert('Room code is required.'); return; }
-  if ((SETTINGS.username || '') !== newName) { await ensureSodium(); rotateIdentityWithName(newName); }
-  const roomChanged = SETTINGS.roomSkB64 !== newRoomSk;
-  SETTINGS.username = newName; SETTINGS.roomSkB64 = newRoomSk; saveSettings();
-  dlg.close();
-  await ensureSodium(); setRoomFromSecret(SETTINGS.roomSkB64);
-  if (roomChanged) await registerRoomIfNeeded();
-  connectFromSettings();
+
+// Room dialog
+ui.btnRoomMenu.addEventListener('click', () => {
+  const open = ui.roomMenu.hasAttribute('hidden');
+  renderRoomMenu();
+  ui.roomMenu.hidden = !open;
+  ui.btnRoomMenu.setAttribute('aria-expanded', String(open));
+});
+document.addEventListener('click', (e) => {
+  if (!ui.roomMenu.contains(e.target) && !ui.btnRoomMenu.contains(e.target)) {
+    ui.roomMenu.hidden = true;
+    ui.btnRoomMenu.setAttribute('aria-expanded', 'false');
+  }
 });
 
 // ====== Boot ======
-loadSettings();
+loadSettings();           // keeps username + device identity behavior
 await ensureIdentity();
-setStatus('Ready');
+loadRooms();
 
-if (SETTINGS.roomSkB64) {
-  await registerRoomIfNeeded();
-  connectFromSettings();
+// If we have at least one room, activate it; else prompt to create
+if (rooms.length) {
+  setCurrentRoom(currentRoomId);
+  await openRoom(currentRoomId);
 } else {
-  dlg.showModal();
+  setStatus('No room');
+  document.getElementById('currentRoomName').textContent = 'No room';
+  openCreateRoomDialog();
 }
