@@ -740,34 +740,60 @@ async function finishInviteDialog(){
   const code = (inv.answerTA.value || '').trim();
   if (!code) { alert('Paste response code first'); return; }
   const msg = unpackSignal(code);
-  if (!msg || msg.type !== 'answer' || !msg.sdp) { alert('Invalid response code'); return; }
+    if (!msg || msg.type !== 'answer' || !msg.sdp) { alert('Invalid response code'); return; }
 
   try {
     await invitePC.setRemoteDescription({ type:'answer', sdp: msg.sdp });
     dbg('RTC/INV', 'answer applied');
 
-    // When the channel opens, send the room payload
-    inviteDC.onopen = async () => {
+    const sendRoom = async () => {
       dbg('RTC/INV', 'dc open -> send room');
+      const room = getCurrentRoom();
       const payload = {
-        ver:1, kind:'room-invite',
-        room: {
-          id: room.id,
-          name: room.name,
-          server: normServer(room.server),
-          roomSkB64: room.roomSkB64,
-          createdAt: nowMs()
-        }
+	ver:1, kind:'room-invite',
+	room: {
+	  id: room.id,
+	  name: room.name,
+	  server: normServer(room.server),
+	  roomSkB64: room.roomSkB64,
+	  createdAt: nowMs()
+	}
       };
       inviteDC.send(JSON.stringify(payload));
-      // let it flush then close
-      setTimeout(() => { try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{} }, 400);
-      inv.dlg.close();
     };
+
+    // NEW: listen for ACK and then close
+    let acked = false;
+    inviteDC.onmessage = (evt) => {
+      // In case the joiner sends ACK earlier than we attach in finish
+      try {
+	const txt = (typeof evt.data === 'string') ? evt.data : new TextDecoder().decode(evt.data);
+	const o = JSON.parse(txt);
+	if (o && o.kind === 'invite-ack') dbg('RTC/INV', 'early ack');
+      } catch {}
+    };
+
+    // Send now if already open, otherwise on open
+    if (inviteDC.readyState === 'open') {
+      await sendRoom();
+    } else {
+      inviteDC.onopen = sendRoom;
+    }
+
+    // Fallback close if no ACK within 5s
+    setTimeout(() => {
+      if (!acked) {
+	dbg('RTC/INV', 'no ack timeout; closing');
+	try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{}
+	inv.dlg.close();
+      }
+    }, 5000);
+
   } catch (e) {
     console.error(e);
     alert('Failed to apply response');
   }
+
 }
 
 // ====== Server connection mgmt ======
@@ -1078,33 +1104,47 @@ async function generateJoinAnswer(){
     dc.onopen = () => dbg('RTC/JOIN', 'dc open');
     dc.onmessage = async (evt) => {
       try {
-        const obj = JSON.parse(new TextDecoder().decode(evt.data));
-        if (obj && obj.kind === 'room-invite' && obj.room) {
-          const r = obj.room;
-          // Validate: derived id must match provided id
-          try {
-            await ensureSodium();
-            const sk = fromB64u(r.roomSkB64);
-            const pk = derivePubFromSk(sk);
-            const derived = b64u(pk);
-            if (derived !== r.id) throw new Error('ID mismatch');
-          } catch(e) {
-            alert('Invalid room code received'); return;
-          }
-          // Add room if not present
-          if (!rooms.find(x => x.id === r.id)) {
-            rooms.push({ id:r.id, name:r.name||'New room', server:normServer(r.server), roomSkB64:r.roomSkB64, roomId:r.id, createdAt:r.createdAt||nowMs() });
-            saveRooms();
-            ensureServerConnection(r.server); // socket will subscribe on open
-            await registerRoomIfNeeded(r);    // optional
-            // Make it the active room right away
-            await openRoom(r.id);
-          }
-          join.dlg.close();
-          // Close RTC
-          setTimeout(() => { try{ dc.close(); }catch{} try{ pc.close(); }catch{} }, 300);
-        }
-      } catch(_){}
+	// Handle both string and binary frames
+	const text = (typeof evt.data === 'string')
+	  ? evt.data
+	  : new TextDecoder().decode(evt.data);
+	const obj = JSON.parse(text);
+
+	if (obj && obj.kind === 'room-invite' && obj.room) {
+	  const r = obj.room;
+
+	  // Validate: derived id must match provided id
+	  await ensureSodium();
+	  const sk = fromB64u(r.roomSkB64);
+	  const pk = derivePubFromSk(sk);
+	  const derived = b64u(pk);
+	  if (derived !== r.id) { alert('Invalid room code received'); return; }
+
+	  // Add room if not present
+	  if (!rooms.find(x => x.id === r.id)) {
+	    rooms.push({
+	      id: r.id,
+	      name: r.name || 'New room',
+	      server: normServer(r.server),
+	      roomSkB64: r.roomSkB64,
+	      roomId: r.id,
+	      createdAt: r.createdAt || nowMs()
+	    });
+	    saveRooms();
+	    ensureServerConnection(r.server);
+	    await registerRoomIfNeeded(r);
+	    await openRoom(r.id);
+	  }
+
+	  // NEW: acknowledge so inviter knows it landed
+	  try { dc.send(JSON.stringify({ kind: 'invite-ack' })); } catch {}
+
+	  join.dlg.close();
+	  setTimeout(() => { try { dc.close(); } catch{} try { pc.close(); } catch{} }, 300);
+	}
+      } catch (e) {
+	dbg('RTC/JOIN', 'message parse error', e);
+      }
     };
   };
 
