@@ -10,7 +10,17 @@ from simple_websocket import Server
 DB_PATH = os.environ.get("WS_DB_PATH", "messages.db")
 
 app = Flask(__name__)
-CORS(app)
+APP = app
+CORS(
+    app,
+    resources={
+        r"/ws": {"origins": ["https://rickard.armiento.se"]},
+        r"/health": {"origins": ["https://rickard.armiento.se"]},
+        r"/rooms": {"origins": ["https://rickard.armiento.se"]},
+    },
+    methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["Content-Type"],
+)
 sock = Sock(app)
 
 # ---------- Logging ----------
@@ -161,19 +171,21 @@ def ws_handler(ws: Server):
                 if nonce is None:
                     ws.send(json.dumps({'type': 'error', 'error': 'no challenge', 'room_id': room_id}))
                     continue
-                # verify: Ed25519 signature over nonce with public key = room_id
                 try:
                     import nacl.signing, nacl.encoding, nacl.exceptions
-                    verify_key = nacl.signing.VerifyKey(room_id.encode('utf-8'), encoder=nacl.encoding.URLSafeBase64Encoder)
+                    # Decode unpadded base64url -> raw 32-byte public key
+                    pk_bytes = _from_b64u(room_id)
+                    verify_key = nacl.signing.VerifyKey(pk_bytes, encoder=nacl.encoding.RawEncoder)
+
                     sig = _from_b64u(signature_b64)
-                    verify_key.verify(nonce, sig)
-                    # success
+                    verify_key.verify(nonce, sig)  # message=nonce, signature=sig
+
                     ROOM_CONNECTIONS.setdefault(room_id, set()).add(ws)
-                    ROOM_PEERS.setdefault(room_id, {})  # per-room map
+                    ROOM_PEERS.setdefault(room_id, {})
                     LOG("auth ok", "room=", room_id, "conns=", len(ROOM_CONNECTIONS[room_id]))
                     ws.send(json.dumps({'type': 'ready', 'room_id': room_id}))
-                except Exception:
-                    LOG("auth fail", "room=", room_id)
+                except Exception as e:
+                    LOG("auth fail", "room=", room_id, "err=", repr(e))
                     ws.send(json.dumps({'type': 'error', 'error': 'auth failed', 'room_id': room_id}))
                 continue
 

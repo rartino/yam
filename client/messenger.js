@@ -33,6 +33,37 @@ const ui = {
   currentRoomName: document.getElementById('currentRoomName'),
 };
 
+// Gear -> configure room
+const cfg = {
+  dlg: document.getElementById('settingsModal'),
+  name: document.getElementById('cfgRoomName'),
+  btnSave: document.getElementById('btnSaveRoomCfg'),
+  btnRemove: document.getElementById('btnRemoveRoom'),
+  btnClose: document.getElementById('btnCloseSettings'),
+  btnInvite: document.getElementById('btnInvite'),
+};
+
+// Invite (sender)
+const inv = {
+  dlg: document.getElementById('inviteModal'),
+  offerTA: document.getElementById('inviteOffer'),
+  answerTA: document.getElementById('inviteAnswer'),
+  btnCopyOffer: document.getElementById('btnCopyInviteOffer'),
+  btnRefreshOffer: document.getElementById('btnRefreshInviteOffer'),
+  btnFinish: document.getElementById('btnFinishInvite'),
+  btnClose: document.getElementById('btnCloseInvite'),
+};
+
+// Join (receiver)
+const join = {
+  dlg: document.getElementById('joinModal'),
+  offerTA: document.getElementById('joinOffer'),
+  answerTA: document.getElementById('joinAnswer'),
+  btnGen: document.getElementById('btnMakeJoinAnswer'),
+  btnCopy: document.getElementById('btnCopyJoinAnswer'),
+  btnClose: document.getElementById('btnCloseJoin'),
+};
+
 // ====== STATE ======
 let SETTINGS = { username: '', roomSkB64: '' };
 
@@ -80,6 +111,31 @@ function scrollToEnd() {
   doScroll(); requestAnimationFrame(doScroll); setTimeout(doScroll, 0);
 }
 function clearMessagesUI() { ui.messages.innerHTML = ''; }
+
+function utf8ToBytes(str){ return new TextEncoder().encode(str); }
+function bytesToUtf8(bytes){ return new TextDecoder().decode(bytes); }
+function packSignal(obj){ return b64u(utf8ToBytes(JSON.stringify(obj))); }
+function unpackSignal(code){
+  try { return JSON.parse(bytesToUtf8(fromB64u(code.trim()))); }
+  catch { return null; }
+}
+
+// Wait until ICE gathering completes (no trickle)
+function waitIceComplete(pc){
+  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+  return new Promise(res => {
+    const check = () => {
+      if (pc.iceGatheringState === 'complete') {
+        pc.removeEventListener('icegatheringstatechange', check);
+        res();
+      }
+    };
+    pc.addEventListener('icegatheringstatechange', check);
+    // fallback: also re-check after a short delay
+    setTimeout(check, 100);
+  });
+}
+
 
 // Wait until all queued bytes have left the datachannel, or timeout
 async function waitForDrain(dc, { settleMs = 200, timeoutMs = 5000 } = {}) {
@@ -645,6 +701,75 @@ async function handleWebRtcIce(serverUrl, msg) {
   }
 }
 
+let invitePC = null, inviteDC = null;
+
+async function openInviteDialog(){
+  const room = getCurrentRoom();
+  if (!room) { alert('No active room'); return; }
+  await ensureSodium();
+
+  // Fresh RTCPeerConnection (no trickle ICE: we wait for complete)
+  if (invitePC) { try { invitePC.close(); } catch{} invitePC = null; }
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  invitePC = pc;
+
+  pc.oniceconnectionstatechange = () => dbg('RTC/INV iceState', pc.iceConnectionState);
+  pc.onconnectionstatechange = () => dbg('RTC/INV pcState', pc.connectionState);
+
+  const dc = pc.createDataChannel('invite');
+  inviteDC = dc;
+  dc.onopen = () => dbg('RTC/INV', 'dc open');
+  dc.onclose = () => dbg('RTC/INV', 'dc close');
+
+  // Build offer (one-shot)
+  const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
+  await pc.setLocalDescription(offer);
+  await waitIceComplete(pc);
+
+  const offerSdp = pc.localDescription.sdp;
+  const inviteCode = packSignal({ type:'offer', sdp: offerSdp });
+  inv.offerTA.value = inviteCode;
+  inv.answerTA.value = '';
+
+  inv.dlg.showModal();
+}
+
+async function finishInviteDialog(){
+  const room = getCurrentRoom();
+  if (!room) return;
+  const code = (inv.answerTA.value || '').trim();
+  if (!code) { alert('Paste response code first'); return; }
+  const msg = unpackSignal(code);
+  if (!msg || msg.type !== 'answer' || !msg.sdp) { alert('Invalid response code'); return; }
+
+  try {
+    await invitePC.setRemoteDescription({ type:'answer', sdp: msg.sdp });
+    dbg('RTC/INV', 'answer applied');
+
+    // When the channel opens, send the room payload
+    inviteDC.onopen = async () => {
+      dbg('RTC/INV', 'dc open -> send room');
+      const payload = {
+        ver:1, kind:'room-invite',
+        room: {
+          id: room.id,
+          name: room.name,
+          server: normServer(room.server),
+          roomSkB64: room.roomSkB64,
+          createdAt: nowMs()
+        }
+      };
+      inviteDC.send(JSON.stringify(payload));
+      // let it flush then close
+      setTimeout(() => { try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{} }, 400);
+      inv.dlg.close();
+    };
+  } catch (e) {
+    console.error(e);
+    alert('Failed to apply response');
+  }
+}
+
 // ====== Server connection mgmt ======
 function ensureServerConnection(serverUrl) {
   serverUrl = normServer(serverUrl);
@@ -814,6 +939,14 @@ function renderRoomMenu(){
     openCreateRoomDialog();
   });
   menu.appendChild(create);
+  const joinItem = document.createElement('div');
+  joinItem.className = 'room-create';
+  joinItem.textContent = 'Join room…';
+  joinItem.addEventListener('click', () => {
+    ui.roomMenu.hidden = true;
+    openJoinDialog();
+  });
+  menu.appendChild(joinItem);  
 }
 
 function openCreateRoomDialog(){
@@ -854,14 +987,6 @@ cr.btnCreate.addEventListener('click', async () => {
   await openRoom(room.id);
 });
 
-// Gear -> configure room
-const cfg = {
-  dlg: document.getElementById('settingsModal'),
-  name: document.getElementById('cfgRoomName'),
-  btnSave: document.getElementById('btnSaveRoomCfg'),
-  btnRemove: document.getElementById('btnRemoveRoom'),
-  btnClose: document.getElementById('btnCloseSettings'),
-};
 ui.btnSettings.addEventListener('click', () => {
   const r = getCurrentRoom();
   if (!r) { openCreateRoomDialog(); return; }
@@ -927,6 +1052,77 @@ async function openRoom(roomId){
   }
 }
 
+let joinPC = null, joinDC = null;
+
+function openJoinDialog(){
+  join.offerTA.value = '';
+  join.answerTA.value = '';
+  join.dlg.showModal();
+}
+
+async function generateJoinAnswer(){
+  const code = (join.offerTA.value || '').trim();
+  const msg = unpackSignal(code);
+  if (!msg || msg.type !== 'offer' || !msg.sdp) { alert('Invalid invitation code'); return; }
+
+  if (joinPC) { try { joinPC.close(); } catch{} joinPC = null; }
+  const pc = new RTCPeerConnection(RTC_CONFIG);
+  joinPC = pc;
+
+  pc.oniceconnectionstatechange = () => dbg('RTC/JOIN iceState', pc.iceConnectionState);
+  pc.onconnectionstatechange = () => dbg('RTC/JOIN pcState', pc.connectionState);
+
+  pc.ondatachannel = (evt) => {
+    const dc = evt.channel;
+    joinDC = dc;
+    dc.onopen = () => dbg('RTC/JOIN', 'dc open');
+    dc.onmessage = async (evt) => {
+      try {
+        const obj = JSON.parse(new TextDecoder().decode(evt.data));
+        if (obj && obj.kind === 'room-invite' && obj.room) {
+          const r = obj.room;
+          // Validate: derived id must match provided id
+          try {
+            await ensureSodium();
+            const sk = fromB64u(r.roomSkB64);
+            const pk = derivePubFromSk(sk);
+            const derived = b64u(pk);
+            if (derived !== r.id) throw new Error('ID mismatch');
+          } catch(e) {
+            alert('Invalid room code received'); return;
+          }
+          // Add room if not present
+          if (!rooms.find(x => x.id === r.id)) {
+            rooms.push({ id:r.id, name:r.name||'New room', server:normServer(r.server), roomSkB64:r.roomSkB64, roomId:r.id, createdAt:r.createdAt||nowMs() });
+            saveRooms();
+            ensureServerConnection(r.server); // socket will subscribe on open
+            await registerRoomIfNeeded(r);    // optional
+            // Make it the active room right away
+            await openRoom(r.id);
+          }
+          join.dlg.close();
+          // Close RTC
+          setTimeout(() => { try{ dc.close(); }catch{} try{ pc.close(); }catch{} }, 300);
+        }
+      } catch(_){}
+    };
+  };
+
+  await pc.setRemoteDescription({ type:'offer', sdp: msg.sdp });
+  const answer = await pc.createAnswer();
+  await pc.setLocalDescription(answer);
+  await waitIceComplete(pc);
+
+  const answerCode = packSignal({ type:'answer', sdp: pc.localDescription.sdp });
+  join.answerTA.value = answerCode;
+}
+
+join.btnClose?.addEventListener('click', () => join.dlg.close());
+join.btnGen?.addEventListener('click', generateJoinAnswer);
+join.btnCopy?.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(join.answerTA.value); join.btnCopy.textContent='Copied'; setTimeout(()=>join.btnCopy.textContent='Copy',1000);} catch {}
+});
+
 // ====== Events ======
 ui.btnSend.addEventListener('click', async () => {
   const text = ui.msgInput.value.trim();
@@ -960,6 +1156,14 @@ ui.fileInput?.addEventListener('change', async (e) => {
   await sendFileMetadata(room, meta);
   ui.fileInput.value = '';
 });
+
+btnInvite?.addEventListener('click', openInviteDialog);
+inv.btnClose?.addEventListener('click', () => inv.dlg.close());
+inv.btnCopyOffer?.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText(inv.offerTA.value); inv.btnCopyOffer.textContent='Copied'; setTimeout(()=>inv.btnCopyOffer.textContent='Copy',1000);} catch {}
+});
+inv.btnRefreshOffer?.addEventListener('click', openInviteDialog);
+inv.btnFinish?.addEventListener('click', finishInviteDialog);
 
 // ====== Boot ======
 loadSettings();

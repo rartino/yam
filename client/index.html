@@ -101,7 +101,7 @@
   </style>
 </head>
 <body>
-
+  
   <!-- Settings dialog -->
   <dialog id="settingsModal">
     <button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
@@ -117,10 +117,13 @@
 	<button type="button" id="btnRemoveRoom" style="border-color:#7a1a1a;background:#2a0e0e;color:#ffb3b3">Remove room</button>
 	<div>
 	  <button type="button" id="btnSaveRoomCfg">Save</button>
+	  <button type="button" id="btnInvite">Invite</button>
 	</div>
       </div>
     </form>
   </dialog>
+  
+  <!-- Create room dialog -->  
   <dialog id="createRoomModal">
     <button id="btnCloseCreateRoom" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
@@ -141,6 +144,60 @@
       </div>
     </form>
   </dialog>
+  
+  <!-- Invite (sender) -->
+  <dialog id="inviteModal">
+    <button id="btnCloseInvite" class="dialog-close" aria-label="Close">×</button>
+    <form method="dialog">
+      <h3 style="margin:0 0 10px">Invite to this room</h3>
+      <div class="settings-stack">
+	<p class="muted help">Step 1: Copy this invitation code and send it to your friend.</p>
+	<div class="field">
+	  <label>Invitation code</label>
+	  <textarea id="inviteOffer" readonly rows="5" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
+	  <div class="row-buttons" style="grid-template-columns:auto auto">
+	    <button type="button" id="btnCopyInviteOffer">Copy</button>
+	    <button type="button" id="btnRefreshInviteOffer">Regenerate</button>
+	  </div>
+	</div>
+
+	<p class="muted help">Step 2: Paste the response code you get back and finish.</p>
+	<div class="field">
+	  <label>Response code</label>
+	  <textarea id="inviteAnswer" rows="5" placeholder="Paste response code here" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
+	</div>
+      </div>
+      <div class="settings-actions" style="justify-content:flex-end">
+	<button type="button" id="btnFinishInvite">Finish</button>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Join (receiver) -->
+  <dialog id="joinModal">
+    <button id="btnCloseJoin" class="dialog-close" aria-label="Close">×</button>
+    <form method="dialog">
+      <h3 style="margin:0 0 10px">Join a room</h3>
+      <div class="settings-stack">
+	<p class="muted help">Step 1: Paste the invitation code you received.</p>
+	<div class="field">
+	  <label>Invitation code</label>
+	  <textarea id="joinOffer" rows="5" placeholder="Paste invitation code here" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
+	</div>
+
+	<p class="muted help">Step 2: Copy the response code below and send it back.</p>
+	<div class="field">
+	  <label>Response code</label>
+	  <textarea id="joinAnswer" readonly rows="5" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
+	  <div class="row-buttons" style="grid-template-columns:auto auto">
+	    <button type="button" id="btnMakeJoinAnswer">Generate response</button>
+	    <button type="button" id="btnCopyJoinAnswer">Copy</button>
+	  </div>
+	</div>
+      </div>
+    </form>
+  </dialog>
+  
   <div id="app">
     <header>
       <div class="hdr-left">
