@@ -30,9 +30,9 @@ const ui = {
   fileInput: document.getElementById('fileInput'),
   identityInfo: document.getElementById('identityInfo'),
   btnSettings: document.getElementById('btnSettings'),
-  btnRoomMenu   = document.getElementById('btnRoomMenu');
-  roomMenu      = document.getElementById('roomMenu');
-  currentRoomName = document.getElementById('currentRoomName');
+  btnRoomMenu: document.getElementById('btnRoomMenu'),
+  roomMenu: document.getElementById('roomMenu'),
+  currentRoomName: document.getElementById('currentRoomName'),
 };
 
 const cr = {
@@ -67,7 +67,6 @@ let edPk = null;   // room public key (Uint8Array)
 let edSk = null;   // room private key (Uint8Array)
 let curvePk = null;
 let curveSk = null;
-let currentRoomId = null;
 
 let myIdPk = null; // device identity public key (Uint8Array)
 let myIdSk = null; // device identity private key (Uint8Array)
@@ -110,19 +109,18 @@ function loadRooms(){
   currentRoomId = localStorage.getItem(CURRENT_ROOM_KEY) || null;
 
   // Migration: if legacy single-room settings exist, lift them into rooms
-  if (!rooms.length && getCurrentRoom().roomSkB64) {
+  if (!rooms.length && SETTINGS.roomSkB64) {
     const migratedServer = RELAY_HTTP_BASE || 'https://rartino.pythonanywhere.com';
-    const tmpSk = getCurrentRoom().roomSkB64;
+    const tmpSk = SETTINGS.roomSkB64;
     try {
       const sk = fromB64u(tmpSk);
       const pk = derivePubFromSk(sk);
       const rid = b64u(pk);
       rooms.push({ id: rid, name: 'Room 1', server: migratedServer, roomSkB64: tmpSk, roomId: rid, createdAt: nowMs() });
       currentRoomId = rid;
-      localStorage.removeItem(SETTINGS_KEY); // old structure not needed for room code
+      localStorage.removeItem(SETTINGS_KEY);
     } catch {}
   }
-
   // If no current room but we have rooms, pick first
   if (!currentRoomId && rooms.length) currentRoomId = rooms[0].id;
 }
@@ -918,10 +916,9 @@ cfg.btnRemove.addEventListener('click', () => {
 
 // Room dialog
 ui.btnRoomMenu.addEventListener('click', () => {
-  const open = ui.roomMenu.hasAttribute('hidden');
   renderRoomMenu();
-  ui.roomMenu.hidden = !open;
-  ui.btnRoomMenu.setAttribute('aria-expanded', String(open));
+  ui.roomMenu.hidden = !ui.roomMenu.hidden;
+  ui.btnRoomMenu.setAttribute('aria-expanded', String(!ui.roomMenu.hidden));
 });
 document.addEventListener('click', (e) => {
   if (!ui.roomMenu.contains(e.target) && !ui.btnRoomMenu.contains(e.target)) {
