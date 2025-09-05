@@ -41,12 +41,13 @@ fetch('./manifest.json')
 
       event.respondWith(
         caches.match(req).then(cached => {
-          const fetchPromise = fetch(req).then(networkRes => {
-            const resClone = networkRes.clone();
-            caches.open(CACHE_NAME).then(cache => cache.put(req, resClone));
-            return networkRes;
-          }).catch(() => cached);
-          return cached || fetchPromise;
+	  const fetchPromise = fetch(req).then(networkRes => {
+	    if (networkRes && networkRes.ok) {
+	      const resClone = networkRes.clone();
+	      caches.open(CACHE_NAME).then(cache => cache.put(req, resClone));
+	    }
+	    return networkRes;
+	  }).catch(() => cached);
         })
       );
     });

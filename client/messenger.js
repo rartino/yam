@@ -2,7 +2,8 @@
 const ROOMS_KEY = 'secmsg_rooms_v1';
 const CURRENT_ROOM_KEY = 'secmsg_current_room_id';
 const SETTINGS_KEY = 'secmsg_settings_v1';
-const HIST_FLAGS_KEY = 'secmsg_hist_fetched_v1';
+const MSG_DB = 'secmsg_msgs_db';
+const MSG_STORE = 'msgs';
 const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302'] },
@@ -94,11 +95,6 @@ const preServeIce     = new Map();
 
 // ====== UTIL ======
 function roomKey(serverUrl, roomId){ return `${normServer(serverUrl)}|${roomId}`; }
-function _loadHistFlags(){ try{ return JSON.parse(localStorage.getItem(HIST_FLAGS_KEY)||'{}'); }catch{ return {}; } }
-function _saveHistFlags(obj){ localStorage.setItem(HIST_FLAGS_KEY, JSON.stringify(obj)); }
-function hasHistoryFetched(serverUrl, roomId){ const f=_loadHistFlags(); return !!f[roomKey(serverUrl, roomId)]; }
-function markHistoryFetched(serverUrl, roomId){ const f=_loadHistFlags(); f[roomKey(serverUrl, roomId)] = true; _saveHistFlags(f); }
-function clearHistoryFlag(serverUrl, roomId){ const f=_loadHistFlags(); delete f[roomKey(serverUrl, roomId)]; _saveHistFlags(f); }
 function b64u(bytes) { return sodium.to_base64(bytes, sodium.base64_variants.URLSAFE_NO_PADDING); }
 function fromB64u(str) { return sodium.from_base64(str, sodium.base64_variants.URLSAFE_NO_PADDING); }
 function nowMs() { return Date.now(); }
@@ -106,10 +102,9 @@ function sevenDaysAgoMs() { return nowMs() - 7 * 24 * 60 * 60 * 1000; }
 function setStatus(text) { ui.status.textContent = text; }
 function shortId(idB64u) { return idB64u.slice(0, 6) + '…' + idB64u.slice(-6); }
 
-function rk(serverUrl, roomId){ return `${normServer(serverUrl)}|${roomId}`; }
 
 async function msgGetLastTs(serverUrl, roomId){
-  const key = rk(serverUrl, roomId);
+  const key = roomKey(serverUrl, roomId);
   const db = await openMsgDB();
   return new Promise((res, rej) => {
     const tx = db.transaction(MSG_STORE, 'readonly');
@@ -126,7 +121,7 @@ async function msgGetLastTs(serverUrl, roomId){
 }
 
 async function msgListByRoom(serverUrl, roomId){
-  const key = rk(serverUrl, roomId);
+  const key = roomKey(serverUrl, roomId);
   const db = await openMsgDB();
   return new Promise((res, rej) => {
     const out = [];
@@ -145,7 +140,7 @@ async function msgListByRoom(serverUrl, roomId){
 
 async function clearRoomData(serverUrl, roomId){
   const db = await openMsgDB();
-  const key = rk(serverUrl, roomId);
+  const key = roomKey(serverUrl, roomId);
   // delete all msgs for room + marker
   return new Promise((res, rej) => {
     const tx = db.transaction(MSG_STORE, 'readwrite');
@@ -154,6 +149,7 @@ async function clearRoomData(serverUrl, roomId){
     const req = idx.openCursor(IDBKeyRange.only(key));
     req.onsuccess = e => {
       const cur = e.target.result;
+      if (!cur) return;
       store.delete(cur.primaryKey);
       cur.continue();
     };
@@ -319,14 +315,12 @@ async function sha256_b64u(blob) {
 }
 
 // ====== IndexedDB (messages by room) ======
-const MSG_DB = 'secmsg_msgs_db';
-const MSG_STORE = 'msgs';
 
 let msgDbPromise = null;
 function openMsgDB(){
   if (msgDbPromise) return msgDbPromise;
   msgDbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(MSG_DB, 2); // bump to v2
+    const req = indexedDB.open(MSG_DB, 2);
     req.onupgradeneeded = () => {
       const db = req.result;
       let s;
@@ -363,22 +357,7 @@ async function msgBulkPut(recs){
     tx.onerror = () => rej(tx.error);
   });
 }
-async function msgListByRoom(serverUrl, roomId){
-  const key = roomKey(serverUrl, roomId);
-  const db = await openMsgDB();
-  return new Promise((res, rej) => {
-    const out = [];
-    const tx = db.transaction(MSG_STORE, 'readonly');
-    const idx = tx.objectStore(MSG_STORE).index('byRoom');
-    const req = idx.openCursor(IDBKeyRange.only(key));
-    req.onsuccess = (e) => {
-      const cur = e.target.result;
-      if (!cur) { out.sort((a,b)=> (a.ts||0)-(b.ts||0)); return res(out); }
-      out.push(cur.value); cur.continue();
-    };
-    req.onerror = () => rej(req.error);
-  });
-}
+
 async function msgDeleteRoom(serverUrl, roomId){
   const list = await msgListByRoom(serverUrl, roomId);
   if (!list.length) return;
@@ -519,18 +498,25 @@ async function renderFileIfAvailable(bubbleEl, meta) {
   if (!blob) return false;
 
   bubbleEl.innerHTML = '';
+  const url = URL.createObjectURL(blob);
+
   if (meta.mime && meta.mime.startsWith('image/')) {
-    const url = URL.createObjectURL(blob);
     const img = document.createElement('img');
-    img.src = url; img.alt = meta.name || 'image';
+    img.onload = () => URL.revokeObjectURL(url);
+    img.src = url;
+    img.alt = meta.name || 'image';
     bubbleEl.appendChild(img);
   } else {
-    const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    link.href = url; link.textContent = `${meta.name || 'file'} (${meta.size || blob.size} bytes)`;
-    link.className = 'file-link'; link.target = '_blank'; link.rel = 'noopener';
+    link.href = url;
+    link.textContent = `${meta.name || 'file'} (${meta.size || blob.size} bytes)`;
+    link.className = 'file-link';
+    link.target = '_blank';
+    link.rel = 'noopener';
+    link.addEventListener('click', () => setTimeout(() => URL.revokeObjectURL(url), 0), { once: true });
     bubbleEl.appendChild(link);
   }
+    
   return true;
 }
 
@@ -563,7 +549,7 @@ async function renderRoomFromCache(serverUrl, roomId){
       renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
     } else if (rec.kind === 'file') {
       const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
-      renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(rec.meta.hash); } });
+      renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(roomId, rec.meta.hash); } });
     }
   }
   setStatus('Connected');
@@ -642,7 +628,7 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
   }
 
   const tsVal = m.ts || nowMs();
-    
+
   try {
     const obj = JSON.parse(pt);
     if (obj && obj.kind === 'file' && obj.hash) {
@@ -656,7 +642,7 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
       // render to UI only if this is the visible room
       if (roomId === currentRoomId) {
         const bubble = fileBubbleSkeleton({ meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
-        renderFileIfAvailable(bubble, obj).then(hasIt => { if (!hasIt) { showPendingBubble(bubble, obj); requestFile(obj.hash); } else { scrollToEnd(); } });
+	  renderFileIfAvailable(bubble, obj).then(hasIt => { if (!hasIt) { showPendingBubble(bubble, obj); requestFile(roomId, obj.hash); } else { scrollToEnd(); } });
       }
       return;
     }
@@ -760,9 +746,10 @@ async function serveFileIfWeHaveIt(serverUrl, msg) {
   pc.ondatachannel = (evt) => {
     const dc = evt.channel;
     dc.binaryType = 'arraybuffer';
-
     dc.onopen = async () => {
+	  
       if (DEBUG_RTC) dbg('RTC/RESP', 'dc open', { request_id });
+      dc.bufferedAmountLowThreshold = Math.max(16384, CHUNK_SIZE >> 2);
 
       const header = { kind: 'file', name: blob.name || 'file', mime: blob.type || 'application/octet-stream', size: blob.size, hash: checksum };
       dc.send(new TextEncoder().encode(JSON.stringify(header)));
@@ -969,17 +956,14 @@ async function finishInviteDialog(){
       inviteDC.send(JSON.stringify(payload));
     };
 
-    // NEW: listen for ACK and then close
     let acked = false;
     inviteDC.onmessage = (evt) => {
-      // In case the joiner sends ACK earlier than we attach in finish
       try {
-	const txt = (typeof evt.data === 'string') ? evt.data : new TextDecoder().decode(evt.data);
-	const o = JSON.parse(txt);
-	if (o && o.kind === 'invite-ack') dbg('RTC/INV', 'early ack');
+	const o = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data));
+	if (o && o.kind === 'invite-ack') { acked = true; inv.dlg.close(); try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{} }
       } catch {}
     };
-
+      
     // Send now if already open, otherwise on open
     if (inviteDC.readyState === 'open') {
       await sendRoom();
@@ -1088,7 +1072,7 @@ function connect(sc) {
       const since = lastTs > 0 ? (lastTs + 1) : sevenDaysAgoMs();
 
       sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since }));
-	
+
       if (room.id === currentRoomId) {
 	await ensureSodium();
 	setCryptoForRoom(room);
@@ -1103,7 +1087,6 @@ function connect(sc) {
       if (m.room_id === currentRoomId) {
 	await renderRoomFromCache(sc.url, m.room_id);
       }
-    }
 
     } else if (m.type === 'message') {
       handleIncoming(sc.url, m);
@@ -1131,7 +1114,9 @@ function connect(sc) {
 }
 
 function scheduleReconnect(sc) {
-  const delay = Math.min(30000, 1000 * Math.pow(2, sc.reconnectAttempt));
+  const base = Math.min(30000, 1000 * Math.pow(2, sc.reconnectAttempt));
+  const jitter = Math.floor(Math.random() * 500);
+  const delay = base + jitter;  
   sc.reconnectAttempt++;
   if (DEBUG_SIG) dbg('SIG/WS', 'reconnect in', delay, 'ms', sc.url);
   if (sc.reconnectTimer) clearTimeout(sc.reconnectTimer);
@@ -1256,7 +1241,6 @@ cfg.btnRemove.addEventListener('click', async () => {
     await openRoom(rooms[0].id);
   } else {
     // No rooms left; disconnect and prompt create
-    if (ws) { try { ws.close(); } catch {} ws = null; }
     clearMessagesUI();
     setStatus('No room');
     document.getElementById('currentRoomName').textContent = 'No room';
@@ -1294,33 +1278,20 @@ async function openRoom(roomId){
       sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
       setStatus('Connecting…');
     } else if (sc.authed.has(room.id)) {
-      // Decide: cached vs first fetch
-      if (hasHistoryFetched(sc.url, room.id)) {
-	await ensureSodium();
-	setCryptoForRoom(room);
-	clearMessagesUI();
-	const cached = await msgListByRoom(sc.url, room.id);
-	for (const rec of cached) {
-	  if (rec.kind === 'text') {
-	    renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
-	  } else if (rec.kind === 'file') {
-	    const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
-	    // try show if we have it, else pending+auto request
-	    // (renderFileIfAvailable returns false if not in IDB yet)
-	    // don't await to keep UI snappy
-	    renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(rec.meta.hash); } });
-	  }
+      await ensureSodium();
+      setCryptoForRoom(room);
+      clearMessagesUI();
+      const cached = await msgListByRoom(sc.url, room.id);
+      for (const rec of cached) {
+	if (rec.kind === 'text') {
+	  renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
+	} else if (rec.kind === 'file') {
+	  const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
+	  renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(roomId, rec.meta.hash); } });
 	}
-	setStatus('Connected');
-	requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
-      } else {
-	// First time ever for this room → fetch once
-	await ensureSodium();
-	setCryptoForRoom(room);
-	clearMessagesUI();
-	sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
-	setStatus('Connected'); // will render when history arrives
       }
+      setStatus('Connected');
+      requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
     } else {
       setStatus('Connecting…');
     }
@@ -1457,7 +1428,7 @@ ui.fileInput?.addEventListener('change', async (e) => {
   ui.fileInput.value = '';
 });
 
-btnInvite?.addEventListener('click', openInviteDialog);
+cfg.btnInvite?.addEventListener('click', openInviteDialog);
 inv.btnClose?.addEventListener('click', () => inv.dlg.close());
 inv.btnCopyOffer?.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(inv.offerTA.value); inv.btnCopyOffer.textContent='Copied'; setTimeout(()=>inv.btnCopyOffer.textContent='Copy',1000);} catch {}
