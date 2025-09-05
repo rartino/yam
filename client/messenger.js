@@ -405,8 +405,7 @@ async function ensureIdentity() {
 }
 
 // ====== Rendering ======
-function renderTextMessage({ room_id, text, ts, nickname, senderId, verified }) {
-  if (room_id !== currentRoomId) return; // only show active room
+function renderTextMessage({ text, ts, nickname, senderId, verified }) {
   const row = document.createElement('div');
   const isMe = senderId && myPeerId && senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
@@ -424,8 +423,7 @@ function renderTextMessage({ room_id, text, ts, nickname, senderId, verified }) 
   ui.messages.appendChild(row); scrollToEnd();
 }
 
-function fileBubbleSkeleton({ room_id, meta, ts, nickname, senderId, verified }) {
-  if (room_id !== currentRoomId) return null; // only draw for active room
+function fileBubbleSkeleton({ meta, ts, nickname, senderId, verified }) {
   const row = document.createElement('div');
   const isMe = senderId && myPeerId && senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
@@ -555,8 +553,6 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
   const rKey = roomKey(serverUrl, roomId);
   const id = `${rKey}|${await sha256_b64u_string(m.ciphertext)}`;
 
-  if (DEBUG_SIG) dbg('UI/INCOMING', { got: roomId, msg: pt, type: m.type || 'message' });
-    
   let verified = undefined;
   if (m.sender_id && m.sig) {
     try {
@@ -587,17 +583,13 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
   } catch (_) { /* not JSON */ }
 
   // plain text
-  if (DEBUG_SIG) dbg('UI/BEFORE MSGPUT', { got: roomId, msg: pt, type: m.type || 'message' });  
   await msgPut({
     id, roomKey: rKey, roomId, serverUrl,
     ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
     verified, kind: 'text', text: pt
   });
-  if (DEBUG_SIG) dbg('UI/AFTER MSGPUT', { got: roomId, msg: pt, type: m.type || 'message' });      
-  if (roomId === currentRoomId) {
-    renderTextMessage({ text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
-  } else {
-    if (DEBUG_SIG) dbg('UI/SKIP non-active room', { got: roomId, want: currentRoomId, type: m.type || 'message' });
+    if (roomId === currentRoomId) {
+      renderTextMessage({ text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
   }
 }
 
@@ -1019,7 +1011,7 @@ function connect(sc) {
 	sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
 	setStatus('Connected');
 	requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
-      }	
+      }
 
     } else if (m.type === 'history') {
       markHistoryFetched(sc.url, m.room_id);
@@ -1030,7 +1022,7 @@ function connect(sc) {
 	// still persist them via handleIncoming so cache is warm even if room not visible
 	for (const item of (m.messages||[])) await handleIncoming(sc.url, item, true);
       }
-	
+
     } else if (m.type === 'message') {
       handleIncoming(sc.url, m);
 
@@ -1115,7 +1107,7 @@ function renderRoomMenu(){
     ui.roomMenu.hidden = true;
     openJoinDialog();
   });
-  menu.appendChild(joinItem);  
+  menu.appendChild(joinItem);
 }
 
 function openCreateRoomDialog(){
