@@ -2,6 +2,7 @@
 const ROOMS_KEY = 'secmsg_rooms_v1';
 const CURRENT_ROOM_KEY = 'secmsg_current_room_id';
 const SETTINGS_KEY = 'secmsg_settings_v1';
+const HIST_FLAGS_KEY = 'secmsg_hist_fetched_v1';
 const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302'] },
@@ -92,6 +93,12 @@ const serveRequests   = new Map();
 const preServeIce     = new Map();
 
 // ====== UTIL ======
+function roomKey(serverUrl, roomId){ return `${normServer(serverUrl)}|${roomId}`; }
+function _loadHistFlags(){ try{ return JSON.parse(localStorage.getItem(HIST_FLAGS_KEY)||'{}'); }catch{ return {}; } }
+function _saveHistFlags(obj){ localStorage.setItem(HIST_FLAGS_KEY, JSON.stringify(obj)); }
+function hasHistoryFetched(serverUrl, roomId){ const f=_loadHistFlags(); return !!f[roomKey(serverUrl, roomId)]; }
+function markHistoryFetched(serverUrl, roomId){ const f=_loadHistFlags(); f[roomKey(serverUrl, roomId)] = true; _saveHistFlags(f); }
+function clearHistoryFlag(serverUrl, roomId){ const f=_loadHistFlags(); delete f[roomKey(serverUrl, roomId)]; _saveHistFlags(f); }
 function b64u(bytes) { return sodium.to_base64(bytes, sodium.base64_variants.URLSAFE_NO_PADDING); }
 function fromB64u(str) { return sodium.from_base64(str, sodium.base64_variants.URLSAFE_NO_PADDING); }
 function nowMs() { return Date.now(); }
@@ -252,6 +259,79 @@ async function sha256_b64u(blob) {
   const digest = await crypto.subtle.digest('SHA-256', buf);
   const bytes = new Uint8Array(digest);
   return b64u(bytes);
+}
+
+// ====== IndexedDB (messages by room) ======
+const MSG_DB = 'secmsg_msgs_db';
+const MSG_STORE = 'msgs';
+
+let msgDbPromise = null;
+function openMsgDB(){
+  if (msgDbPromise) return msgDbPromise;
+  msgDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(MSG_DB, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      const s = db.createObjectStore(MSG_STORE, { keyPath: 'id' });
+      s.createIndex('byRoom', 'roomKey', { unique: false });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return msgDbPromise;
+}
+
+async function msgPut(rec){
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(MSG_STORE, 'readwrite');
+    tx.objectStore(MSG_STORE).put(rec);
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function msgBulkPut(recs){
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(MSG_STORE, 'readwrite');
+    const store = tx.objectStore(MSG_STORE);
+    for (const r of recs) store.put(r);
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function msgListByRoom(serverUrl, roomId){
+  const key = roomKey(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const out = [];
+    const tx = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoom');
+    const req = idx.openCursor(IDBKeyRange.only(key));
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (!cur) { out.sort((a,b)=> (a.ts||0)-(b.ts||0)); return res(out); }
+      out.push(cur.value); cur.continue();
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+async function msgDeleteRoom(serverUrl, roomId){
+  const list = await msgListByRoom(serverUrl, roomId);
+  if (!list.length) return;
+  const db = await openMsgDB();
+  await new Promise((res, rej) => {
+    const tx = db.transaction(MSG_STORE, 'readwrite');
+    const store = tx.objectStore(MSG_STORE);
+    for (const r of list) store.delete(r.id);
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function sha256_b64u_string(s){
+  const buf = new TextEncoder().encode(s);
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return b64u(new Uint8Array(digest));
 }
 
 // ====== Rooms store ======
@@ -469,9 +549,12 @@ async function sendFileMetadata(room, meta) {
   sc.ws.send(JSON.stringify(payload));
 }
 
-function handleIncoming(serverUrl, m, fromHistory=false) {
-  const room_id = m.room_id;
+async function handleIncoming(serverUrl, m, fromHistory=false) {
   const pt = decryptToString(m.ciphertext);
+  const roomId = m.room_id || currentRoomId; // server includes this for history/live
+  const rKey = roomKey(serverUrl, roomId);
+  const id = `${rKey}|${await sha256_b64u_string(m.ciphertext)}`;    
+    
   let verified = undefined;
   if (m.sender_id && m.sig) {
     try {
@@ -482,26 +565,34 @@ function handleIncoming(serverUrl, m, fromHistory=false) {
     } catch { verified = false; }
   }
 
-  // Try parse JSON
   try {
     const obj = JSON.parse(pt);
     if (obj && obj.kind === 'file' && obj.hash) {
-      obj.room_id = room_id;
-      const bubble = fileBubbleSkeleton({ room_id, meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
-      renderFileIfAvailable(bubble, obj).then((hasIt) => {
-        if (!hasIt) {
-          showPendingBubble(bubble, obj);
-          requestFile(room_id, obj.hash);
-        } else {
-          scrollToEnd();
-        }
+      // persist
+      await msgPut({
+        id, roomKey: rKey, roomId, serverUrl,
+        ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
+        verified, kind: 'file', meta: obj
       });
+
+      // render to UI only if this is the visible room
+      if (roomId === currentRoomId) {
+        const bubble = fileBubbleSkeleton({ meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
+        renderFileIfAvailable(bubble, obj).then(hasIt => { if (!hasIt) { showPendingBubble(bubble, obj); requestFile(obj.hash); } else { scrollToEnd(); } });
+      }
       return;
     }
   } catch (_) { /* not JSON */ }
 
-  // Plain text
-  renderTextMessage({ room_id, text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
+  // plain text
+  await msgPut({
+    id, roomKey: rKey, roomId, serverUrl,
+    ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
+    verified, kind: 'text', text: pt
+  });
+  if (roomId === currentRoomId) {
+    renderTextMessage({ text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
+  }
 }
 
 // ====== WebRTC Signaling (via server) ======
@@ -925,11 +1016,15 @@ function connect(sc) {
       }	
 
     } else if (m.type === 'history') {
+      markHistoryFetched(sc.url, m.room_id);
       if (m.room_id === currentRoomId) {
-        for (const item of (m.messages || [])) handleIncoming(sc.url, item, /*fromHistory=*/true);
-        scrollToEnd(); requestAnimationFrame(scrollToEnd);
+	for (const item of (m.messages||[])) await handleIncoming(sc.url, item, true);
+	scrollToEnd(); requestAnimationFrame(scrollToEnd);
+      } else {
+	// still persist them via handleIncoming so cache is warm even if room not visible
+	for (const item of (m.messages||[])) await handleIncoming(sc.url, item, true);
       }
-
+	
     } else if (m.type === 'message') {
       handleIncoming(sc.url, m);
 
@@ -1068,6 +1163,11 @@ cfg.btnSave.addEventListener('click', () => {
 cfg.btnRemove.addEventListener('click', () => {
   const r = getCurrentRoom(); if (!r) return;
   if (!confirm(`Remove room “${r.name}”?`)) return;
+
+  // NEW: clear local history
+  await msgDeleteRoom(r.server, r.id);
+  clearHistoryFlag(r.server, r.id);
+
   rooms = rooms.filter(x => x.id !== r.id);
   saveRooms();
   cfg.dlg.close();
@@ -1104,24 +1204,41 @@ async function openRoom(roomId){
 
   if (sc.ws && sc.ws.readyState === WebSocket.OPEN) {
     if (!sc.subscribed.has(room.id)) {
-      // Not subscribed yet on this ws → subscribe and wait for challenge/ready
       sc.subscribed.add(room.id);
       sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
       setStatus('Connecting…');
     } else if (sc.authed.has(room.id)) {
-      // Already authed on this ws → show history now (ready won't re-fire)
-      await ensureSodium();
-      setCryptoForRoom(room);
-      clearMessagesUI();
-      sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
-      setStatus('Connected');
-      requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
+      // Decide: cached vs first fetch
+      if (hasHistoryFetched(sc.url, room.id)) {
+	await ensureSodium();
+	setCryptoForRoom(room);
+	clearMessagesUI();
+	const cached = await msgListByRoom(sc.url, room.id);
+	for (const rec of cached) {
+	  if (rec.kind === 'text') {
+	    renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
+	  } else if (rec.kind === 'file') {
+	    const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
+	    // try show if we have it, else pending+auto request
+	    // (renderFileIfAvailable returns false if not in IDB yet)
+	    // don't await to keep UI snappy
+	    renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(rec.meta.hash); } });
+	  }
+	}
+	setStatus('Connected');
+	requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
+      } else {
+	// First time ever for this room → fetch once
+	await ensureSodium();
+	setCryptoForRoom(room);
+	clearMessagesUI();
+	sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
+	setStatus('Connected'); // will render when history arrives
+      }
     } else {
-      // Subscribed but not authed yet → still connecting
       setStatus('Connecting…');
     }
   } else {
-    // ws not open yet; onopen flow will subscribe; ready will fetch history
     setStatus('Connecting…');
   }
 }
