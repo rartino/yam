@@ -553,7 +553,9 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
   const pt = decryptToString(m.ciphertext);
   const roomId = m.room_id || currentRoomId; // server includes this for history/live
   const rKey = roomKey(serverUrl, roomId);
-  const id = `${rKey}|${await sha256_b64u_string(m.ciphertext)}`;    
+  const id = `${rKey}|${await sha256_b64u_string(m.ciphertext)}`;
+
+  if (DEBUG_SIG) dbg('UI/INCOMING', { got: roomId, msg: pt, type: m.type || 'message' });
     
   let verified = undefined;
   if (m.sender_id && m.sig) {
