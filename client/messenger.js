@@ -1100,14 +1100,29 @@ async function openRoom(roomId){
   setCryptoForRoom(room);
   setStatus('Connecting…');
 
-  // ensure server connection & subscription
-  const sc = ensureServerConnection(room.server);
-  await registerRoomIfNeeded(room);
+  const sc = ensureServerConnection(room.server); // your existing helper
+
   if (sc.ws && sc.ws.readyState === WebSocket.OPEN) {
     if (!sc.subscribed.has(room.id)) {
+      // Not subscribed yet on this ws → subscribe and wait for challenge/ready
       sc.subscribed.add(room.id);
       sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
+      setStatus('Connecting…');
+    } else if (sc.authed.has(room.id)) {
+      // Already authed on this ws → show history now (ready won't re-fire)
+      await ensureSodium();
+      setCryptoForRoom(room);
+      clearMessagesUI();
+      sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
+      setStatus('Connected');
+      requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
+    } else {
+      // Subscribed but not authed yet → still connecting
+      setStatus('Connecting…');
     }
+  } else {
+    // ws not open yet; onopen flow will subscribe; ready will fetch history
+    setStatus('Connecting…');
   }
 }
 
