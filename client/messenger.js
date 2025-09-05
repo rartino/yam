@@ -6,7 +6,8 @@ const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302'] },
     // { urls: 'turn:your.turn.server:3478', username: 'user', credential: 'pass' }
-  ]
+  ],
+  iceCandidatePoolSize: 1,
 };
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks for file send
 
@@ -121,21 +122,51 @@ function unpackSignal(code){
 }
 
 // Wait until ICE gathering completes (no trickle)
-function waitIceComplete(pc){
-  if (pc.iceGatheringState === 'complete') return Promise.resolve();
-  return new Promise(res => {
-    const check = () => {
+//function waitIceComplete(pc){
+//  if (pc.iceGatheringState === 'complete') return Promise.resolve();
+//  return new Promise(res => {
+//    const check = () => {
+//      if (pc.iceGatheringState === 'complete') {
+//        pc.removeEventListener('icegatheringstatechange', check);
+//        res();
+//      }
+//    };
+//    pc.addEventListener('icegatheringstatechange', check);
+//    // fallback: also re-check after a short delay
+//    setTimeout(check, 100);
+//  });
+//}
+
+// Collect ICE candidates for a short window, not until "complete"
+function gatherIceCandidates(pc, timeoutMs = 1500) {
+  return new Promise((resolve) => {
+    const candidates = [];
+    const onCand = (e) => { if (e.candidate) candidates.push(iceToJSON(e.candidate)); };
+    pc.addEventListener('icecandidate', onCand);
+
+    const finish = () => {
+      pc.removeEventListener('icecandidate', onCand);
+      resolve({ sdp: pc.localDescription?.sdp || '', candidates });
+    };
+
+    // If Chrome is already done (rare), finish right away
+    if (pc.iceGatheringState === 'complete') return finish();
+
+    const onState = () => {
       if (pc.iceGatheringState === 'complete') {
-        pc.removeEventListener('icegatheringstatechange', check);
-        res();
+        pc.removeEventListener('icegatheringstatechange', onState);
+        finish();
       }
     };
-    pc.addEventListener('icegatheringstatechange', check);
-    // fallback: also re-check after a short delay
-    setTimeout(check, 100);
+    pc.addEventListener('icegatheringstatechange', onState);
+
+    // Hard timeout so we don’t sit for 1 min in Chrome
+    setTimeout(() => {
+      pc.removeEventListener('icegatheringstatechange', onState);
+      finish();
+    }, timeoutMs);
   });
 }
-
 
 // Wait until all queued bytes have left the datachannel, or timeout
 async function waitForDrain(dc, { settleMs = 200, timeoutMs = 5000 } = {}) {
@@ -721,17 +752,17 @@ async function openInviteDialog(){
   dc.onopen = () => dbg('RTC/INV', 'dc open');
   dc.onclose = () => dbg('RTC/INV', 'dc close');
 
-  // Build offer (one-shot)
+  // Build offer (one-shot, but don't wait for "complete")
   const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
   await pc.setLocalDescription(offer);
-  await waitIceComplete(pc);
 
-  const offerSdp = pc.localDescription.sdp;
-  const inviteCode = packSignal({ type:'offer', sdp: offerSdp });
+  const { sdp, candidates } = await gatherIceCandidates(pc, 1500);
+  const inviteCode = packSignal({ type: 'offer', sdp, candidates });
+
   inv.offerTA.value = inviteCode;
   inv.answerTA.value = '';
-
   inv.dlg.showModal();
+    
 }
 
 async function finishInviteDialog(){
@@ -743,8 +774,13 @@ async function finishInviteDialog(){
     if (!msg || msg.type !== 'answer' || !msg.sdp) { alert('Invalid response code'); return; }
 
   try {
-    await invitePC.setRemoteDescription({ type:'answer', sdp: msg.sdp });
-    dbg('RTC/INV', 'answer applied');
+     await invitePC.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+     dbg('RTC/INV', 'answer applied');
+
+     const ansCands = Array.isArray(msg.candidates) ? msg.candidates : [];
+     for (const c of ansCands) {
+       try { await invitePC.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { dbg('RTC/INV addIce answer', e); }
+     }
 
     const sendRoom = async () => {
       dbg('RTC/INV', 'dc open -> send room');
@@ -1148,12 +1184,21 @@ async function generateJoinAnswer(){
     };
   };
 
+  // msg contains { type:'offer', sdp, candidates? }
   await pc.setRemoteDescription({ type:'offer', sdp: msg.sdp });
+
+  // Apply inviter's candidates (if present)
+  const offerCands = Array.isArray(msg.candidates) ? msg.candidates : [];
+  for (const c of offerCands) {
+    try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { dbg('RTC/JOIN addIce offer', e); }
+  }
+
+  // Create/Set local answer as usual
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
-  await waitIceComplete(pc);
 
-  const answerCode = packSignal({ type:'answer', sdp: pc.localDescription.sdp });
+  const { sdp, candidates } = await gatherIceCandidates(pc, 1500);
+  const answerCode = packSignal({ type: 'answer', sdp, candidates });
   join.answerTA.value = answerCode;
 }
 
