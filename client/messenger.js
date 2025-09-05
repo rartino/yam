@@ -905,19 +905,19 @@ function connect(sc) {
       sc.ws.send(JSON.stringify({ type: 'auth', room_id: room.id, signature: b64u(sig) }));
 
     } else if (m.type === 'ready') {
+
       const room = rooms.find(r => r.id === m.room_id && normServer(r.server) === sc.url);
       if (!room) return;
+
       sc.authed.add(room.id);
-      // announce peer for signaling
       sc.ws.send(JSON.stringify({ type: 'announce', room_id: room.id, peer_id: myPeerId }));
-      // If this is the active room, set crypto and ask history
+
       if (room.id === currentRoomId) {
-        await ensureSodium();
-        setCryptoForRoom(room);
-        clearMessagesUI();
-        sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
-        setStatus('Connected');
-        requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
+	await ensureSodium();
+	setCryptoForRoom(room);
+	setStatus('Connected');
+	// Defer to openRoom() to do the single history request
+	openRoom(currentRoomId);
       }
 
     } else if (m.type === 'history') {
