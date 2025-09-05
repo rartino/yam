@@ -896,12 +896,15 @@ function connect(sc) {
     }));
 
     if (m.type === 'challenge') {
+      // m.room_id comes from the server; sign using THAT room's secret
       const room = rooms.find(r => r.id === m.room_id && normServer(r.server) === sc.url);
-      if (!room) return;
+      if (!room) { if (DEBUG_SIG) dbg('SIG/RX', 'challenge for unknown room', m.room_id); return; }
+
       await ensureSodium();
-      // For signing we need the room's secret key; set crypto temporarily:
-      const sk = fromB64u(room.roomSkB64);
-      const sig = sodium.crypto_sign_detached(fromB64u(m.nonce), sk);
+      const nonce = fromB64u(m.nonce);
+      const edSkBytes = fromB64u(room.roomSkB64);
+      const sig = sodium.crypto_sign_detached(nonce, edSkBytes);
+
       sc.ws.send(JSON.stringify({ type: 'auth', room_id: room.id, signature: b64u(sig) }));
 
     } else if (m.type === 'ready') {
@@ -915,10 +918,11 @@ function connect(sc) {
       if (room.id === currentRoomId) {
 	await ensureSodium();
 	setCryptoForRoom(room);
+	clearMessagesUI();
+	sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
 	setStatus('Connected');
-	// Defer to openRoom() to do the single history request
-	openRoom(currentRoomId);
-      }
+	requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
+      }	
 
     } else if (m.type === 'history') {
       if (m.room_id === currentRoomId) {
@@ -1032,22 +1036,17 @@ cr.btnCreate.addEventListener('click', async () => {
   const name = (cr.name.value || '').trim() || 'New room';
   const server = normServer(cr.server.value || '');
   if (!server) { alert('Server URL is required'); return; }
+
   await ensureSodium();
   const { privateKey } = sodium.crypto_sign_keypair();
   const rid = b64u(derivePubFromSk(privateKey));
   const room = { id: rid, name, server, roomSkB64: b64u(privateKey), roomId: rid, createdAt: nowMs() };
+
   rooms.push(room); saveRooms();
-
-  // connect server (if not already) and subscribe
-  const sc = ensureServerConnection(server);
-  // register (no-op) and let WS subscription kick in on open; if already open, subscribe now:
-  await registerRoomIfNeeded(room);
-  if (sc.ws && sc.ws.readyState === WebSocket.OPEN) {
-    sc.subscribed.add(room.id);
-    sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
-  }
-
   cr.dlg.close();
+
+  ensureServerConnection(server);
+
   await openRoom(room.id);
 });
 
@@ -1108,10 +1107,6 @@ async function openRoom(roomId){
     if (!sc.subscribed.has(room.id)) {
       sc.subscribed.add(room.id);
       sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
-    } else if (sc.authed.has(room.id)) {
-      clearMessagesUI();
-      sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
-      setStatus('Connected');
     }
   }
 }
