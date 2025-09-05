@@ -592,6 +592,8 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
   });
   if (roomId === currentRoomId) {
     renderTextMessage({ text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
+  } else {
+    if (DEBUG_SIG) dbg('UI/SKIP non-active room', { got: roomId, want: currentRoomId, type: m.type || 'message' });
   }
 }
 
