@@ -1160,21 +1160,29 @@ cfg.btnSave.addEventListener('click', () => {
   renderRoomMenu();
   cfg.dlg.close();
 });
-cfg.btnRemove.addEventListener('click', () => {
+cfg.btnRemove.addEventListener('click', async () => {
   const r = getCurrentRoom(); if (!r) return;
   if (!confirm(`Remove room “${r.name}”?`)) return;
 
-  // NEW: clear local history
+  // Clear local history for the room
   await msgDeleteRoom(r.server, r.id);
   clearHistoryFlag(r.server, r.id);
 
+  // Remove from list and persist
   rooms = rooms.filter(x => x.id !== r.id);
   saveRooms();
   cfg.dlg.close();
-  if (rooms.length) openRoom(rooms[0].id);
-  else {
+
+  // Pick next room or reset UI
+  if (rooms.length) {
+    await openRoom(rooms[0].id);
+  } else {
+    // No rooms left; disconnect and prompt create
+    if (ws) { try { ws.close(); } catch {} ws = null; }
+    clearMessagesUI();
     setStatus('No room');
-    ui.currentRoomName.textContent = 'No room';
+    document.getElementById('currentRoomName').textContent = 'No room';
+    openCreateRoomDialog();
   }
 });
 
