@@ -7,7 +7,7 @@ const RTC_CONFIG = {
     { urls: ['stun:stun.l.google.com:19302'] },
     // { urls: 'turn:your.turn.server:3478', username: 'user', credential: 'pass' }
   ],
-  iceCandidatePoolSize: 1,
+  iceCandidatePoolSize: 2,
 };
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks for file send
 
@@ -149,7 +149,6 @@ function gatherIceCandidates(pc, timeoutMs = 1500) {
       resolve({ sdp: pc.localDescription?.sdp || '', candidates });
     };
 
-    // If Chrome is already done (rare), finish right away
     if (pc.iceGatheringState === 'complete') return finish();
 
     const onState = () => {
@@ -160,7 +159,6 @@ function gatherIceCandidates(pc, timeoutMs = 1500) {
     };
     pc.addEventListener('icegatheringstatechange', onState);
 
-    // Hard timeout so we don’t sit for 1 min in Chrome
     setTimeout(() => {
       pc.removeEventListener('icegatheringstatechange', onState);
       finish();
@@ -739,7 +737,6 @@ async function openInviteDialog(){
   if (!room) { alert('No active room'); return; }
   await ensureSodium();
 
-  // Fresh RTCPeerConnection (no trickle ICE: we wait for complete)
   if (invitePC) { try { invitePC.close(); } catch{} invitePC = null; }
   const pc = new RTCPeerConnection(RTC_CONFIG);
   invitePC = pc;
@@ -749,20 +746,25 @@ async function openInviteDialog(){
 
   const dc = pc.createDataChannel('invite');
   inviteDC = dc;
-  dc.onopen = () => dbg('RTC/INV', 'dc open');
-  dc.onclose = () => dbg('RTC/INV', 'dc close');
+  inviteDC.onopen = () => dbg('RTC/INV', 'dc open');
+  inviteDC.onmessage = (evt) => {
+    // (Optional) early ACKs before finishInviteDialog attaches handler
+    try {
+      const txt = typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data);
+      const o = JSON.parse(txt);
+      if (o && o.kind === 'invite-ack') dbg('RTC/INV', 'early ack');
+    } catch {}
+  };
 
-  // Build offer (one-shot, but don't wait for "complete")
-  const offer = await pc.createOffer({ offerToReceiveAudio: false, offerToReceiveVideo: false });
+  // Build offer (no trickle; short gather window)
+  const offer = await pc.createOffer({ offerToReceiveAudio:false, offerToReceiveVideo:false });
   await pc.setLocalDescription(offer);
 
-  const { sdp, candidates } = await gatherIceCandidates(pc, 1500);
-  const inviteCode = packSignal({ type: 'offer', sdp, candidates });
-
-  inv.offerTA.value = inviteCode;
+  const { sdp, candidates } = await gatherIceCandidates(pc, 1200);
+  inv.offerTA.value = packSignal({ type:'offer', sdp, candidates });
   inv.answerTA.value = '';
+
   inv.dlg.showModal();
-    
 }
 
 async function finishInviteDialog(){
