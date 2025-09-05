@@ -105,6 +105,63 @@ function nowMs() { return Date.now(); }
 function sevenDaysAgoMs() { return nowMs() - 7 * 24 * 60 * 60 * 1000; }
 function setStatus(text) { ui.status.textContent = text; }
 function shortId(idB64u) { return idB64u.slice(0, 6) + '…' + idB64u.slice(-6); }
+
+function rk(serverUrl, roomId){ return `${normServer(serverUrl)}|${roomId}`; }
+
+async function msgGetLastTs(serverUrl, roomId){
+  const key = rk(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTs');
+    const range = IDBKeyRange.bound([key, 0], [key, Number.MAX_SAFE_INTEGER]);
+    const req = idx.openCursor(range, 'prev'); // last by ts
+    req.onsuccess = e => {
+      const cur = e.target.result;
+      if (!cur) return res(0);
+      res(cur.value.ts || 0);
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+
+async function msgListByRoom(serverUrl, roomId){
+  const key = rk(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const out = [];
+    const tx = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTs');
+    const range = IDBKeyRange.bound([key, 0], [key, Number.MAX_SAFE_INTEGER]);
+    const req = idx.openCursor(range, 'next'); // ascending by ts
+    req.onsuccess = e => {
+      const cur = e.target.result;
+      if (!cur) return res(out);
+      out.push(cur.value); cur.continue();
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+
+async function clearRoomData(serverUrl, roomId){
+  const db = await openMsgDB();
+  const key = rk(serverUrl, roomId);
+  // delete all msgs for room + marker
+  return new Promise((res, rej) => {
+    const tx = db.transaction(MSG_STORE, 'readwrite');
+    const store = tx.objectStore(MSG_STORE);
+    const idx = store.index('byRoom');
+    const req = idx.openCursor(IDBKeyRange.only(key));
+    req.onsuccess = e => {
+      const cur = e.target.result;
+      store.delete(cur.primaryKey);
+      cur.continue();
+    };
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
 async function ensureSodium() { await sodium.ready; }
 function normServer(url){
   if (!url) return '';
@@ -269,11 +326,17 @@ let msgDbPromise = null;
 function openMsgDB(){
   if (msgDbPromise) return msgDbPromise;
   msgDbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(MSG_DB, 1);
+    const req = indexedDB.open(MSG_DB, 2); // bump to v2
     req.onupgradeneeded = () => {
       const db = req.result;
-      const s = db.createObjectStore(MSG_STORE, { keyPath: 'id' });
-      s.createIndex('byRoom', 'roomKey', { unique: false });
+      let s;
+      if (!db.objectStoreNames.contains(MSG_STORE)) {
+        s = db.createObjectStore(MSG_STORE, { keyPath: 'id' });
+      } else {
+        s = req.transaction.objectStore(MSG_STORE);
+      }
+      if (!s.indexNames.contains('byRoom'))   s.createIndex('byRoom', 'roomKey', { unique:false });
+      if (!s.indexNames.contains('byRoomTs')) s.createIndex('byRoomTs', ['roomKey','ts'], { unique:false });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -492,6 +555,21 @@ function showPendingBubble(bubbleEl, meta) {
   bubbleEl.appendChild(wrap);
 }
 
+async function renderRoomFromCache(serverUrl, roomId){
+  clearMessagesUI();
+  const cached = await msgListByRoom(serverUrl, roomId);
+  for (const rec of cached) {
+    if (rec.kind === 'text') {
+      renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
+    } else if (rec.kind === 'file') {
+      const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
+      renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(rec.meta.hash); } });
+    }
+  }
+  setStatus('Connected');
+  requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
+}
+
 // ====== Encrypt/Decrypt ======
 function encryptStringForRoom(str) {
   const cipher = sodium.crypto_box_seal(sodium.from_string(str), curvePk);
@@ -563,6 +641,8 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
     } catch { verified = false; }
   }
 
+  const tsVal = m.ts || nowMs();
+    
   try {
     const obj = JSON.parse(pt);
     if (obj && obj.kind === 'file' && obj.hash) {
@@ -1004,24 +1084,26 @@ function connect(sc) {
       sc.authed.add(room.id);
       sc.ws.send(JSON.stringify({ type: 'announce', room_id: room.id, peer_id: myPeerId }));
 
+      const lastTs = await msgGetLastTs(sc.url, room.id);
+      const since = lastTs > 0 ? (lastTs + 1) : sevenDaysAgoMs();
+
+      sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since }));
+	
       if (room.id === currentRoomId) {
 	await ensureSodium();
 	setCryptoForRoom(room);
-	clearMessagesUI();
-	sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since: sevenDaysAgoMs() }));
-	setStatus('Connected');
-	requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
+	await renderRoomFromCache(sc.url, room.id);
       }
 
     } else if (m.type === 'history') {
-      markHistoryFetched(sc.url, m.room_id);
-      if (m.room_id === currentRoomId) {
-	for (const item of (m.messages||[])) await handleIncoming(sc.url, item, true);
-	scrollToEnd(); requestAnimationFrame(scrollToEnd);
-      } else {
-	// still persist them via handleIncoming so cache is warm even if room not visible
-	for (const item of (m.messages||[])) await handleIncoming(sc.url, item, true);
+      for (const item of (m.messages || [])) {
+	await handleIncoming(sc.url, item, true);
       }
+
+      if (m.room_id === currentRoomId) {
+	await renderRoomFromCache(sc.url, m.room_id);
+      }
+    }
 
     } else if (m.type === 'message') {
       handleIncoming(sc.url, m);
@@ -1042,7 +1124,7 @@ function connect(sc) {
     } else if (m.type === 'error') {
       // optionally display when active room matches
       if (m.room_id === currentRoomId) {
-        renderTextMessage({ room_id: m.room_id, text: `Server error: ${m.error}`, ts: nowMs(), nickname: 'server', senderId: null });
+        renderTextMessage({ text: `Server error: ${m.error}`, ts: nowMs(), nickname: 'server', senderId: null });
       }
     }
   };
@@ -1158,15 +1240,13 @@ cfg.btnSave.addEventListener('click', () => {
   renderRoomMenu();
   cfg.dlg.close();
 });
+
 cfg.btnRemove.addEventListener('click', async () => {
   const r = getCurrentRoom(); if (!r) return;
   if (!confirm(`Remove room “${r.name}”?`)) return;
 
-  // Clear local history for the room
-  await msgDeleteRoom(r.server, r.id);
-  clearHistoryFlag(r.server, r.id);
+  await clearRoomData(r.server, r.id);
 
-  // Remove from list and persist
   rooms = rooms.filter(x => x.id !== r.id);
   saveRooms();
   cfg.dlg.close();
