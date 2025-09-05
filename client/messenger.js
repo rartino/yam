@@ -587,11 +587,13 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
   } catch (_) { /* not JSON */ }
 
   // plain text
+  if (DEBUG_SIG) dbg('UI/BEFORE MSGPUT', { got: roomId, msg: pt, type: m.type || 'message' });  
   await msgPut({
     id, roomKey: rKey, roomId, serverUrl,
     ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
     verified, kind: 'text', text: pt
   });
+  if (DEBUG_SIG) dbg('UI/AFTER MSGPUT', { got: roomId, msg: pt, type: m.type || 'message' });      
   if (roomId === currentRoomId) {
     renderTextMessage({ text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
   } else {
