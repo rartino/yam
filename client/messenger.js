@@ -1,3 +1,6 @@
+Object.freeze(crypto.subtle);
+Object.freeze(crypto);
+
 // ====== CONFIG ======
 const ROOMS_KEY = 'secmsg_rooms_v1';
 const SECRET_DB = 'secmsg_secret_db';
@@ -105,6 +108,7 @@ const join = {
 // ====== STATE ======
 let SETTINGS = { username: '', roomSkB64: '' };
 let MASTER_PASS = null;
+let MASTER_BASE_KEY = null; // PBKDF2 base CryptoKey (non-extractable)
 
 let secretDbP = null;
 
@@ -142,6 +146,40 @@ function sevenDaysAgoMs() { return nowMs() - 7 * 24 * 60 * 60 * 1000; }
 function setStatus(text) { ui.status.textContent = text; }
 function shortId(idB64u) { return idB64u.slice(0, 6) + '…' + idB64u.slice(-6); }
 
+const _subtle = crypto.subtle;
+const subtleImportKey = _subtle.importKey.bind(_subtle);
+const subtleDeriveKey = _subtle.deriveKey.bind(_subtle);
+const subtleEncrypt   = _subtle.encrypt.bind(_subtle);
+const subtleDecrypt   = _subtle.decrypt.bind(_subtle);
+
+const te = new TextEncoder();
+
+// Ask user once per session; discard the string immediately after import.
+async function ensureMasterBaseKey() {
+  if (MASTER_BASE_KEY) return MASTER_BASE_KEY;
+  const pass = (await Promise.resolve(prompt('Enter passphrase to unlock rooms'))) || '';
+  MASTER_BASE_KEY = await subtleImportKey(
+    'raw',
+    te.encode(pass),
+    { name: 'PBKDF2' },
+    /* extractable */ false,
+    ['deriveKey']
+  );
+  // best-effort scrub (strings aren't reliably zeroable, but we avoid keeping it)
+  return MASTER_BASE_KEY;
+}
+
+// Derive a per-room AES-GCM key (non-extractable) from the base key + salt
+async function deriveAesKey(saltU8, usages = ['encrypt', 'decrypt']) {
+  return subtleDeriveKey(
+    { name: 'PBKDF2', hash: 'SHA-256', salt: saltU8, iterations: 250_000 },
+    await ensureMasterBaseKey(),
+    { name: 'AES-GCM', length: 256 },
+    /* extractable */ false,
+    usages
+  );
+}
+
 async function ensureMasterPass() {
   if (MASTER_PASS) return MASTER_PASS;
   // Replace prompt() with your own modal if you prefer
@@ -162,19 +200,24 @@ async function deriveKey(pass, salt) {
   );
 }
 
-async function sealSecret(pass, plainB64) {
+// Seals a base64url string (roomSkB64) -> {salt, iv, ct} (all base64url)
+async function sealSecret(roomSkB64) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv   = crypto.getRandomValues(new Uint8Array(12));
-  const key  = await deriveKey(pass, salt);
-  const ct   = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, new TextEncoder().encode(plainB64));
-  return { salt: b64u(salt), iv: b64u(iv), ct: b64u(new Uint8Array(ct)) };
+  const key  = await deriveAesKey(salt, ['encrypt']);
+  const pt   = fromB64u(roomSkB64); // Uint8Array
+  const ct   = new Uint8Array(await subtleEncrypt({ name: 'AES-GCM', iv }, key, pt));
+  return { salt: b64u(salt), iv: b64u(iv), ct: b64u(ct) };
 }
-async function openSecret(pass, sealed) {
+
+async function openSecret(sealed) {
   const salt = fromB64u(sealed.salt);
   const iv   = fromB64u(sealed.iv);
-  const key  = await deriveKey(pass, salt);
-  const pt   = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, fromB64u(sealed.ct));
-  return new TextDecoder().decode(pt);
+  const ct   = fromB64u(sealed.ct);
+  const key  = await deriveAesKey(salt, ['decrypt']);
+  const pt   = new Uint8Array(await subtleDecrypt({ name: 'AES-GCM', iv }, key, ct));
+  // Return the original base64url string for your existing callers
+  return b64u(pt);
 }
 
 function openSecretDB() {
@@ -384,20 +427,11 @@ function iceToJSON(c) {
   return j;
 }
 
-const roomSkCache = new Map(); // roomId -> Uint8Array (ed25519 sk bytes)
-
 async function getRoomPrivateKeyBytes(roomId) {
-  if (roomSkCache.has(roomId)) return roomSkCache.get(roomId);
-
-  const sealed = await secretGet(roomId); // { salt, iv, ct } or null
+  const sealed = await secretGet(roomId);
   if (!sealed) throw new Error('Room secret missing locally');
-
-  const pass = await ensureMasterPass();    // your passphrase prompt / session unlock
-  const skB64 = await openSecret(pass, sealed); // decrypt -> base64url string
-  const sk = fromB64u(skB64);
-
-  roomSkCache.set(roomId, sk);  // cache in RAM for this session (optional)
-  return sk;
+  const skB64 = await openSecret(sealed);
+  return fromB64u(skB64);
 }
 
 // ====== IndexedDB (files by hash) ======
@@ -1441,11 +1475,9 @@ cr.btnCreate.addEventListener('click', async () => {
   await ensureSodium();
   const { privateKey } = sodium.crypto_sign_keypair();
   const rid = b64u(derivePubFromSk(privateKey));
-  const pass = await ensureMasterPass();
-  const sealed = await sealSecret(pass, b64u(privateKey)); // -> {salt,iv,ct}
-  const room = { id: rid, name, server, roomId: rid, createdAt: nowMs() }; // no secret here
+  const room = { id: rid, name, server, roomId: rid, createdAt: nowMs() };
   rooms.push(room); saveRooms();
-  await secretPut(rid, sealed);   // store sealed secret in IDB
+  await secretPut(rid, await sealSecret(b64u(privateKey)));
   saveRooms();
   cr.dlg.close();
 
@@ -1589,11 +1621,7 @@ async function generateJoinAnswer(){
             });
             saveRooms();
           }
-
-          // ---- Store sealed secret (always overwrite to allow re-keys)
-          const pass = await ensureMasterPass();
-          const sealed = await sealSecret(pass, r.roomSkB64);
-          await secretPut(r.id, sealed);
+          await secretPut(r.id, await sealSecret(b64u(privateKey)));
 
           // ---- Connect & open
           ensureServerConnection(serverUrl);
