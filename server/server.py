@@ -309,6 +309,24 @@ def ws_handler(ws):
                 sender_id = m.get('sender_id')
                 sig = m.get('sig')
 
+                # If either sender_id or sig is present, both must be present and valid.
+                if (sender_id is not None) or (sig is not None):
+                    if not sender_id or not sig:
+                        ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'signature_required'}))
+                        continue
+                    try:
+                        import nacl.signing, nacl.exceptions
+                        sender_pk = _from_b64u(sender_id)
+                        signature = _from_b64u(sig)
+                        cipher_bytes = _from_b64u(ciphertext)
+                        nacl.signing.VerifyKey(sender_pk).verify(cipher_bytes, signature)
+                    except nacl.exceptions.BadSignatureError:
+                        ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_signature'}))
+                        continue
+                    except Exception:
+                        ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'signature_error'}))
+                        continue
+                
                 # De-dupe: skip if this ciphertext already exists for this room
                 conn = get_db()
                 cur = conn.cursor()
@@ -382,6 +400,17 @@ def ws_handler(ws):
                 ok = unicast(room_id, target, payload)
                 LOG("rtc/ice", "room=", room_id, "req=", m.get('request_id'), "to=", target, "ok=", ok)
                 continue
+
+            if t == 'webrtc-taken':
+                payload = {
+                    'type': 'webrtc-taken',
+                    'room_id': room_id,
+                    'request_id': m.get('request_id'),
+                    'chosen': m.get('chosen'),
+                }
+                broadcast(room_id, payload, exclude=ws)
+                LOG("rtc/taken", "room=", room_id, "req=", m.get('request_id'), "chosen=", m.get('chosen'))
+                continue            
 
     except Exception as e:
         LOG("WS error", str(e))

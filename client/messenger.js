@@ -1,5 +1,7 @@
 // ====== CONFIG ======
 const ROOMS_KEY = 'secmsg_rooms_v1';
+const SECRET_DB = 'secmsg_secret_db';
+const SECRET_STORE = 'roomsecrets';
 const CURRENT_ROOM_KEY = 'secmsg_current_room_id';
 const SETTINGS_KEY = 'secmsg_settings_v1';
 const MSG_DB = 'secmsg_msgs_db';
@@ -30,6 +32,14 @@ function dbg(tag, ...args){
 }
 
 // ====== UI REFS ======
+
+const statuses = {
+    connected: '↔', // ✅
+    disconnected: '↮', // ❌
+    connecting: '↻', // ☑️
+    passive: '·', // ✔️
+};
+
 const ui = {
   status: document.getElementById('status'),
   messages: document.getElementById('messages'),
@@ -94,6 +104,9 @@ const join = {
 
 // ====== STATE ======
 let SETTINGS = { username: '', roomSkB64: '' };
+let MASTER_PASS = null;
+
+let secretDbP = null;
 
 let edPk = null;   // room public key (Uint8Array) — set per active room when switching
 let edSk = null;   // room private key (Uint8Array)
@@ -129,6 +142,70 @@ function sevenDaysAgoMs() { return nowMs() - 7 * 24 * 60 * 60 * 1000; }
 function setStatus(text) { ui.status.textContent = text; }
 function shortId(idB64u) { return idB64u.slice(0, 6) + '…' + idB64u.slice(-6); }
 
+async function ensureMasterPass() {
+  if (MASTER_PASS) return MASTER_PASS;
+  // Replace prompt() with your own modal if you prefer
+  const p = (await Promise.resolve(prompt('Set/enter a passphrase to unlock room keys'))) || '';
+  MASTER_PASS = p;
+  return MASTER_PASS;
+}
+
+async function deriveKey(pass, salt) {
+  const enc = new TextEncoder();
+  const baseKey = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt, iterations: 250_000, hash: 'SHA-256' },
+    baseKey,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt','decrypt']
+  );
+}
+
+async function sealSecret(pass, plainB64) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv   = crypto.getRandomValues(new Uint8Array(12));
+  const key  = await deriveKey(pass, salt);
+  const ct   = await crypto.subtle.encrypt({ name:'AES-GCM', iv }, key, new TextEncoder().encode(plainB64));
+  return { salt: b64u(salt), iv: b64u(iv), ct: b64u(new Uint8Array(ct)) };
+}
+async function openSecret(pass, sealed) {
+  const salt = fromB64u(sealed.salt);
+  const iv   = fromB64u(sealed.iv);
+  const key  = await deriveKey(pass, salt);
+  const pt   = await crypto.subtle.decrypt({ name:'AES-GCM', iv }, key, fromB64u(sealed.ct));
+  return new TextDecoder().decode(pt);
+}
+
+function openSecretDB() {
+  if (secretDbP) return secretDbP;
+  secretDbP = new Promise((resolve, reject) => {
+    const req = indexedDB.open(SECRET_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(SECRET_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return secretDbP;
+}
+async function secretPut(roomId, value) {
+  const db = await openSecretDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(SECRET_STORE, 'readwrite');
+    tx.objectStore(SECRET_STORE).put(value, roomId);
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+async function secretGet(roomId) {
+  const db = await openSecretDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(SECRET_STORE, 'readonly');
+    const req = tx.objectStore(SECRET_STORE).get(roomId);
+    req.onsuccess = () => res(req.result || null);
+    req.onerror = () => rej(req.error);
+  });
+}
+
 async function clearRoomData(serverUrl, roomId){
   const db = await openMsgDB();
   const key = roomKey(serverUrl, roomId);
@@ -136,8 +213,10 @@ async function clearRoomData(serverUrl, roomId){
   return new Promise((res, rej) => {
     const tx = db.transaction(MSG_STORE, 'readwrite');
     const store = tx.objectStore(MSG_STORE);
-    const idx = store.index('byRoom');
-    const req = idx.openCursor(IDBKeyRange.only(key));
+    const idx = store.index('byRoomTsId');
+    const lower = [key, 0, ''];
+    const upper = [key, Number.MAX_SAFE_INTEGER, '\uffff'];
+    const req = idx.openCursor(IDBKeyRange.bound(lower, upper));
     req.onsuccess = e => {
       const cur = e.target.result;
       if (!cur) return;
@@ -289,8 +368,8 @@ function derivePubFromSk(sk) {
   return sk.slice(32, 64);
 }
 
-function setCryptoForRoom(room) {
-  edSk = fromB64u(room.roomSkB64);
+async function setCryptoForRoom(room) {
+  edSk = await getRoomPrivateKeyBytes(room.id);
   edPk = derivePubFromSk(edSk);
   curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(edPk);
   curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(edSk);
@@ -303,6 +382,22 @@ function iceToJSON(c) {
     : { candidate: c.candidate, sdpMid: c.sdpMid, sdpMLineIndex: c.sdpMLineIndex, usernameFragment: c.usernameFragment };
   if (DEBUG_RTC) dbg('RTC/ICE->JSON', { hasCandidate: !!j.candidate, mid: j.sdpMid, mline: j.sdpMLineIndex });
   return j;
+}
+
+const roomSkCache = new Map(); // roomId -> Uint8Array (ed25519 sk bytes)
+
+async function getRoomPrivateKeyBytes(roomId) {
+  if (roomSkCache.has(roomId)) return roomSkCache.get(roomId);
+
+  const sealed = await secretGet(roomId); // { salt, iv, ct } or null
+  if (!sealed) throw new Error('Room secret missing locally');
+
+  const pass = await ensureMasterPass();    // your passphrase prompt / session unlock
+  const skB64 = await openSecret(pass, sealed); // decrypt -> base64url string
+  const sk = fromB64u(skB64);
+
+  roomSkCache.set(roomId, sk);  // cache in RAM for this session (optional)
+  return sk;
 }
 
 // ====== IndexedDB (files by hash) ======
@@ -478,21 +573,6 @@ function saveSettings() { localStorage.setItem(SETTINGS_KEY, JSON.stringify(SETT
 function loadRooms(){
   try { rooms = JSON.parse(localStorage.getItem(ROOMS_KEY) || '[]'); } catch { rooms = []; }
   currentRoomId = localStorage.getItem(CURRENT_ROOM_KEY) || null;
-
-  // Migration: lift legacy single-room setting into rooms (if any)
-  if (!rooms.length && SETTINGS.roomSkB64) {
-    const migratedServer = 'https://rartino.pythonanywhere.com';
-    const tmpSk = SETTINGS.roomSkB64;
-    try {
-      const sk = fromB64u(tmpSk);
-      const pk = derivePubFromSk(sk);
-      const rid = b64u(pk);
-      rooms.push({ id: rid, name: 'Room 1', server: migratedServer, roomSkB64: tmpSk, roomId: rid, createdAt: nowMs() });
-      currentRoomId = rid;
-      localStorage.removeItem(SETTINGS_KEY);
-    } catch {}
-  }
-
   if (!currentRoomId && rooms.length) currentRoomId = rooms[0].id;
 }
 function saveRooms(){
@@ -524,9 +604,6 @@ function persistIdentity() {
   myPeerId = b64u(myIdPk);
   localStorage.setItem('secmsg_id_pk', myPeerId);
   localStorage.setItem('secmsg_id_sk', b64u(myIdSk));
-  if (ui.identityInfo) {
-    ui.identityInfo.textContent = `Your device ID: ${shortId(myPeerId)} (stored locally)`;
-  }
 }
 
 async function ensureIdentity() {
@@ -555,7 +632,6 @@ async function ensureIdentity() {
 }
 
 function announceIdentityToServers() {
-  if (!window.servers) return;            // your multi-server map
   for (const [, sc] of servers) {
     if (!sc.ws || sc.ws.readyState !== WebSocket.OPEN) continue;
     for (const roomId of sc.authed || []) {
@@ -692,7 +768,10 @@ async function sendTextMessage(room, text) {
     sig: signCiphertextB64(ciphertextB64),
   };
   const sc = servers.get(normServer(room.server));
-  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN) { alert('Not connected'); return; }
+  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN || !sc.authed?.has(room.id)) {
+    alert('Not connected');
+    return;
+  }
   if (DEBUG_SIG) dbg('SIG/TX', 'send:text', { room: room.name, len: text.length });
   sc.ws.send(JSON.stringify(payload));
 }
@@ -710,7 +789,10 @@ async function sendFileMetadata(room, meta) {
     sig: signCiphertextB64(ciphertextB64),
   };
   const sc = servers.get(normServer(room.server));
-  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN) { alert('Not connected'); return; }
+  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN || !sc.authed?.has(room.id)) {
+    alert('Not connected');
+    return;
+  }
   if (DEBUG_SIG) dbg('SIG/TX', 'send:file-meta', { room: room.name, hash: meta.hash, name: meta.name, mime: meta.mime, size: meta.size });
   sc.ws.send(JSON.stringify(payload));
 }
@@ -938,10 +1020,21 @@ async function handleWebRtcResponse(serverUrl, msg) {
   }
 
   await st.pc.setRemoteDescription(answer);
-  st.remotePeerId = from;
-  st.haveAnswer = true;
+  if (!st.remotePeerId) {
+    st.remotePeerId = from;
+    st.haveAnswer = true;
+    const sc = servers.get(serverUrl);
+    if (sc && sc.ws && sc.ws.readyState === WebSocket.OPEN) {
+      sc.ws.send(JSON.stringify({
+	type: 'webrtc-taken',
+	room_id: st.roomId,
+	request_id,
+	chosen: from,
+      }));
+    }
+  }
   if (DEBUG_RTC) dbg('RTC/REQ', 'answer applied', { request_id });
-
+    
   // Flush buffered OUTGOING ICE
   const sc = servers.get(serverUrl);
   for (const cand of st.iceBuf) {
@@ -1039,31 +1132,38 @@ async function openInviteDialog(){
 async function finishInviteDialog(){
   const room = getCurrentRoom();
   if (!room) return;
+
   const code = (inv.answerTA.value || '').trim();
   if (!code) { alert('Paste response code first'); return; }
   const msg = unpackSignal(code);
-    if (!msg || msg.type !== 'answer' || !msg.sdp) { alert('Invalid response code'); return; }
+  if (!msg || msg.type !== 'answer' || !msg.sdp) { alert('Invalid response code'); return; }
 
   try {
-     await invitePC.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-     dbg('RTC/INV', 'answer applied');
+    await invitePC.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
+    dbg('RTC/INV', 'answer applied');
 
-     const ansCands = Array.isArray(msg.candidates) ? msg.candidates : [];
-     for (const c of ansCands) {
-       try { await invitePC.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { dbg('RTC/INV addIce answer', e); }
-     }
+    const ansCands = Array.isArray(msg.candidates) ? msg.candidates : [];
+    for (const c of ansCands) {
+      try { await invitePC.addIceCandidate(new RTCIceCandidate(c)); }
+      catch (e) { dbg('RTC/INV addIce answer', e); }
+    }
+
+    const edSkBytes = await getRoomPrivateKeyBytes(room.id);
+    await ensureSodium(); // needed for b64u(..) using sodium’s encoder
+    const roomSkB64 = b64u(edSkBytes);
 
     const sendRoom = async () => {
       dbg('RTC/INV', 'dc open -> send room');
-      const room = getCurrentRoom();
+      const active = getCurrentRoom(); // in case user switched during flow
       const payload = {
-        ver:1, kind:'room-invite',
+        ver: 1,
+        kind: 'room-invite',
         room: {
-          id: room.id,
-          name: room.name,
-          server: normServer(room.server),
-          roomSkB64: room.roomSkB64,
-          createdAt: nowMs()
+          id: active.id,
+          name: active.name,
+          server: normServer(active.server),
+          roomSkB64,
+          createdAt: active.createdAt || nowMs()
         }
       };
       inviteDC.send(JSON.stringify(payload));
@@ -1072,23 +1172,28 @@ async function finishInviteDialog(){
     let acked = false;
     inviteDC.onmessage = (evt) => {
       try {
-        const o = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data));
-        if (o && o.kind === 'invite-ack') { acked = true; inv.dlg.close(); try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{} }
+        const txt = typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data);
+        const o = JSON.parse(txt);
+        if (o && o.kind === 'invite-ack') {
+          acked = true;
+          inv.dlg.close();
+          try { inviteDC.close(); } catch {}
+          try { invitePC.close(); } catch {}
+        }
       } catch {}
     };
 
-    // Send now if already open, otherwise on open
     if (inviteDC.readyState === 'open') {
       await sendRoom();
     } else {
-      inviteDC.onopen = sendRoom;
+      inviteDC.onopen = sendRoom; // overwrite earlier noop handler is fine
     }
 
-    // Fallback close if no ACK within 5s
     setTimeout(() => {
       if (!acked) {
         dbg('RTC/INV', 'no ack timeout; closing');
-        try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{}
+        try { inviteDC.close(); } catch {}
+        try { invitePC.close(); } catch {}
         inv.dlg.close();
       }
     }, 5000);
@@ -1097,7 +1202,6 @@ async function finishInviteDialog(){
     console.error(e);
     alert('Failed to apply response');
   }
-
 }
 
 // ====== Server connection mgmt ======
@@ -1150,7 +1254,7 @@ function connect(sc) {
     if (sc.heartbeatTimer) { clearInterval(sc.heartbeatTimer); sc.heartbeatTimer = null; }
     sc.authed.clear();
     const r = getCurrentRoom();
-    if (r && normServer(r.server) === sc.url) setStatus('❌');
+    if (r && normServer(r.server) === sc.url) setStatus(statuses.disconnected);
     scheduleReconnect(sc);
   };
 
@@ -1170,7 +1274,7 @@ function connect(sc) {
 
       await ensureSodium();
       const nonce = fromB64u(m.nonce);
-      const edSkBytes = fromB64u(room.roomSkB64);
+      const edSkBytes = await getRoomPrivateKeyBytes(room.id);
       const sig = sodium.crypto_sign_detached(nonce, edSkBytes);
 
       sc.ws.send(JSON.stringify({ type: 'auth', room_id: room.id, signature: b64u(sig) }));
@@ -1192,7 +1296,7 @@ function connect(sc) {
         await ensureSodium();
         setCryptoForRoom(room);
         await initVirtualRoomView(sc.url, room.id);
-        setStatus('✅');
+        setStatus(statuses.connected);
       }
 
     } else if (m.type === 'history') {
@@ -1202,9 +1306,9 @@ function connect(sc) {
       if (m.room_id === currentRoomId) {
         if (!ui.messages.firstChild || !VL?.oldestKey) {
           await initVirtualRoomView(sc.url, m.room_id);
-          setStatus('✅');
+          setStatus(statuses.connected);
         } else if (ui.status && ui.status.textContent !== 'Connected') {
-          setStatus('✅');
+          setStatus(statuses.connected);
         }
       }
 
@@ -1220,6 +1324,23 @@ function connect(sc) {
 
     } else if (m.type === 'webrtc-ice') {
       await handleWebRtcIce(sc.url, m);
+
+    } else if (m.type === 'webrtc-taken') {
+      const { request_id, chosen } = m;
+      // Responder side
+      const s = serveRequests.get(request_id);
+      if (s && chosen !== myPeerId) {
+	try { s.pc.close(); } catch {}
+	serveRequests.delete(request_id);
+	if (DEBUG_RTC) dbg('RTC/RESP', 'taken -> closing', { request_id, chosen });
+      }
+      // (Requester side) if for some reason we’re not the chosen peer, cancel our pending attempt
+      const p = pendingRequests.get(request_id);
+      if (p && p.remotePeerId && p.remotePeerId !== chosen) {
+	try { p.pc.close(); } catch {}
+	pendingRequests.delete(request_id);
+	if (DEBUG_RTC) dbg('RTC/REQ', 'taken (not me) -> closing', { request_id, chosen });
+      }	
 
     } else if (m.type === 'pong') {
       // noop
@@ -1320,9 +1441,12 @@ cr.btnCreate.addEventListener('click', async () => {
   await ensureSodium();
   const { privateKey } = sodium.crypto_sign_keypair();
   const rid = b64u(derivePubFromSk(privateKey));
-  const room = { id: rid, name, server, roomSkB64: b64u(privateKey), roomId: rid, createdAt: nowMs() };
-
+  const pass = await ensureMasterPass();
+  const sealed = await sealSecret(pass, b64u(privateKey)); // -> {salt,iv,ct}
+  const room = { id: rid, name, server, roomId: rid, createdAt: nowMs() }; // no secret here
   rooms.push(room); saveRooms();
+  await secretPut(rid, sealed);   // store sealed secret in IDB
+  saveRooms();
   cr.dlg.close();
 
   ensureServerConnection(server);
@@ -1356,7 +1480,7 @@ cfg.btnRemove.addEventListener('click', async () => {
   } else {
     // No rooms left; disconnect and prompt create
     clearMessagesUI();
-    setStatus('✔️');
+    setStatus(statuses.passive);
     document.getElementById('currentRoomName').textContent = 'No room';
     openCreateRoomDialog();
   }
@@ -1382,7 +1506,7 @@ async function openRoom(roomId){
   if (!room) return;
   await ensureSodium();
   setCryptoForRoom(room);
-  setStatus('☑️');
+  setStatus(statuses.connecting);
 
   const sc = ensureServerConnection(room.server); // your existing helper
 
@@ -1390,15 +1514,15 @@ async function openRoom(roomId){
     if (!sc.subscribed.has(room.id)) {
       sc.subscribed.add(room.id);
       sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
-      setStatus('☑️');
+      setStatus(statuses.connecting);
     } else if (sc.authed.has(room.id)) {
       await initVirtualRoomView(sc.url, room.id);
-      setStatus('✅');
+      setStatus(statuses.connected);
     } else {
-      setStatus('☑️');
+      setStatus(statuses.connecting);
     }
   } else {
-    setStatus('☑️');
+    setStatus(statuses.connecting);
   }
 }
 
@@ -1426,45 +1550,67 @@ async function generateJoinAnswer(){
     const dc = evt.channel;
     joinDC = dc;
     dc.onopen = () => dbg('RTC/JOIN', 'dc open');
+
     dc.onmessage = async (evt) => {
       try {
-        // Handle both string and binary frames
-        const text = (typeof evt.data === 'string')
-          ? evt.data
-          : new TextDecoder().decode(evt.data);
+        const text = (typeof evt.data === 'string') ? evt.data : new TextDecoder().decode(evt.data);
         const obj = JSON.parse(text);
 
         if (obj && obj.kind === 'room-invite' && obj.room) {
           const r = obj.room;
 
-          // Validate: derived id must match provided id
+          // ---- Validate secret & derived id
           await ensureSodium();
-          const sk = fromB64u(r.roomSkB64);
-          const pk = derivePubFromSk(sk);
+          if (typeof r.roomSkB64 !== 'string') { alert('Invalid room code (secret missing)'); return; }
+          const skBytes = fromB64u(r.roomSkB64);
+          if (!(skBytes instanceof Uint8Array) || skBytes.length !== 64) {
+            alert('Invalid room code (bad secret format)'); return;
+          }
+          const pk = derivePubFromSk(skBytes);
           const derived = b64u(pk);
-          if (derived !== r.id) { alert('Invalid room code received'); return; }
+          if (derived !== r.id) { alert('Invalid room code (mismatched id)'); return; }
 
-          // Add room if not present
-          if (!rooms.find(x => x.id === r.id)) {
+          // ---- Upsert room (without secret on the object)
+          const serverUrl = normServer(r.server);
+          const existing = rooms.find(x => x.id === r.id);
+          if (existing) {
+            // update name/server if they changed (optional)
+            let changed = false;
+            if (r.name && existing.name !== r.name) { existing.name = r.name; changed = true; }
+            if (serverUrl && normServer(existing.server) !== serverUrl) { existing.server = serverUrl; changed = true; }
+            if (changed) saveRooms();
+          } else {
             rooms.push({
               id: r.id,
               name: r.name || 'New room',
-              server: normServer(r.server),
-              roomSkB64: r.roomSkB64,
+              server: serverUrl,
               roomId: r.id,
               createdAt: r.createdAt || nowMs()
             });
             saveRooms();
-            ensureServerConnection(r.server);
-            await registerRoomIfNeeded(r);
-            await openRoom(r.id);
           }
 
-          // NEW: acknowledge so inviter knows it landed
+          // ---- Store sealed secret (always overwrite to allow re-keys)
+          const pass = await ensureMasterPass();
+          const sealed = await sealSecret(pass, r.roomSkB64);
+          await secretPut(r.id, sealed);
+
+          // ---- Connect & open
+          ensureServerConnection(serverUrl);
+          await registerRoomIfNeeded({ id: r.id, server: serverUrl });
+          await openRoom(r.id);
+
+          // Ack so inviter can auto-close their dialog
           try { dc.send(JSON.stringify({ kind: 'invite-ack' })); } catch {}
 
+          // Clean up
           join.dlg.close();
-          setTimeout(() => { try { dc.close(); } catch{} try { pc.close(); } catch{} }, 300);
+          setTimeout(() => {
+            try { dc.close(); } catch {}
+            try { pc.close(); } catch {}
+            if (joinDC === dc) joinDC = null;
+            if (joinPC === pc) joinPC = null;
+          }, 300);
         }
       } catch (e) {
         dbg('RTC/JOIN', 'message parse error', e);
@@ -1472,19 +1618,20 @@ async function generateJoinAnswer(){
     };
   };
 
-  // msg contains { type:'offer', sdp, candidates? }
+  // Apply inviter offer + any early ICE
   await pc.setRemoteDescription({ type:'offer', sdp: msg.sdp });
 
-  // Apply inviter's candidates (if present)
   const offerCands = Array.isArray(msg.candidates) ? msg.candidates : [];
   for (const c of offerCands) {
-    try { await pc.addIceCandidate(new RTCIceCandidate(c)); } catch (e) { dbg('RTC/JOIN addIce offer', e); }
+    try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
+    catch (e) { dbg('RTC/JOIN addIce offer', e); }
   }
 
-  // Create/Set local answer as usual
+  // Create/Set local answer
   const answer = await pc.createAnswer();
   await pc.setLocalDescription(answer);
 
+  // Short ICE gather window for compact response code
   const { sdp, candidates } = await gatherIceCandidates(pc, 1500);
   const answerCode = packSignal({ type: 'answer', sdp, candidates });
   join.answerTA.value = answerCode;
@@ -1877,6 +2024,6 @@ if (rooms.length) {
   // open current room in the UI
   await openRoom(currentRoomId);
 } else {
-  setStatus('✔️');
+  setStatus(statuses.passive);
   ui.currentRoomName.textContent = 'No room';
 }

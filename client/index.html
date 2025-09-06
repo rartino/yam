@@ -3,191 +3,27 @@
 <head>
   <meta charset="UTF-8" />
   <title>Yam</title>
+  <meta http-equiv="Content-Security-Policy"
+      content="
+        default-src 'self';
+	script-src 'self' 'wasm-unsafe-eval';
+        connect-src 'self' https: wss:;
+        img-src 'self' blob: data:;
+        style-src 'self';
+        font-src 'self';
+        media-src 'self' blob:;
+        worker-src 'self';
+        object-src 'none';
+        base-uri 'none';
+        frame-ancestors 'none'
+      ">
   <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
   <meta name="theme-color" content="#000000" />
+  <link rel="apple-touch-icon" href="/apple-touch-icon.png" />
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="manifest.json" />
-  <style>
-    :root { --bg:#0b0b0b; --fg:#eaeaea; --muted:#999; --me:#2b6cb0; --other:#2d2d2d; --bubble-me:#1f6feb; --bubble-other:#202124; }
-    html, body { margin:0; padding:0; width:100%; height:100dvh; overflow:hidden; background:var(--bg); color:var(--fg); }
-    #app { height:100dvh; display:flex; flex-direction:column; }
-
-    header{
-      position: sticky; top: 0; z-index: 50;
-      background:#111; padding-top: max(12px, env(safe-area-inset-top));
-      border-bottom: 1px solid #222; display:flex; align-items:center; justify-content:space-between;
-    }
-    .hdr-left{ display:flex; flex-direction:column; }
-    .icon-btn{ background:transparent; border:0; padding:8px; border-radius:10px; color:#ccc; }
-    .icon-btn:active{ transform:scale(0.98); }
-    header h1 { margin:0; font-size:16px; display:flex; align-items:center; gap:8px; }
-    .app-logo { width:18px; height:18px; display:block; margin-left: 8px; }
-
-    #diagnostics { color: var(--muted); margin-left: 6px; font-weight: 400; }
-    
-    main{
-      min-height: 0; overflow: hidden; flex:1;
-      display:grid; grid-template-rows: 1fr auto; /* messages grows; composer fixed */
-    }
-    .messages{
-      min-height:0; -webkit-overflow-scrolling: touch; overflow:auto;
-      padding:12px 12px 4px; display:flex; flex-direction:column; gap:8px;
-    }
-    .row { display:flex; width:100%; }
-    .row .wrap{ max-width:75%; display:flex; flex-direction:column; }
-    .name-label{ font-size:11px; color:#bbb; margin:2px 8px 4px; }
-    .bubble { max-width:100%; padding:10px 12px; border-radius:16px; line-height:1.25; position:relative; word-wrap:break-word; }
-    .me   { justify-content:flex-end; }
-    .me .bubble { background:var(--bubble-me); color:white; border-top-right-radius:6px; }
-    .other { justify-content:flex-start; }
-    .other .bubble { background:var(--bubble-other); color:#eaeaea; border-top-left-radius:6px; }
-    .bubble img { max-width: 68vw; height: auto; display:block; border-radius:12px; }
-    .file-link { color:#cdd; text-decoration: underline; word-break: break-all; }
-
-    .composer{
-      display:grid; grid-template-columns: auto 1fr auto; gap:8px;
-      background:#0b0b0b; padding:12px 16px; border-top:1px solid #222;
-      padding-bottom: max(12px, env(safe-area-inset-bottom));
-    }
-    .composer input, .composer button {
-      padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea;
-    }
-    .attach-btn { display:flex; align-items:center; justify-content:center; width:44px; }
-    .attach-btn svg { display:block; }
-
-    footer { padding:8px 16px; font-size:12px; color:#999; border-top:1px solid #222; }
-    .keyhint { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size:12px; color:#a7b; overflow-wrap:anywhere; }
-
-    /* Dialog */
-    dialog{ position:relative; border:1px solid #333; border-radius:14px; padding:16px; background:#121212; color:#eaeaea; width:min(560px,94vw); }
-    dialog::backdrop{ background:rgba(0,0,0,.6); }
-    .dialog-close{ position:absolute; top:8px; right:10px; background:transparent; border:0; color:#aaa; font-size:22px; line-height:1; cursor:pointer; }
-
-    .settings-stack{ display:flex; flex-direction:column; gap:14px; }
-    .field label{ display:block; font-size:12px; color:#bbb; margin:0 0 6px; }
-    .field input{ width:100%; padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
-
-    .row-buttons button,
-    .settings-actions button,
-    .avatar-actions button,
-    .profile-actions button{
-      padding:12px; border-radius:12px; border:1px solid #333;
-      background:#1a1a1a; color:#eaeaea; cursor:pointer;
-    }
-    .row-buttons button:active,
-    .settings-actions button:active,
-    .avatar-actions button:active,
-    .profile-actions button:active{ transform:scale(0.98); }
-
-    /* Make button groups responsive: stack on small screens, split on wider */
-    .avatar-actions,
-    .row-buttons,
-    .profile-actions{
-      display:grid;
-      grid-template-columns: 1fr;
-      gap:8px;
-    }
-    @media (min-width: 420px){
-      .avatar-actions,
-      .row-buttons,
-      .profile-actions{
-	grid-template-columns: 1fr 1fr;
-      }
-    }
-
-    /* If a group has only one button (e.g., just "Save"), keep it full width */
-    .profile-actions:has(> :only-child){ grid-template-columns: 1fr; }
-
-    /* Inputs match the rest */
-    .profile-fields .field input,
-    .profile-fields .field textarea{
-      width:100%;
-      padding:12px;
-      border-radius:12px;
-      border:1px solid #333;
-      background:#151515;
-      color:#eaeaea;
-    }
-
-    .help{ margin:6px 0 0; }
-    .settings-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
-
-    .pending { display:flex; align-items:center; gap:8px; opacity:0.9; }
-    .retry-btn {
-      display:inline-flex; align-items:center; justify-content:center;
-      width:28px; height:28px; border-radius:50%;
-      border:1px solid #333; background:#1a1a1a; color:#eaeaea; cursor:pointer;
-    }
-    .retry-btn:active { transform:scale(0.96); }
-    .retry-icon { width:16px; height:16px; display:block; }
-
-    .hdr-center{ position: absolute; left:50%; transform:translateX(-50%); display:flex; align-items:center; }
-    .room-button{
-      display:flex; align-items:center; gap:6px; background:transparent; border:1px solid #333; color:#eaeaea;
-      border-radius:12px; padding:6px 10px; cursor:pointer;
-    }
-    .room-button .chev{ opacity:.7; }
-    .room-menu{
-      position:absolute; top:calc(100% + 8px); left:50%; transform:translateX(-50%);
-      min-width:220px; background:#121212; border:1px solid #333; border-radius:12px; padding:6px; z-index:60;
-      box-shadow: 0 8px 24px rgba(0,0,0,.4);
-    }
-    .room-item{ display:flex; justify-content:space-between; gap:8px; padding:8px 10px; border-radius:10px; cursor:pointer; }
-    .room-item:hover{ background:#1a1a1a; }
-    .room-item .sub{ font-size:11px; color:#aaa; }
-    .room-create{ margin-top:6px; padding:8px 10px; border-top:1px solid #222; cursor:pointer; color:#cde; }
-    .room-create:hover{ background:#161616; }
-
-    /* Settings dropdown (right side) */
-    .hdr-right{ position: relative; }
-    .settings-menu{
-      position:absolute; top:calc(100% + 8px); right:0;
-      min-width:220px; background:#121212; border:1px solid #333; border-radius:12px; padding:6px; z-index:60;
-      box-shadow: 0 8px 24px rgba(0,0,0,.4);
-    }
-    .settings-item{ padding:8px 10px; border-radius:10px; cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
-    .settings-item:hover{ background:#1a1a1a; }
-    
-    .menu-head{ display:flex; gap:10px; align-items:center; padding:8px 10px 6px; }
-    .menu-logo{ width:28px; height:28px; display:block; }
-    .brand-line{ display:flex; align-items:baseline; gap:6px; }
-    .brand-name{ font-weight:600; }
-    .version{ color:#999; font-weight:400; }
-    .tagline{ font-size:11px; color:#aaa; }
-    .menu-sep{ border:0; border-top:1px solid #222; margin:6px 0; }
-
-    /* Profile dialog: make it single-column, mobile-first */
-    .profile-grid{
-      display:flex;
-      flex-direction:column;
-      gap:14px;
-    }
-
-    /* Keep avatar centered on top */
-    .avatar-col{
-      display:flex;
-      flex-direction:column;
-      gap:8px;
-      align-items:center;
-    }
-
-    /* Avatar preview stays circular and contained */
-    .avatar-preview{
-      width:84px; height:84px;
-      border-radius:50%; overflow:hidden;
-      background:#222; color:#777; font-size:12px;
-      display:flex; align-items:center; justify-content:center;
-    }
-    .avatar-preview img{ width:100%; height:100%; object-fit:cover; display:block; }
-
-    .avatar-actions{ display:flex; gap:8px; }
-    .profile-fields{ display:flex; flex-direction:column; gap:14px; }
-    .profile-fields .field input,
-    .profile-fields .field textarea{
-      width:100%; padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea;
-    }
-    .profile-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
-    
-  </style>
+  <link rel="stylesheet" href="yam.css" /> 
 </head>
 <body>
   
@@ -195,15 +31,15 @@
   <dialog id="settingsModal">
     <button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
-      <h3 style="margin:0 0 10px">Configure room</h3>
+      <h3 class="modal-title">Configure room</h3>
       <div class="settings-stack">
 	<div class="field">
 	  <label for="cfgRoomName">Room name</label>
 	  <input id="cfgRoomName" placeholder="Room name" />
 	</div>
       </div>
-      <div class="settings-actions" style="justify-content:space-between">
-	<button type="button" id="btnRemoveRoom" style="border-color:#7a1a1a;background:#2a0e0e;color:#ffb3b3">Remove room</button>
+      <div class="settings-actions settings-actions--split">
+	<button type="button" id="btnRemoveRoom" class="dangerbutton">Remove room</button>
 	<div>
 	  <button type="button" id="btnSaveRoomCfg">Save</button>
 	</div>
@@ -215,7 +51,7 @@
   <dialog id="profileModal">
     <button id="btnCloseProfile" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
-      <h3 style="margin:0 0 10px">Profile</h3>
+      <h3 class="modal-title">Profile</h3>
 
       <div class="profile-grid">
 	<div class="avatar-col">
@@ -224,7 +60,7 @@
 	    <button type="button" id="btnAvatarUpload">Upload</button>
 	    <button type="button" id="btnAvatarClear">Clear</button>
 	  </div>
-	  <input id="avatarInput" type="file" accept="image/*" style="display:none" />
+	  <input id="avatarInput" type="file" accept="image/*" class="hidden" />
 	</div>
 
 	<div class="profile-fields">
@@ -235,8 +71,8 @@
 
 	  <div class="field">
 	    <label class="muted">Public device key</label>
-	    <textarea id="profPubKey" rows="3" readonly spellcheck="false" style="resize:none"></textarea>
-	    <div class="row-buttons" style="grid-template-columns:auto auto">
+	    <textarea id="profPubKey" class="codearea no-resize" rows="3" readonly spellcheck="false"></textarea>
+	    <div class="row-buttons row-buttons--auto2">
 	      <button type="button" id="btnCopyPubKey">Copy</button>
 	      <button type="button" id="btnRegenIdentity">Regenerate identity</button>
 	    </div>
@@ -254,7 +90,7 @@
   <dialog id="createRoomModal">
     <button id="btnCloseCreateRoom" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
-      <h3 style="margin:0 0 10px">Create new room</h3>
+      <h3 class="modal-title">Create new room</h3>
       <div class="settings-stack">
 	<div class="field">
 	  <label for="newRoomName">Room name</label>
@@ -276,13 +112,13 @@
   <dialog id="inviteModal">
     <button id="btnCloseInvite" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
-      <h3 style="margin:0 0 10px">Invite to this room</h3>
+      <h3 class="modal-title">Invite to this room</h3>
       <div class="settings-stack">
 	<p class="muted help">Step 1: Copy this invitation code and send it to your friend.</p>
 	<div class="field">
 	  <label>Invitation code</label>
-	  <textarea id="inviteOffer" readonly rows="5" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
-	  <div class="row-buttons" style="grid-template-columns:auto auto">
+	  <textarea id="inviteOffer" class="codearea" readonly rows="5"></textarea>
+	  <div class="row-buttons row-buttons--auto2">
 	    <button type="button" id="btnCopyInviteOffer">Copy</button>
 	    <button type="button" id="btnRefreshInviteOffer">Regenerate</button>
 	  </div>
@@ -291,10 +127,10 @@
 	<p class="muted help">Step 2: Paste the response code you get back and finish.</p>
 	<div class="field">
 	  <label>Response code</label>
-	  <textarea id="inviteAnswer" rows="5" placeholder="Paste response code here" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
+	  <textarea id="inviteAnswer" class="codearea" rows="5" placeholder="Paste response code here"></textarea>
 	</div>
       </div>
-      <div class="settings-actions" style="justify-content:flex-end">
+      <div class="settings-actions settings-actions--end">
 	<button type="button" id="btnFinishInvite">Finish</button>
       </div>
     </form>
@@ -304,19 +140,19 @@
   <dialog id="joinModal">
     <button id="btnCloseJoin" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
-      <h3 style="margin:0 0 10px">Join a room</h3>
+      <h3 class="modal-title">Join a room</h3>
       <div class="settings-stack">
 	<p class="muted help">Step 1: Paste the invitation code you received.</p>
 	<div class="field">
 	  <label>Invitation code</label>
-	  <textarea id="joinOffer" spellcheck="false" rows="5" placeholder="Paste invitation code here" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
+	  <textarea id="joinOffer" class="codearea" spellcheck="false" rows="5" placeholder="Paste invitation code here"></textarea>
 	</div>
 
 	<p class="muted help">Step 2: Copy the response code below and send it back.</p>
 	<div class="field">
 	  <label>Response code</label>
-	  <textarea id="joinAnswer" spellcheck="false" readonly rows="5" style="width:100%;padding:10px;border-radius:12px;border:1px solid #333;background:#151515;color:#eaeaea;"></textarea>
-	  <div class="row-buttons" style="grid-template-columns:auto auto">
+	  <textarea id="joinAnswer" class="codearea" spellcheck="false" readonly rows="5"></textarea>
+	  <div class="row-buttons row-buttons--auto2">
 	    <button type="button" id="btnMakeJoinAnswer">Generate response</button>
 	    <button type="button" id="btnCopyJoinAnswer">Copy</button>
 	  </div>
@@ -328,7 +164,7 @@
   <div id="app">
     <header>
       <div class="hdr-left">
-        <h1><img src="logo.svg" alt="" class="app-logo">Yam<span id="status">❌</span></span></h1>
+        <h1><img src="logo.svg" alt="" class="app-logo">Yam<span id="status">↮</span></h1>
       </div>
       <div class="hdr-center">
 	<button id="btnRoomMenu" class="room-button" aria-haspopup="true" aria-expanded="false">
@@ -377,32 +213,13 @@
         </button>
         <input id="messageInput" placeholder="Type a message…" />
         <button id="btnSend">Send</button>
-        <input id="fileInput" type="file" style="display:none" />
+        <input id="fileInput" type="file" class="hidden" />
       </div>
     </main>
   </div>
 
   <script src="vendor/sodium/sodium.js"></script>
+  <script type="module" src="boot.js"></script>
 
-  <script type="module">
-    fetch('./manifest.json')
-      .then(r => r.json())
-      .then(manifest => {
-        window.APP_VERSION = manifest.version;
-	const mv = document.getElementById('menuVersion');
-	if (mv) mv.textContent = `v${window.APP_VERSION}`;
-        const script = document.createElement('script');
-        script.type = 'module';
-        script.src = `./messenger.js?v=${window.APP_VERSION}`;
-        document.body.appendChild(script);
-      })
-      .catch(err => console.error('Failed to load manifest:', err));
-  </script>
-
-  <script>
-    if ('serviceWorker' in navigator) {
-      navigator.serviceWorker.register('sw.js').then(() => console.log('Service Worker Registered'));
-    }
-  </script>
 </body>
 </html>
