@@ -520,26 +520,40 @@ function getRoomsByServer() {
 
 // ====== Identity ======
 function persistIdentity() {
-  localStorage.setItem('secmsg_id_pk', b64u(myIdPk));
-  localStorage.setItem('secmsg_id_sk', b64u(myIdSk));
+  // Always set myPeerId and UI, and keep storage in sync
   myPeerId = b64u(myIdPk);
-  ui.identityInfo.textContent = `Your device ID: ${shortId(myPeerId)} (stored locally)`;
+  localStorage.setItem('secmsg_id_pk', myPeerId);
+  localStorage.setItem('secmsg_id_sk', b64u(myIdSk));
+  if (ui.identityInfo) {
+    ui.identityInfo.textContent = `Your device ID: ${shortId(myPeerId)} (stored locally)`;
+  }
 }
 
 async function ensureIdentity() {
   await ensureSodium();
-  const pk = localStorage.getItem('secmsg_id_pk');
-  const sk = localStorage.getItem('secmsg_id_sk');
-  if (pk && sk) {
-    myIdPk = fromB64u(pk); myIdSk = fromB64u(sk);
-  } else {
+  try {
+    const pk = localStorage.getItem('secmsg_id_pk');
+    const sk = localStorage.getItem('secmsg_id_sk');
+    if (pk && sk) {
+      // Rehydrate from storage
+      myIdPk = fromB64u(pk);
+      myIdSk = fromB64u(sk);
+    } else {
+      // First run (or storage empty) → create a new pair
+      const pair = sodium.crypto_sign_keypair();
+      myIdPk = pair.publicKey;
+      myIdSk = pair.privateKey;
+    }
+  } catch {
+    // Storage corrupted or decode failed → recover with a fresh pair
     const pair = sodium.crypto_sign_keypair();
-    myIdPk = pair.publicKey; myIdSk = pair.privateKey;
-    persistIdentity();
+    myIdPk = pair.publicKey;
+    myIdSk = pair.privateKey;
   }
-  ui.identityInfo.textContent = `Your device ID: ${shortId(b64u(myIdPk))} (stored locally)`;
+  // IMPORTANT: always call persistIdentity so myPeerId is set
+  persistIdentity();
 }
-    
+
 function announceIdentityToServers() {
   if (!window.servers) return;            // your multi-server map
   for (const [, sc] of servers) {
@@ -1546,9 +1560,26 @@ async function loadOlderPage() {
   const el = ui.messages;
   const prevH = el.scrollHeight;
 
-  const page = await msgPageByRoom(VL.serverUrl, VL.roomId, {
-    beforeTs: VL.oldestTs,
-    limit: PAGE_SIZE
+  const key = roomKey(VL.serverUrl, VL.roomId);
+  const db  = await openMsgDB();
+
+  // Page strictly BEFORE the current oldest (ts,id) using an open upper bound
+  const upperTs = VL.oldestKey ? VL.oldestKey.ts : Number.MAX_SAFE_INTEGER;
+  const upperId = VL.oldestKey ? VL.oldestKey.id : '\uffff';
+
+  const page = await new Promise((resolve, reject) => {
+    const out = [];
+    const tx  = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
+    const range = IDBKeyRange.upperBound([key, upperTs, upperId], /*open=*/true);
+    const req = idx.openCursor(range, 'prev'); // walk older -> newer within the "older than" window
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (!cur || out.length >= PAGE_SIZE) return resolve(out.reverse()); // return ascending
+      out.push(cur.value);
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
   });
 
   if (!page.length) {
@@ -1557,14 +1588,17 @@ async function loadOlderPage() {
     return;
   }
 
-  // Update window bounds (page is ascending)
-  VL.oldestTs = Math.min(VL.oldestTs, page[0].ts);
+  // Update bounds using the earliest item we just fetched
+  VL.oldestTs  = Math.min(VL.oldestTs, page[0].ts);
+  VL.oldestKey = { ts: page[0].ts, id: page[0].id };
 
-  // Build once, insert once (keeps DOM order ascending)
+  // Build once, insert once (ascending order)
   const frag = document.createDocumentFragment();
   const pendingFiles = [];
 
   for (const rec of page) {
+    if (VL.seenIds.has(rec.id)) continue;   // guard against accidental dup render
+    VL.seenIds.add(rec.id);
     const built = buildRowFromRecord(rec);
     frag.appendChild(built.node);
     if (built.bubble) pendingFiles.push(built);
@@ -1572,11 +1606,10 @@ async function loadOlderPage() {
 
   el.insertBefore(frag, el.firstChild);
 
-  // Preserve scroll position after prepending
+  // Preserve viewport position
   const newH = el.scrollHeight;
   el.scrollTop += (newH - prevH);
 
-  // Resolve any file bubbles
   for (const { bubble, meta } of pendingFiles) {
     renderFileIfAvailable(bubble, meta).then(ok => {
       if (!ok) { showPendingBubble(bubble, meta); requestFile(VL.roomId, meta.hash); }
@@ -1603,21 +1636,47 @@ async function initVirtualRoomView(serverUrl, roomId) {
   VL.hasMoreOlder = true;
   VL.loadingOlder = false;
 
+  // NEW: boundary & simple DOM de-dupe
+  VL.oldestKey = null;              // { ts, id } of the earliest row currently rendered
+  VL.seenIds   = new Set();         // avoid accidental double insertions
+
   clearMessagesUI();
 
-  const first = await msgPageByRoom(serverUrl, roomId, {
-    beforeTs: Number.MAX_SAFE_INTEGER,
-    limit: PAGE_SIZE
+  // Fetch the newest PAGE_SIZE items (using byRoomTsId) and then render ascending
+  const key = roomKey(serverUrl, roomId);
+  const db  = await openMsgDB();
+  const batch = await new Promise((resolve, reject) => {
+    const out = [];
+    const tx  = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
+    // full range for the room
+    const range = IDBKeyRange.bound([key, 0, ''], [key, Number.MAX_SAFE_INTEGER, '\uffff']);
+    const req = idx.openCursor(range, 'prev'); // newest first
+    req.onsuccess = (e) => {
+      const cur = e.target.result;
+      if (!cur || out.length >= PAGE_SIZE) return resolve(out);
+      out.push(cur.value);
+      cur.continue();
+    };
+    req.onerror = () => reject(req.error);
   });
 
-  if (first.length) {
-    VL.oldestTs = first[0].ts;
-    VL.newestTs = first[first.length - 1].ts;
+  if (batch.length) {
+    // Ascending for display
+    batch.reverse();
 
+    // Track bounds
+    VL.oldestTs = batch[0].ts;
+    VL.newestTs = batch[batch.length - 1].ts;
+    VL.oldestKey = { ts: batch[0].ts, id: batch[0].id };
+
+    // Build once, insert once
     const frag = document.createDocumentFragment();
     const pendingFiles = [];
 
-    for (const rec of first) {
+    for (const rec of batch) {
+      if (VL.seenIds.has(rec.id)) continue;
+      VL.seenIds.add(rec.id);
       const built = buildRowFromRecord(rec);
       frag.appendChild(built.node);
       if (built.bubble) pendingFiles.push(built);
@@ -1625,7 +1684,7 @@ async function initVirtualRoomView(serverUrl, roomId) {
 
     ui.messages.appendChild(frag);
 
-    // Fill any file bubbles after insertion
+    // Resolve file bubbles after insertion
     for (const { bubble, meta } of pendingFiles) {
       renderFileIfAvailable(bubble, meta).then(ok => {
         if (!ok) { showPendingBubble(bubble, meta); requestFile(roomId, meta.hash); }
@@ -1679,10 +1738,12 @@ async function refreshAvatarPreview() {
 }
 
 async function openProfile() {
-  // Fill fields
-  prof.name.value = (SETTINGS.username || '').trim();
   await ensureIdentity();
-  prof.pubKey.value = myPeerId;
+  prof.name.value = (SETTINGS.username || '').trim();
+
+  // Use myPeerId if set, otherwise derive from myIdPk
+  const pub = myPeerId || (myIdPk ? b64u(myIdPk) : '');
+  prof.pubKey.value = pub;
 
   await refreshAvatarPreview();
   prof.dlg.showModal();
@@ -1711,12 +1772,13 @@ async function clearAvatar() {
 async function regenerateIdentity() {
   await ensureSodium();
   const pair = sodium.crypto_sign_keypair();
-  myIdPk = pair.publicKey; myIdSk = pair.privateKey;
-  persistIdentity();
+  myIdPk = pair.publicKey;
+  myIdSk = pair.privateKey;
+  persistIdentity();                 // sets myPeerId too
   prof.pubKey.value = myPeerId;
-  announceIdentityToServers();
+  announceIdentityToServers();       // optional: re-announce to authed rooms
 }
-    
+
 // ====== Events ======
 ui.btnSend.addEventListener('click', async () => {
   const text = ui.msgInput.value.trim();

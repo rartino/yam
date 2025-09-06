@@ -20,9 +20,8 @@
     .icon-btn{ background:transparent; border:0; padding:8px; border-radius:10px; color:#ccc; }
     .icon-btn:active{ transform:scale(0.98); }
     header h1 { margin:0; font-size:16px; }
-    #status { color:var(--muted); margin-top:4px; }
-    .version { color: var(--muted); margin-left: 6px; font-weight: 400; }
-
+    #diagnostics { color: var(--muted); margin-left: 6px; font-weight: 400; }
+    
     main{
       min-height: 0; overflow: hidden; flex:1;
       display:grid; grid-template-rows: 1fr auto; /* messages grows; composer fixed */
@@ -266,8 +265,7 @@
   <div id="app">
     <header>
       <div class="hdr-left">
-        <h1>Yam<span id="appVersion" class="version"></span></h1>
-        <div id="status">Not connected</div>
+        <h1>Yam<span id="diagnostics"><span id="appVersion" class="version"></span>&nbsp; [<span id="status">Not connected</span>]</span></h1>
       </div>
       <div class="hdr-center">
 	<button id="btnRoomMenu" class="room-button" aria-haspopup="true" aria-expanded="false">
@@ -307,11 +305,6 @@
         <input id="fileInput" type="file" style="display:none" />
       </div>
     </main>
-
-    <footer>
-      Installable PWA. E2E via sealed boxes. Identity bubbles are based on a device key stored locally.
-      <div id="identityInfo" class="keyhint"></div>
-    </footer>
   </div>
 
   <script src="vendor/sodium/sodium.js"></script>
