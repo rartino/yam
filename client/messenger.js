@@ -500,6 +500,10 @@ function derivePubFromSk(sk) {
 
 async function setCryptoForRoom(room) {
   edSk = await getRoomPrivateKeyBytes(room.id);
+  if (!(edSk instanceof Uint8Array) || edSk.length !== 64) {
+    console.error('Room secret must be 64 bytes; got', edSk && edSk.length);
+    throw new Error('invalid-room-secret');
+  }
   edPk = derivePubFromSk(edSk);
   curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(edPk);
   curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(edSk);
@@ -1750,7 +1754,7 @@ async function generateJoinAnswer(){
             });
             saveRooms();
           }
-          await secretPut(r.id, await sealSecret(b64u(r.roomSkB64)));
+          await secretPut(r.id, await sealSecret(r.roomSkB64));
 
           // ---- Connect & open
           ensureServerConnection(serverUrl);

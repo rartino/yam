@@ -311,45 +311,52 @@ def ws_handler(ws):
                 continue
 
             # ---------- Send (store + broadcast, with de-dupe) ----------
-            if t == 'send':
-                if _too_many('send', ip, room_id, limit=300):  # ~10 msg/sec in 30s window
+            elif t == 'send':
+                if _too_many('send', ip, room_id, limit=300):
                     ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'rate_limited'}))
                     continue
 
-                ciphertext = m.get('ciphertext')
-                if not isinstance(ciphertext, str) or not ciphertext:
+                ciphertext_b64u = m.get('ciphertext')
+                nickname = m.get('nickname')
+                sender_id_b64u = m.get('sender_id')  # this is the base64url string from the client
+                sig_b64u = m.get('sig')              # base64url string (detached signature)
+
+                if not isinstance(ciphertext_b64u, str) or not ciphertext_b64u:
                     ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'missing_ciphertext'}))
                     continue
 
-                ts_client = m.get('ts_client')
+                # Decode for verification/storage
                 try:
-                    ts = int(ts_client) if ts_client is not None else now_ms()
+                    ciphertext = _from_b64u(ciphertext_b64u)
+                    sender_id = _from_b64u(sender_id_b64u) if sender_id_b64u else None
+                    sig = _from_b64u(sig_b64u) if sig_b64u else None
                 except Exception:
-                    ts = now_ms()
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_encoding'}))
+                    continue
 
-                nickname = m.get('nickname')
-                sender_id = m.get('sender_id')
-                sig = m.get('sig')
-
-                # If either sender_id or sig is present, both must be present and valid.
-                if (sender_id is not None) or (sig is not None):
-                    if not sender_id or not sig:
+                # If either sender_id or sig is present, require and verify both
+                if (sender_id_b64u is not None) or (sig_b64u is not None):
+                    if not sender_id_b64u or not sig_b64u:
                         ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'signature_required'}))
                         continue
                     try:
                         import nacl.signing, nacl.exceptions
-                        sender_pk = _from_b64u(sender_id)
-                        signature = _from_b64u(sig)
-                        cipher_bytes = _from_b64u(ciphertext)
-                        nacl.signing.VerifyKey(sender_pk).verify(cipher_bytes, signature)
+                        nacl.signing.VerifyKey(sender_id).verify(ciphertext, sig)
                     except nacl.exceptions.BadSignatureError:
                         ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_signature'}))
                         continue
                     except Exception:
                         ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'signature_error'}))
                         continue
-                
-                # De-dupe: skip if this ciphertext already exists for this room
+
+                # Timestamp: trust client ts if provided, else now
+                ts_client = m.get('ts_client')
+                try:
+                    ts = int(ts_client) if ts_client is not None else now_ms()
+                except Exception:
+                    ts = now_ms()
+
+                # Insert-or-ignore; gate broadcast on actual insert → prevents replay rebroadcast
                 conn = get_db()
                 cur = conn.cursor()
                 cur.execute(
@@ -360,19 +367,18 @@ def ws_handler(ws):
                 conn.commit()
                 conn.close()
 
-                payload = {
-                    'type': 'message',
-                    'room_id': room_id,
-                    'ts': ts,
-                    'nickname': nickname,
-                    'sender_id': sender_id_b64u,  # whichever var you use
-                    'sig': sig_b64u,
-                    'ciphertext': ciph_b64u
-                }
-
                 if inserted:
+                    payload = {
+                        'type': 'message',
+                        'room_id': room_id,
+                        'ts': ts,
+                        'nickname': nickname,
+                        'sender_id': sender_id_b64u,   # <- send the string form to clients
+                        'sig': sig_b64u,               # <- string form
+                        'ciphertext': ciphertext_b64u  # <- string form
+                    }
                     fanout = broadcast(room_id, payload)
-                    LOG("send", "room=", room_id, "bytes=", len(ciph_b64u), "fanout=", fanout)
+                    LOG("send", "room=", room_id, "bytes=", len(ciphertext_b64u), "fanout=", fanout)
                 else:
                     LOG("send-replay-ignored", "room=", room_id)
                 
