@@ -1149,6 +1149,8 @@ function connect(sc) {
     if (DEBUG_SIG) dbg('SIG/WS', 'close', sc.url, { code:e.code, reason:e.reason });
     if (sc.heartbeatTimer) { clearInterval(sc.heartbeatTimer); sc.heartbeatTimer = null; }
     sc.authed.clear();
+    const r = getCurrentRoom();
+    if (r && normServer(r.server) === sc.url) setStatus('Disconnected');
     scheduleReconnect(sc);
   };
 
@@ -1190,11 +1192,15 @@ function connect(sc) {
 	await ensureSodium();
 	setCryptoForRoom(room);
         await initVirtualRoomView(sc.url, room.id);
+	setStatus('Connected');
       }
 
     } else if (m.type === 'history') {
       for (const item of (m.messages || [])) {
 	await handleIncoming(sc.url, item, true);
+      }
+      if (m.room_id === currentRoomId) {
+	  if (ui.status && ui.status.textContent !== 'Connected') setStatus('Connected');
       }
 
     } else if (m.type === 'message') {
@@ -1515,6 +1521,8 @@ function buildRowFromRecord(rec) {
   const isMe = rec.senderId && myPeerId && rec.senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
 
+  if (rec.id) row.dataset.msgId = rec.id;
+
   const wrap  = document.createElement('div'); wrap.className = 'wrap';
   const label = document.createElement('div'); label.className = 'name-label';
   const who = rec.nickname || (rec.senderId ? shortId(rec.senderId) : 'room');
@@ -1563,7 +1571,7 @@ async function loadOlderPage() {
   const key = roomKey(VL.serverUrl, VL.roomId);
   const db  = await openMsgDB();
 
-  // Page strictly BEFORE the current oldest (ts,id) using an open upper bound
+  // Strictly BEFORE the current oldest (ts,id) via OPEN upper bound
   const upperTs = VL.oldestKey ? VL.oldestKey.ts : Number.MAX_SAFE_INTEGER;
   const upperId = VL.oldestKey ? VL.oldestKey.id : '\uffff';
 
@@ -1571,9 +1579,9 @@ async function loadOlderPage() {
     const out = [];
     const tx  = db.transaction(MSG_STORE, 'readonly');
     const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
-    const range = IDBKeyRange.upperBound([key, upperTs, upperId], /*open=*/true);
-    const req = idx.openCursor(range, 'prev'); // walk older -> newer within the "older than" window
-    req.onsuccess = (e) => {
+    const ub  = IDBKeyRange.upperBound([key, upperTs, upperId], /*open=*/true);
+    const req = idx.openCursor(ub, 'prev'); // walk older -> newer within "older than boundary"
+    req.onsuccess = e => {
       const cur = e.target.result;
       if (!cur || out.length >= PAGE_SIZE) return resolve(out.reverse()); // return ascending
       out.push(cur.value);
@@ -1588,17 +1596,19 @@ async function loadOlderPage() {
     return;
   }
 
-  // Update bounds using the earliest item we just fetched
+  // Update bounds using the earliest item we fetched
   VL.oldestTs  = Math.min(VL.oldestTs, page[0].ts);
   VL.oldestKey = { ts: page[0].ts, id: page[0].id };
+  VL.hasMoreOlder = (page.length === PAGE_SIZE);
 
-  // Build once, insert once (ascending order)
+  // Build once, insert once (ascending)
   const frag = document.createDocumentFragment();
   const pendingFiles = [];
 
   for (const rec of page) {
-    if (VL.seenIds.has(rec.id)) continue;   // guard against accidental dup render
+    if (VL.seenIds.has(rec.id)) continue;   // guards against races/dup inserts
     VL.seenIds.add(rec.id);
+
     const built = buildRowFromRecord(rec);
     frag.appendChild(built.node);
     if (built.bubble) pendingFiles.push(built);
@@ -1620,10 +1630,15 @@ async function loadOlderPage() {
   VL.loadingOlder = false;
 }
 
+let _vlLastLoad = 0;
 function attachVirtualScroll() {
   if (scrollHandler) ui.messages.removeEventListener('scroll', scrollHandler);
   scrollHandler = () => {
-    if (ui.messages.scrollTop < TOP_LOAD_PX) loadOlderPage();
+    const now = performance.now();
+    if (ui.messages.scrollTop < TOP_LOAD_PX && now - _vlLastLoad > 150) {
+      _vlLastLoad = now;
+      loadOlderPage();
+    }
   };
   ui.messages.addEventListener('scroll', scrollHandler);
 }
@@ -1636,23 +1651,23 @@ async function initVirtualRoomView(serverUrl, roomId) {
   VL.hasMoreOlder = true;
   VL.loadingOlder = false;
 
-  // NEW: boundary & simple DOM de-dupe
-  VL.oldestKey = null;              // { ts, id } of the earliest row currently rendered
-  VL.seenIds   = new Set();         // avoid accidental double insertions
+  // NEW: strict boundary + DOM dedupe
+  VL.oldestKey = null;       // { ts, id } of earliest row currently rendered
+  VL.seenIds   = new Set();  // avoid accidental double insertions
 
   clearMessagesUI();
 
-  // Fetch the newest PAGE_SIZE items (using byRoomTsId) and then render ascending
+  // Fetch newest PAGE_SIZE via byRoomTsId, then render ascending
   const key = roomKey(serverUrl, roomId);
   const db  = await openMsgDB();
+
   const batch = await new Promise((resolve, reject) => {
     const out = [];
     const tx  = db.transaction(MSG_STORE, 'readonly');
     const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
-    // full range for the room
     const range = IDBKeyRange.bound([key, 0, ''], [key, Number.MAX_SAFE_INTEGER, '\uffff']);
-    const req = idx.openCursor(range, 'prev'); // newest first
-    req.onsuccess = (e) => {
+    const req = idx.openCursor(range, 'prev'); // newest -> older
+    req.onsuccess = e => {
       const cur = e.target.result;
       if (!cur || out.length >= PAGE_SIZE) return resolve(out);
       out.push(cur.value);
@@ -1662,21 +1677,20 @@ async function initVirtualRoomView(serverUrl, roomId) {
   });
 
   if (batch.length) {
-    // Ascending for display
-    batch.reverse();
+    batch.reverse(); // display ascending
 
-    // Track bounds
-    VL.oldestTs = batch[0].ts;
-    VL.newestTs = batch[batch.length - 1].ts;
+    VL.oldestTs  = batch[0].ts;
+    VL.newestTs  = batch[batch.length - 1].ts;
     VL.oldestKey = { ts: batch[0].ts, id: batch[0].id };
+    VL.hasMoreOlder = (batch.length === PAGE_SIZE);
 
-    // Build once, insert once
     const frag = document.createDocumentFragment();
     const pendingFiles = [];
 
     for (const rec of batch) {
       if (VL.seenIds.has(rec.id)) continue;
       VL.seenIds.add(rec.id);
+
       const built = buildRowFromRecord(rec);
       frag.appendChild(built.node);
       if (built.bubble) pendingFiles.push(built);
@@ -1690,9 +1704,11 @@ async function initVirtualRoomView(serverUrl, roomId) {
         if (!ok) { showPendingBubble(bubble, meta); requestFile(roomId, meta.hash); }
       });
     }
+  } else {
+    VL.hasMoreOlder = false;
   }
 
-  attachVirtualScroll();
+  attachVirtualScroll();     // keep this if you already had it
   requestAnimationFrame(scrollToEnd);
 }
 
