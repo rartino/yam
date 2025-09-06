@@ -4,6 +4,8 @@ const CURRENT_ROOM_KEY = 'secmsg_current_room_id';
 const SETTINGS_KEY = 'secmsg_settings_v1';
 const MSG_DB = 'secmsg_msgs_db';
 const MSG_STORE = 'msgs';
+const PROFILE_DB = 'secmsg_profile_db';
+const PROFILE_STORE = 'kv';
 const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302'] },
@@ -12,6 +14,12 @@ const RTC_CONFIG = {
   iceCandidatePoolSize: 2,
 };
 const CHUNK_SIZE = 64 * 1024; // 64KB chunks for file send
+
+// Paging
+const PAGE_SIZE = 60;              // messages per page
+const MAX_DOM_MESSAGES = 250;      // hard cap in DOM
+const TOP_LOAD_PX = 150;           // when scrollTop < this → load older
+const BOTTOM_NEAR_PX = 400;        // near-bottom for autoscroll
 
 // ====== DEBUG ======
 const DEBUG_SIG = true;     // WebSocket signaling logs
@@ -34,7 +42,10 @@ const ui = {
   btnRoomMenu: document.getElementById('btnRoomMenu'),
   roomMenu: document.getElementById('roomMenu'),
   currentRoomName: document.getElementById('currentRoomName'),
-};
+  settingsMenu: document.getElementById('settingsMenu'),
+  menuProfile: document.getElementById('menuProfile'),
+  menuRoomOpts = document.getElementById('menuRoomOpts'),
+;
 
 // Gear -> configure room
 const cfg = {
@@ -46,6 +57,20 @@ const cfg = {
   btnInvite: document.getElementById('btnInvite'),
 };
 
+const prof = {
+  dlg: document.getElementById('profileModal'),
+  btnClose: document.getElementById('btnCloseProfile'),
+  name: document.getElementById('profName'),
+  pubKey: document.getElementById('profPubKey'),
+  btnCopy: document.getElementById('btnCopyPubKey'),
+  btnRegen: document.getElementById('btnRegenIdentity'),
+  btnSave: document.getElementById('btnSaveProfile'),
+  avatarPreview: document.getElementById('avatarPreview'),
+  avatarInput: document.getElementById('avatarInput'),
+  btnAvatarUpload: document.getElementById('btnAvatarUpload'),
+  btnAvatarClear: document.getElementById('btnAvatarClear'),
+};
+    
 // Invite (sender)
 const inv = {
   dlg: document.getElementById('inviteModal'),
@@ -85,6 +110,9 @@ let currentRoomId = null;  // string id = roomId (ed25519 pk b64u)
 // Per-server connections { url, ws, reconnectAttempt, reconnectTimer, heartbeatTimer, subscribed:Set, authed:Set }
 const servers = new Map();
 
+let profileDbPromise = null;
+let myPeerId = null; // base64url of myIdPk
+    
 // WebRTC maps
 // request_id -> { serverUrl, roomId, pc, dc, hash, remotePeerId?, iceBuf?, incomingIceBuf?, haveAnswer? }
 const pendingRequests = new Map();
@@ -158,6 +186,47 @@ async function clearRoomData(serverUrl, roomId){
   });
 }
 
+function openProfileDB() {
+  if (profileDbPromise) return profileDbPromise;
+  profileDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(PROFILE_DB, 1);
+    req.onupgradeneeded = () => req.result.createObjectStore(PROFILE_STORE);
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+  return profileDbPromise;
+}
+async function profileGet(key) {
+  const db = await openProfileDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PROFILE_STORE, 'readonly');
+    const store = tx.objectStore(PROFILE_STORE);
+    const req = store.get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function profilePut(key, value) {
+  const db = await openProfileDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PROFILE_STORE, 'readwrite');
+    const store = tx.objectStore(PROFILE_STORE);
+    const req = store.put(value, key);
+    req.onsuccess = () => resolve(true);
+    req.onerror = () => reject(req.error);
+  });
+}
+async function profileDel(key) {
+  const db = await openProfileDB();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(PROFILE_STORE, 'readwrite');
+    const store = tx.objectStore(PROFILE_STORE);
+    const req = store.delete(key);
+    req.onsuccess = () => resolve(true);
+    req.onerror = () => reject(req.error);
+  });
+}
+    
 async function ensureSodium() { await sodium.ready; }
 function normServer(url){
   if (!url) return '';
@@ -181,6 +250,37 @@ function unpackSignal(code){
   catch { return null; }
 }
 
+function persistIdentity() {
+  localStorage.setItem('secmsg_id_pk', b64u(myIdPk));
+  localStorage.setItem('secmsg_id_sk', b64u(myIdSk));
+  myPeerId = b64u(myIdPk);
+  ui.identityInfo.textContent = `Your device ID: ${shortId(myPeerId)} (stored locally)`;
+}
+
+async function ensureIdentity() {
+  await ensureSodium();
+  const pk = localStorage.getItem('secmsg_id_pk');
+  const sk = localStorage.getItem('secmsg_id_sk');
+  if (pk && sk) {
+    myIdPk = fromB64u(pk); myIdSk = fromB64u(sk);
+  } else {
+    const pair = sodium.crypto_sign_keypair();
+    myIdPk = pair.publicKey; myIdSk = pair.privateKey;
+    persistIdentity();
+  }
+  ui.identityInfo.textContent = `Your device ID: ${shortId(b64u(myIdPk))} (stored locally)`;
+}
+    
+function announceIdentityToServers() {
+  if (!window.servers) return;            // your multi-server map
+  for (const [, sc] of servers) {
+    if (!sc.ws || sc.ws.readyState !== WebSocket.OPEN) continue;
+    for (const roomId of sc.authed || []) {
+      try { sc.ws.send(JSON.stringify({ type:'announce', room_id: roomId, peer_id: myPeerId })); } catch {}
+    }
+  }
+}
+    
 // Wait until ICE gathering completes (no trickle)
 //function waitIceComplete(pc){
 //  if (pc.iceGatheringState === 'complete') return Promise.resolve();
@@ -376,6 +476,27 @@ async function sha256_b64u_string(s){
   return b64u(new Uint8Array(digest));
 }
 
+async function msgPageByRoom(serverUrl, roomId, { beforeTs = Number.MAX_SAFE_INTEGER, limit = PAGE_SIZE } = {}) {
+  const key = roomKey(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const out = [];
+    const tx = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTs');
+    // ts < beforeTs
+    const upper = (beforeTs === Number.MAX_SAFE_INTEGER) ? [key, Number.MAX_SAFE_INTEGER] : [key, Math.max(0, beforeTs - 1)];
+    const range = IDBKeyRange.bound([key, 0], upper);
+    const req = idx.openCursor(range, 'prev'); // newest first
+    req.onsuccess = e => {
+      const cur = e.target.result;
+      if (!cur || out.length >= limit) return res(out.reverse()); // return ascending
+      out.push(cur.value);
+      cur.continue();
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+
 // ====== Rooms store ======
 function loadSettings() {
   try { SETTINGS = { ...SETTINGS, ...JSON.parse(localStorage.getItem(SETTINGS_KEY) || '{}') }; }
@@ -433,21 +554,16 @@ function persistIdentity() {
   myPeerId = b64u(myIdPk);
   ui.identityInfo.textContent = `Your device ID: ${shortId(myPeerId)} (stored locally)`;
 }
-function rotateIdentityWithName(newName) {
-  const pair = sodium.crypto_sign_keypair();
-  myIdPk = pair.publicKey; myIdSk = pair.privateKey;
-  SETTINGS.username = newName.trim(); saveSettings(); persistIdentity();
-}
+
 async function ensureIdentity() {
   await ensureSodium();
   const pk = localStorage.getItem('secmsg_id_pk');
   const sk = localStorage.getItem('secmsg_id_sk');
   if (pk && sk) { myIdPk = fromB64u(pk); myIdSk = fromB64u(sk); persistIdentity(); }
-  else { rotateIdentityWithName(SETTINGS.username || 'Me'); }
 }
 
 // ====== Rendering ======
-function renderTextMessage({ text, ts, nickname, senderId, verified }) {
+function renderTextMessage({ text, ts, nickname, senderId, verified }, { prepend=false } = {}) {
   const row = document.createElement('div');
   const isMe = senderId && myPeerId && senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
@@ -462,10 +578,12 @@ function renderTextMessage({ text, ts, nickname, senderId, verified }) {
   bubble.textContent = text;
 
   wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
-  ui.messages.appendChild(row); scrollToEnd();
+  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
+  else ui.messages.appendChild(row);
+  return row;
 }
 
-function fileBubbleSkeleton({ meta, ts, nickname, senderId, verified }) {
+function fileBubbleSkeleton({ meta, ts, nickname, senderId, verified }, { prepend=false } = {}) {
   const row = document.createElement('div');
   const isMe = senderId && myPeerId && senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
@@ -478,17 +596,16 @@ function fileBubbleSkeleton({ meta, ts, nickname, senderId, verified }) {
 
   const bubble = document.createElement('div'); bubble.className = 'bubble';
   bubble.dataset.hash = meta.hash;
-
-  if (meta.mime && meta.mime.startsWith('image/')) {
-    bubble.textContent = 'Image pending…';
-  } else {
+  if (meta.mime && meta.mime.startsWith('image/')) bubble.textContent = 'Image pending…';
+  else {
     const p = document.createElement('div');
     p.textContent = `${meta.name || 'file'} (${meta.size || '?'} bytes)`;
     bubble.appendChild(p);
   }
 
   wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
-  ui.messages.appendChild(row);
+  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
+  else ui.messages.appendChild(row);
   return bubble;
 }
 
@@ -539,21 +656,6 @@ function showPendingBubble(bubbleEl, meta) {
   });
   wrap.appendChild(label); wrap.appendChild(btn);
   bubbleEl.appendChild(wrap);
-}
-
-async function renderRoomFromCache(serverUrl, roomId){
-  clearMessagesUI();
-  const cached = await msgListByRoom(serverUrl, roomId);
-  for (const rec of cached) {
-    if (rec.kind === 'text') {
-      renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
-    } else if (rec.kind === 'file') {
-      const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
-      renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(roomId, rec.meta.hash); } });
-    }
-  }
-  setStatus('Connected');
-  requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
 }
 
 // ====== Encrypt/Decrypt ======
@@ -654,8 +756,17 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
     ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
     verified, kind: 'text', text: pt
   });
-    if (roomId === currentRoomId) {
-      renderTextMessage({ text: pt, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
+  if (roomId === currentRoomId && !fromHistory) {
+    const rec = (/* determine kind */ (() => {
+      try {
+        const obj = JSON.parse(pt);
+        if (obj && obj.kind === 'file' && obj.hash) {
+          return { kind: 'file', ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id, verified, meta: obj };
+       }
+      } catch {}
+      return { kind: 'text', ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id, verified, text: pt };
+    })());
+    appendLiveRecord(rec);
   }
 }
 
@@ -1076,16 +1187,12 @@ function connect(sc) {
       if (room.id === currentRoomId) {
 	await ensureSodium();
 	setCryptoForRoom(room);
-	await renderRoomFromCache(sc.url, room.id);
+        await initVirtualRoomView(sc.url, room.id);
       }
 
     } else if (m.type === 'history') {
       for (const item of (m.messages || [])) {
 	await handleIncoming(sc.url, item, true);
-      }
-
-      if (m.room_id === currentRoomId) {
-	await renderRoomFromCache(sc.url, m.room_id);
       }
 
     } else if (m.type === 'message') {
@@ -1210,12 +1317,6 @@ cr.btnCreate.addEventListener('click', async () => {
   await openRoom(room.id);
 });
 
-ui.btnSettings.addEventListener('click', () => {
-  const r = getCurrentRoom();
-  if (!r) { openCreateRoomDialog(); return; }
-  cfg.name.value = r.name || '';
-  cfg.dlg.showModal();
-});
 cfg.btnClose.addEventListener('click', () => cfg.dlg.close());
 cfg.btnSave.addEventListener('click', () => {
   const r = getCurrentRoom(); if (!r) return;
@@ -1278,20 +1379,8 @@ async function openRoom(roomId){
       sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
       setStatus('Connecting…');
     } else if (sc.authed.has(room.id)) {
-      await ensureSodium();
-      setCryptoForRoom(room);
-      clearMessagesUI();
-      const cached = await msgListByRoom(sc.url, room.id);
-      for (const rec of cached) {
-	if (rec.kind === 'text') {
-	  renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
-	} else if (rec.kind === 'file') {
-	  const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified });
-	  renderFileIfAvailable(bubble, rec.meta).then(ok => { if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(roomId, rec.meta.hash); } });
-	}
-      }
+      await initVirtualRoomView(sc.url, room.id);
       setStatus('Connected');
-      requestAnimationFrame(() => requestAnimationFrame(scrollToEnd));
     } else {
       setStatus('Connecting…');
     }
@@ -1394,6 +1483,167 @@ join.btnCopy?.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(join.answerTA.value); join.btnCopy.textContent='Copied'; setTimeout(()=>join.btnCopy.textContent='Copy',1000);} catch {}
 });
 
+// ---- Virtual list state for current room ----
+const VL = {
+  serverUrl: null,
+  roomId: null,
+  oldestTs: Number.MAX_SAFE_INTEGER,
+  newestTs: 0,
+  hasMoreOlder: true,
+  loadingOlder: false,
+};
+let scrollHandler = null;
+
+function nearBottom() {
+  const el = ui.messages;
+  return (el.scrollHeight - el.clientHeight - el.scrollTop) < BOTTOM_NEAR_PX;
+}
+
+function pruneTopIfNeeded() {
+  const el = ui.messages;
+  while (el.children.length > MAX_DOM_MESSAGES) el.removeChild(el.firstChild);
+}
+function pruneBottomIfNeeded() {
+  const el = ui.messages;
+  while (el.children.length > MAX_DOM_MESSAGES) el.removeChild(el.lastChild);
+}
+
+function renderRecord(rec, { prepend=false } = {}) {
+  if (rec.kind === 'text') {
+    renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified }, { prepend });
+  } else if (rec.kind === 'file') {
+    const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified }, { prepend });
+    renderFileIfAvailable(bubble, rec.meta).then(ok => {
+      if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(VL.roomId, rec.meta.hash); }
+    });
+  }
+}
+
+async function loadOlderPage() {
+  if (VL.loadingOlder || !VL.hasMoreOlder) return;
+  VL.loadingOlder = true;
+
+  const el = ui.messages;
+  const prevH = el.scrollHeight;
+  const page = await msgPageByRoom(VL.serverUrl, VL.roomId, { beforeTs: VL.oldestTs, limit: PAGE_SIZE });
+  if (!page.length) {
+    VL.hasMoreOlder = false;
+    VL.loadingOlder = false;
+    return;
+  }
+  VL.oldestTs = Math.min(VL.oldestTs, page[0].ts);
+
+  // Prepend in ascending order so visual order stays correct
+  for (const rec of page) renderRecord(rec, { prepend: true });
+  // Keep viewport from jumping when we add at top
+  const newH = el.scrollHeight;
+  el.scrollTop += (newH - prevH);
+
+  pruneBottomIfNeeded();
+  VL.loadingOlder = false;
+}
+
+function attachVirtualScroll() {
+  if (scrollHandler) ui.messages.removeEventListener('scroll', scrollHandler);
+  scrollHandler = () => {
+    if (ui.messages.scrollTop < TOP_LOAD_PX) loadOlderPage();
+  };
+  ui.messages.addEventListener('scroll', scrollHandler);
+}
+
+async function initVirtualRoomView(serverUrl, roomId) {
+  VL.serverUrl = serverUrl;
+  VL.roomId = roomId;
+  VL.oldestTs = Number.MAX_SAFE_INTEGER;
+  VL.newestTs = 0;
+  VL.hasMoreOlder = true;
+  VL.loadingOlder = false;
+
+  clearMessagesUI();
+  const first = await msgPageByRoom(serverUrl, roomId, { beforeTs: Number.MAX_SAFE_INTEGER, limit: PAGE_SIZE });
+  if (first.length) {
+    VL.oldestTs = first[0].ts;
+    VL.newestTs = first[first.length - 1].ts;
+    for (const rec of first) renderRecord(rec, { prepend: false });
+  }
+  attachVirtualScroll();
+  requestAnimationFrame(scrollToEnd);
+}
+
+// Append a new live record at bottom (keep window size, autoscroll if near bottom)
+function appendLiveRecord(rec) {
+  const autoscroll = nearBottom();
+  renderRecord(rec, { prepend: false });
+  pruneTopIfNeeded();
+  if (autoscroll) requestAnimationFrame(scrollToEnd);
+}
+
+function toggleSettingsMenu(show) {
+  const willShow = (typeof show === 'boolean') ? show : ui.settingsMenu.hidden;
+  ui.settingsMenu.hidden = !willShow;
+}
+
+function dataUrlFromBlob(blob) {
+  return new Promise((resolve) => {
+    const r = new FileReader();
+    r.onload = () => resolve(r.result);
+    r.readAsDataURL(blob);
+  });
+}
+
+async function refreshAvatarPreview() {
+  const blob = await profileGet('avatar');
+  prof.avatarPreview.innerHTML = '';
+  if (blob) {
+    const url = URL.createObjectURL(blob);
+    const img = document.createElement('img');
+    img.onload = () => URL.revokeObjectURL(url);
+    img.src = url;
+    prof.avatarPreview.appendChild(img);
+  } else {
+    prof.avatarPreview.textContent = 'No avatar';
+  }
+}
+
+async function openProfile() {
+  // Fill fields
+  prof.name.value = (SETTINGS.username || '').trim();
+  await ensureIdentity();
+  prof.pubKey.value = myPeerId;
+
+  await refreshAvatarPreview();
+  prof.dlg.showModal();
+}
+
+function closeProfile() { prof.dlg.close(); }
+
+function saveProfile() {
+  SETTINGS.username = (prof.name.value || '').trim();
+  saveSettings();
+  closeProfile();
+}
+
+async function handleAvatarPicked(file) {
+  if (!file) return;
+  // Optional: resize/compress here if you want. For now store as-is.
+  await profilePut('avatar', file);
+  await refreshAvatarPreview();
+}
+
+async function clearAvatar() {
+  await profileDel('avatar');
+  await refreshAvatarPreview();
+}
+
+async function regenerateIdentity() {
+  await ensureSodium();
+  const pair = sodium.crypto_sign_keypair();
+  myIdPk = pair.publicKey; myIdSk = pair.privateKey;
+  persistIdentity();
+  prof.pubKey.value = myPeerId;
+  announceIdentityToServers();
+}
+    
 // ====== Events ======
 ui.btnSend.addEventListener('click', async () => {
   const text = ui.msgInput.value.trim();
@@ -1436,6 +1686,38 @@ inv.btnCopyOffer?.addEventListener('click', async () => {
 inv.btnRefreshOffer?.addEventListener('click', openInviteDialog);
 inv.btnFinish?.addEventListener('click', finishInviteDialog);
 
+// Settings dropdown
+ui.btnSettings.addEventListener('click', (e) => {
+  e.stopPropagation();
+  toggleSettingsMenu(true);
+});
+document.addEventListener('click', (e) => {
+  if (!ui.settingsMenu.contains(e.target) && !ui.btnSettings.contains(e.target)) {
+    toggleSettingsMenu(false);
+  }
+});
+ui.menuProfile.addEventListener('click', () => { toggleSettingsMenu(false); openProfile(); });
+
+ui.menuRoomOpts.addEventListener('click', () => {
+  toggleSettingsMenu(false);
+  const r = getCurrentRoom();
+  if (!r) { openCreateRoomDialog(); return; }
+  cfg.name.value = r.name || '';
+  cfg.dlg.showModal();
+});
+    
+// Profile dialog
+prof.btnClose.addEventListener('click', closeProfile);
+prof.btnSave.addEventListener('click', saveProfile);
+prof.btnCopy.addEventListener('click', async () => {
+  try { await navigator.clipboard.writeText((prof.pubKey.value || '').trim()); prof.btnCopy.textContent='Copied'; setTimeout(()=>prof.btnCopy.textContent='Copy', 900); } catch {}
+});
+prof.btnRegen.addEventListener('click', regenerateIdentity);
+
+prof.btnAvatarUpload.addEventListener('click', () => prof.avatarInput.click());
+prof.avatarInput.addEventListener('change', (e) => handleAvatarPicked(e.target.files && e.target.files[0]));
+    prof.btnAvatarClear.addEventListener('click', clearAvatar);
+    
 // ====== Boot ======
 loadSettings();
 await ensureIdentity();

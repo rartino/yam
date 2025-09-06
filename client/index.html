@@ -97,6 +97,32 @@
     .room-item .sub{ font-size:11px; color:#aaa; }
     .room-create{ margin-top:6px; padding:8px 10px; border-top:1px solid #222; cursor:pointer; color:#cde; }
     .room-create:hover{ background:#161616; }
+
+    /* Settings dropdown (right side) */
+    .hdr-right{ position: relative; }
+    .settings-menu{
+      position:absolute; top:calc(100% + 8px); right:0;
+      min-width:220px; background:#121212; border:1px solid #333; border-radius:12px; padding:6px; z-index:60;
+      box-shadow: 0 8px 24px rgba(0,0,0,.4);
+    }
+    .settings-item{ padding:8px 10px; border-radius:10px; cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
+    .settings-item:hover{ background:#1a1a1a; }
+
+    /* Profile dialog */
+    .profile-grid{ display:grid; grid-template-columns: 88px 1fr; gap:14px; align-items: start; }
+    .avatar-col{ display:flex; flex-direction:column; gap:8px; align-items:center; }
+    .avatar-preview{
+      width:84px; height:84px; border-radius:50%; overflow:hidden; background:#222;
+      display:flex; align-items:center; justify-content:center; color:#777; font-size:12px;
+    }
+    .avatar-preview img{ width:100%; height:100%; object-fit:cover; display:block; }
+    .avatar-actions{ display:flex; gap:8px; }
+    .profile-fields{ display:flex; flex-direction:column; gap:14px; }
+    .profile-fields .field input,
+    .profile-fields .field textarea{
+      width:100%; padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea;
+    }
+    .profile-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
     
   </style>
 </head>
@@ -119,6 +145,45 @@
 	  <button type="button" id="btnSaveRoomCfg">Save</button>
 	  <button type="button" id="btnInvite">Invite</button>
 	</div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Profile dialog -->
+  <dialog id="profileModal">
+    <button id="btnCloseProfile" class="dialog-close" aria-label="Close">×</button>
+    <form method="dialog">
+      <h3 style="margin:0 0 10px">Profile</h3>
+
+      <div class="profile-grid">
+	<div class="avatar-col">
+	  <div id="avatarPreview" class="avatar-preview">No avatar</div>
+	  <div class="avatar-actions">
+	    <button type="button" id="btnAvatarUpload">Upload</button>
+	    <button type="button" id="btnAvatarClear">Clear</button>
+	  </div>
+	  <input id="avatarInput" type="file" accept="image/*" style="display:none" />
+	</div>
+
+	<div class="profile-fields">
+	  <div class="field">
+	    <label for="profName" class="muted">Display name</label>
+	    <input id="profName" placeholder="Your name" autocomplete="off" autocapitalize="words" />
+	  </div>
+
+	  <div class="field">
+	    <label class="muted">Public device key</label>
+	    <textarea id="profPubKey" rows="3" readonly spellcheck="false" style="resize:none"></textarea>
+	    <div class="row-buttons" style="grid-template-columns:auto auto">
+	      <button type="button" id="btnCopyPubKey">Copy</button>
+	      <button type="button" id="btnRegenIdentity">Regenerate identity</button>
+	    </div>
+	  </div>
+	</div>
+      </div>
+
+      <div class="profile-actions">
+	<button type="button" id="btnSaveProfile">Save</button>
       </div>
     </form>
   </dialog>
@@ -213,12 +278,18 @@
 	</button>
 	<div id="roomMenu" class="room-menu" hidden></div>
       </div>
-      <button id="btnSettings" class="icon-btn" aria-label="Settings" title="Settings">
-        <!-- gear icon -->
-        <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-          <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8.94 3.24-.97-.56a7.96 7.96 0 0 0-.26-1l.73-.89a.7.7 0 0 0-.08-.98l-1.1-1.1a.7.7 0 0 0-.98-.08l-.89.73c-.32-.12-.66-.21-1-.26l-.56-.97a.7.7 0 0 0-.62-.36h-1.56a.7.7 0 0 0-.62.36l-.56.97c-.34.05-.68.14-1 .26l-.89-.73a.7.7 0 0 0-.98.08l-1.1 1.1a.7.7 0 0 0-.08.98l.73.89c-.12.32-.21.66-.26 1l-.97.56a.7.7 0 0 0-.36.62v1.56c0 .26.14.5.36.62l.97.56c.05.34.14.68.26 1l-.73.89a.7.7 0 0 0 .08.98l1.1 1.1c.25.25.64.27.92.08l.89-.73c.32.12.66.21 1 .26l.56.97c.12.22.36.36.62.36h1.56c.26 0 .5-.14.62-.36l.56-.97c.34-.05.68-.14 1-.26l.89.73c.28.2.67.17.92-.08l1.1-1.1c.25-.25.27-.64.08-.92l-.73-.89c.12-.32.21-.66.26-1l.97-.56c.22-.12.36-.36.36-.62v-1.56a.7.7 0 0 0-.36-.62Z"/>
-        </svg>
-      </button>
+      <div class="hdr-right">
+	<button id="btnSettings" class="icon-btn" aria-label="Settings" title="Settings">
+	  <!-- gear icon -->
+	  <svg width="22" height="22" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+	    <path d="M12 8.5a3.5 3.5 0 1 0 0 7 3.5 3.5 0 0 0 0-7Zm8.94 3.24-.97-.56a7.96 7.96 0 0 0-.26-1l.73-.89a.7.7 0 0 0-.08-.98l-1.1-1.1a.7.7 0 0 0-.98-.08l-.89.73c-.32-.12-.66-.21-1-.26l-.56-.97a.7.7 0 0 0-.62-.36h-1.56a.7.7 0 0 0-.62.36l-.56.97c-.34.05-.68.14-1 .26l-.89-.73a.7.7 0 0 0-.98.08l-1.1 1.1a.7.7 0 0 0-.08.98l.73.89c-.12.32-.21.66-.26 1l-.97.56a.7.7 0 0 0-.36.62v1.56c0 .26.14.5.36.62l.97.56c.05.34.14.68.26 1l-.73.89a.7.7 0 0 0 .08.98l1.1 1.1c.25.25.64.27.92.08l.89-.73c.32.12.66.21 1 .26l.56.97c.12.22.36.36.62.36h1.56c.26 0 .5-.14.62-.36l.56-.97c.34-.05.68-.14 1-.26l.89.73c.28.2.67.17.92-.08l1.1-1.1c.25-.25.27-.64.08-.92l-.73-.89c.12-.32.21-.66.26-1l.97-.56c.22-.12.36-.36.36-.62v-1.56a.7.7 0 0 0-.36-.62Z"/>
+	  </svg>
+	</button>
+	<div id="settingsMenu" class="settings-menu" hidden>
+	  <div id="menuProfile" class="settings-item">Profile</div>
+	  <div id="menuRoomOpts" class="settings-item">Room options</div>
+	</div>
+      </div>
     </header>
 
     <main>
