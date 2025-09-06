@@ -111,7 +111,6 @@ let currentRoomId = null;  // string id = roomId (ed25519 pk b64u)
 const servers = new Map();
 
 let profileDbPromise = null;
-let myPeerId = null; // base64url of myIdPk
     
 // WebRTC maps
 // request_id -> { serverUrl, roomId, pc, dc, hash, remotePeerId?, iceBuf?, incomingIceBuf?, haveAnswer? }
@@ -250,37 +249,6 @@ function unpackSignal(code){
   catch { return null; }
 }
 
-function persistIdentity() {
-  localStorage.setItem('secmsg_id_pk', b64u(myIdPk));
-  localStorage.setItem('secmsg_id_sk', b64u(myIdSk));
-  myPeerId = b64u(myIdPk);
-  ui.identityInfo.textContent = `Your device ID: ${shortId(myPeerId)} (stored locally)`;
-}
-
-async function ensureIdentity() {
-  await ensureSodium();
-  const pk = localStorage.getItem('secmsg_id_pk');
-  const sk = localStorage.getItem('secmsg_id_sk');
-  if (pk && sk) {
-    myIdPk = fromB64u(pk); myIdSk = fromB64u(sk);
-  } else {
-    const pair = sodium.crypto_sign_keypair();
-    myIdPk = pair.publicKey; myIdSk = pair.privateKey;
-    persistIdentity();
-  }
-  ui.identityInfo.textContent = `Your device ID: ${shortId(b64u(myIdPk))} (stored locally)`;
-}
-    
-function announceIdentityToServers() {
-  if (!window.servers) return;            // your multi-server map
-  for (const [, sc] of servers) {
-    if (!sc.ws || sc.ws.readyState !== WebSocket.OPEN) continue;
-    for (const roomId of sc.authed || []) {
-      try { sc.ws.send(JSON.stringify({ type:'announce', room_id: roomId, peer_id: myPeerId })); } catch {}
-    }
-  }
-}
-    
 // Wait until ICE gathering completes (no trickle)
 //function waitIceComplete(pc){
 //  if (pc.iceGatheringState === 'complete') return Promise.resolve();
@@ -559,7 +527,24 @@ async function ensureIdentity() {
   await ensureSodium();
   const pk = localStorage.getItem('secmsg_id_pk');
   const sk = localStorage.getItem('secmsg_id_sk');
-  if (pk && sk) { myIdPk = fromB64u(pk); myIdSk = fromB64u(sk); persistIdentity(); }
+  if (pk && sk) {
+    myIdPk = fromB64u(pk); myIdSk = fromB64u(sk);
+  } else {
+    const pair = sodium.crypto_sign_keypair();
+    myIdPk = pair.publicKey; myIdSk = pair.privateKey;
+    persistIdentity();
+  }
+  ui.identityInfo.textContent = `Your device ID: ${shortId(b64u(myIdPk))} (stored locally)`;
+}
+    
+function announceIdentityToServers() {
+  if (!window.servers) return;            // your multi-server map
+  for (const [, sc] of servers) {
+    if (!sc.ws || sc.ws.readyState !== WebSocket.OPEN) continue;
+    for (const roomId of sc.authed || []) {
+      try { sc.ws.send(JSON.stringify({ type:'announce', room_id: roomId, peer_id: myPeerId })); } catch {}
+    }
+  }
 }
 
 // ====== Rendering ======
