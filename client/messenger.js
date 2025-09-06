@@ -44,7 +44,7 @@ const ui = {
   currentRoomName: document.getElementById('currentRoomName'),
   settingsMenu: document.getElementById('settingsMenu'),
   menuProfile: document.getElementById('menuProfile'),
-  menuRoomOpts = document.getElementById('menuRoomOpts'),
+  menuRoomOpts: document.getElementById('menuRoomOpts'),
 ;
 
 // Gear -> configure room
