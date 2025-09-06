@@ -1200,7 +1200,12 @@ function connect(sc) {
 	await handleIncoming(sc.url, item, true);
       }
       if (m.room_id === currentRoomId) {
-	  if (ui.status && ui.status.textContent !== 'Connected') setStatus('Connected');
+	if (!ui.messages.firstChild || !VL?.oldestKey) {
+	  await initVirtualRoomView(sc.url, m.room_id);
+	  setStatus('Connected');
+	} else if (ui.status && ui.status.textContent !== 'Connected') {
+	  setStatus('Connected');
+	}
       }
 
     } else if (m.type === 'message') {
