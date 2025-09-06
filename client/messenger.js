@@ -129,42 +129,6 @@ function sevenDaysAgoMs() { return nowMs() - 7 * 24 * 60 * 60 * 1000; }
 function setStatus(text) { ui.status.textContent = text; }
 function shortId(idB64u) { return idB64u.slice(0, 6) + '…' + idB64u.slice(-6); }
 
-
-async function msgGetLastTs(serverUrl, roomId){
-  const key = roomKey(serverUrl, roomId);
-  const db = await openMsgDB();
-  return new Promise((res, rej) => {
-    const tx = db.transaction(MSG_STORE, 'readonly');
-    const idx = tx.objectStore(MSG_STORE).index('byRoomTs');
-    const range = IDBKeyRange.bound([key, 0], [key, Number.MAX_SAFE_INTEGER]);
-    const req = idx.openCursor(range, 'prev'); // last by ts
-    req.onsuccess = e => {
-      const cur = e.target.result;
-      if (!cur) return res(0);
-      res(cur.value.ts || 0);
-    };
-    req.onerror = () => rej(req.error);
-  });
-}
-
-async function msgListByRoom(serverUrl, roomId){
-  const key = roomKey(serverUrl, roomId);
-  const db = await openMsgDB();
-  return new Promise((res, rej) => {
-    const out = [];
-    const tx = db.transaction(MSG_STORE, 'readonly');
-    const idx = tx.objectStore(MSG_STORE).index('byRoomTs');
-    const range = IDBKeyRange.bound([key, 0], [key, Number.MAX_SAFE_INTEGER]);
-    const req = idx.openCursor(range, 'next'); // ascending by ts
-    req.onsuccess = e => {
-      const cur = e.target.result;
-      if (!cur) return res(out);
-      out.push(cur.value); cur.continue();
-    };
-    req.onerror = () => rej(req.error);
-  });
-}
-
 async function clearRoomData(serverUrl, roomId){
   const db = await openMsgDB();
   const key = roomKey(serverUrl, roomId);
@@ -397,8 +361,7 @@ function openMsgDB(){
       } else {
         s = req.transaction.objectStore(MSG_STORE);
       }
-      if (!s.indexNames.contains('byRoom'))   s.createIndex('byRoom', 'roomKey', { unique:false });
-      if (!s.indexNames.contains('byRoomTs')) s.createIndex('byRoomTs', ['roomKey','ts'], { unique:false });
+      if (!s.indexNames.contains('byRoomTsId')) s.createIndex('byRoomTsId', ['roomKey','ts', 'id'], { unique:false });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
@@ -449,15 +412,55 @@ async function msgPageByRoom(serverUrl, roomId, { beforeTs = Number.MAX_SAFE_INT
   const db = await openMsgDB();
   return new Promise((res, rej) => {
     const out = [];
-    const tx = db.transaction(MSG_STORE, 'readonly');
-    const idx = tx.objectStore(MSG_STORE).index('byRoomTs');
-    // ts < beforeTs
-    const upper = (beforeTs === Number.MAX_SAFE_INTEGER) ? [key, Number.MAX_SAFE_INTEGER] : [key, Math.max(0, beforeTs - 1)];
-    const range = IDBKeyRange.bound([key, 0], upper);
+    const tx  = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
+    const lower = [key, 0, ''];
+    const upper = [key, Math.max(0, beforeTs - 1), '\uffff'];
+    const range = IDBKeyRange.bound(lower, upper);
     const req = idx.openCursor(range, 'prev'); // newest first
     req.onsuccess = e => {
       const cur = e.target.result;
       if (!cur || out.length >= limit) return res(out.reverse()); // return ascending
+      out.push(cur.value);
+      cur.continue();
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+
+async function msgGetLastTs(serverUrl, roomId){
+  const key = roomKey(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const tx  = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
+    const lower = [key, 0, ''];
+    const upper = [key, Number.MAX_SAFE_INTEGER, '\uffff'];
+    const range = IDBKeyRange.bound(lower, upper);
+    const req = idx.openCursor(range, 'prev'); // newest first
+    req.onsuccess = e => {
+      const cur = e.target.result;
+      if (!cur) return res(0);
+      res(cur.value.ts || 0);
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+
+async function msgListByRoom(serverUrl, roomId){
+  const key = roomKey(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const out = [];
+    const tx  = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
+    const lower = [key, 0, ''];
+    const upper = [key, Number.MAX_SAFE_INTEGER, '\uffff'];
+    const range = IDBKeyRange.bound(lower, upper);
+    const req = idx.openCursor(range, 'next'); // ascending
+    req.onsuccess = e => {
+      const cur = e.target.result;
+      if (!cur) return res(out);
       out.push(cur.value);
       cur.continue();
     };
@@ -1493,6 +1496,38 @@ function pruneBottomIfNeeded() {
   while (el.children.length > MAX_DOM_MESSAGES) el.removeChild(el.lastChild);
 }
 
+function buildRowFromRecord(rec) {
+  const row = document.createElement('div');
+  const isMe = rec.senderId && myPeerId && rec.senderId === myPeerId;
+  row.className = 'row ' + (isMe ? 'me' : 'other');
+
+  const wrap  = document.createElement('div'); wrap.className = 'wrap';
+  const label = document.createElement('div'); label.className = 'name-label';
+  const who = rec.nickname || (rec.senderId ? shortId(rec.senderId) : 'room');
+  const when = new Date(rec.ts || nowMs()).toLocaleString();
+  label.textContent = `${who} • ${when}${rec.verified === false ? ' • ⚠︎ unverified' : ''}`;
+
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+
+  let fileMeta = null;
+  if (rec.kind === 'text') {
+    bubble.textContent = rec.text;
+  } else {
+    fileMeta = rec.meta;
+    bubble.dataset.hash = fileMeta.hash;
+    if (fileMeta.mime && fileMeta.mime.startsWith('image/')) {
+      bubble.textContent = 'Image pending…';
+    } else {
+      const p = document.createElement('div');
+      p.textContent = `${fileMeta.name || 'file'} (${fileMeta.size || '?'} bytes)`;
+      bubble.appendChild(p);
+    }
+  }
+
+  wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+  return { node: row, bubble: (rec.kind === 'file') ? bubble : null, meta: fileMeta };
+}
+
 function renderRecord(rec, { prepend=false } = {}) {
   if (rec.kind === 'text') {
     renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified }, { prepend });
@@ -1510,19 +1545,43 @@ async function loadOlderPage() {
 
   const el = ui.messages;
   const prevH = el.scrollHeight;
-  const page = await msgPageByRoom(VL.serverUrl, VL.roomId, { beforeTs: VL.oldestTs, limit: PAGE_SIZE });
+
+  const page = await msgPageByRoom(VL.serverUrl, VL.roomId, {
+    beforeTs: VL.oldestTs,
+    limit: PAGE_SIZE
+  });
+
   if (!page.length) {
     VL.hasMoreOlder = false;
     VL.loadingOlder = false;
     return;
   }
+
+  // Update window bounds (page is ascending)
   VL.oldestTs = Math.min(VL.oldestTs, page[0].ts);
 
-  // Prepend in ascending order so visual order stays correct
-  for (const rec of page) renderRecord(rec, { prepend: true });
-  // Keep viewport from jumping when we add at top
+  // Build once, insert once (keeps DOM order ascending)
+  const frag = document.createDocumentFragment();
+  const pendingFiles = [];
+
+  for (const rec of page) {
+    const built = buildRowFromRecord(rec);
+    frag.appendChild(built.node);
+    if (built.bubble) pendingFiles.push(built);
+  }
+
+  el.insertBefore(frag, el.firstChild);
+
+  // Preserve scroll position after prepending
   const newH = el.scrollHeight;
   el.scrollTop += (newH - prevH);
+
+  // Resolve any file bubbles
+  for (const { bubble, meta } of pendingFiles) {
+    renderFileIfAvailable(bubble, meta).then(ok => {
+      if (!ok) { showPendingBubble(bubble, meta); requestFile(VL.roomId, meta.hash); }
+    });
+  }
 
   pruneBottomIfNeeded();
   VL.loadingOlder = false;
@@ -1545,12 +1604,35 @@ async function initVirtualRoomView(serverUrl, roomId) {
   VL.loadingOlder = false;
 
   clearMessagesUI();
-  const first = await msgPageByRoom(serverUrl, roomId, { beforeTs: Number.MAX_SAFE_INTEGER, limit: PAGE_SIZE });
+
+  const first = await msgPageByRoom(serverUrl, roomId, {
+    beforeTs: Number.MAX_SAFE_INTEGER,
+    limit: PAGE_SIZE
+  });
+
   if (first.length) {
     VL.oldestTs = first[0].ts;
     VL.newestTs = first[first.length - 1].ts;
-    for (const rec of first) renderRecord(rec, { prepend: false });
+
+    const frag = document.createDocumentFragment();
+    const pendingFiles = [];
+
+    for (const rec of first) {
+      const built = buildRowFromRecord(rec);
+      frag.appendChild(built.node);
+      if (built.bubble) pendingFiles.push(built);
+    }
+
+    ui.messages.appendChild(frag);
+
+    // Fill any file bubbles after insertion
+    for (const { bubble, meta } of pendingFiles) {
+      renderFileIfAvailable(bubble, meta).then(ok => {
+        if (!ok) { showPendingBubble(bubble, meta); requestFile(roomId, meta.hash); }
+      });
+    }
   }
+
   attachVirtualScroll();
   requestAnimationFrame(scrollToEnd);
 }
@@ -1558,7 +1640,13 @@ async function initVirtualRoomView(serverUrl, roomId) {
 // Append a new live record at bottom (keep window size, autoscroll if near bottom)
 function appendLiveRecord(rec) {
   const autoscroll = nearBottom();
-  renderRecord(rec, { prepend: false });
+  const built = buildRowFromRecord(rec);
+  ui.messages.appendChild(built.node);
+  if (built.bubble) {
+    renderFileIfAvailable(built.bubble, built.meta).then(ok => {
+      if (!ok) { showPendingBubble(built.bubble, built.meta); requestFile(VL.roomId, built.meta.hash); }
+    });
+  }
   pruneTopIfNeeded();
   if (autoscroll) requestAnimationFrame(scrollToEnd);
 }
