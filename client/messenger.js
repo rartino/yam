@@ -1565,30 +1565,19 @@ async function loadOlderPage() {
   if (VL.loadingOlder || !VL.hasMoreOlder) return;
   VL.loadingOlder = true;
 
+  // capture current view generation; abort later if it changed
+  const gen = VL.viewGen;
+
   const el = ui.messages;
   const prevH = el.scrollHeight;
 
-  const key = roomKey(VL.serverUrl, VL.roomId);
-  const db  = await openMsgDB();
-
-  // Strictly BEFORE the current oldest (ts,id) via OPEN upper bound
-  const upperTs = VL.oldestKey ? VL.oldestKey.ts : Number.MAX_SAFE_INTEGER;
-  const upperId = VL.oldestKey ? VL.oldestKey.id : '\uffff';
-
-  const page = await new Promise((resolve, reject) => {
-    const out = [];
-    const tx  = db.transaction(MSG_STORE, 'readonly');
-    const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
-    const ub  = IDBKeyRange.upperBound([key, upperTs, upperId], /*open=*/true);
-    const req = idx.openCursor(ub, 'prev'); // walk older -> newer within "older than boundary"
-    req.onsuccess = e => {
-      const cur = e.target.result;
-      if (!cur || out.length >= PAGE_SIZE) return resolve(out.reverse()); // return ascending
-      out.push(cur.value);
-      cur.continue();
-    };
-    req.onerror = () => reject(req.error);
+  const page = await msgPageByRoom(VL.serverUrl, VL.roomId, {
+    beforeTs: VL.oldestTs,
+    limit: PAGE_SIZE
   });
+
+  // user switched rooms while we were fetching → no-op
+  if (gen !== VL.viewGen) { VL.loadingOlder = false; return; }
 
   if (!page.length) {
     VL.hasMoreOlder = false;
@@ -1596,17 +1585,18 @@ async function loadOlderPage() {
     return;
   }
 
-  // Update bounds using the earliest item we fetched
   VL.oldestTs  = Math.min(VL.oldestTs, page[0].ts);
   VL.oldestKey = { ts: page[0].ts, id: page[0].id };
   VL.hasMoreOlder = (page.length === PAGE_SIZE);
 
-  // Build once, insert once (ascending)
   const frag = document.createDocumentFragment();
   const pendingFiles = [];
 
   for (const rec of page) {
-    if (VL.seenIds.has(rec.id)) continue;   // guards against races/dup inserts
+    // extra safety: skip any cross-room stragglers
+    if ((rec.roomId && rec.roomId !== VL.roomId) ||
+        (rec.serverUrl && rec.serverUrl !== VL.serverUrl)) continue;
+    if (VL.seenIds.has(rec.id)) continue;
     VL.seenIds.add(rec.id);
 
     const built = buildRowFromRecord(rec);
@@ -1614,9 +1604,11 @@ async function loadOlderPage() {
     if (built.bubble) pendingFiles.push(built);
   }
 
+  // re-check before touching the DOM
+  if (gen !== VL.viewGen) { VL.loadingOlder = false; return; }
+
   el.insertBefore(frag, el.firstChild);
 
-  // Preserve viewport position
   const newH = el.scrollHeight;
   el.scrollTop += (newH - prevH);
 
@@ -1644,6 +1636,10 @@ function attachVirtualScroll() {
 }
 
 async function initVirtualRoomView(serverUrl, roomId) {
+  // bump gen and capture it locally
+  VL.viewGen = (VL.viewGen || 0) + 1;
+  const gen = VL.viewGen;
+
   VL.serverUrl = serverUrl;
   VL.roomId = roomId;
   VL.oldestTs = Number.MAX_SAFE_INTEGER;
@@ -1651,43 +1647,33 @@ async function initVirtualRoomView(serverUrl, roomId) {
   VL.hasMoreOlder = true;
   VL.loadingOlder = false;
 
-  // NEW: strict boundary + DOM dedupe
-  VL.oldestKey = null;       // { ts, id } of earliest row currently rendered
-  VL.seenIds   = new Set();  // avoid accidental double insertions
+  // strict boundary + DOM dedupe
+  VL.oldestKey = null;       // { ts, id }
+  VL.seenIds   = new Set();
 
   clearMessagesUI();
 
-  // Fetch newest PAGE_SIZE via byRoomTsId, then render ascending
-  const key = roomKey(serverUrl, roomId);
-  const db  = await openMsgDB();
-
-  const batch = await new Promise((resolve, reject) => {
-    const out = [];
-    const tx  = db.transaction(MSG_STORE, 'readonly');
-    const idx = tx.objectStore(MSG_STORE).index('byRoomTsId');
-    const range = IDBKeyRange.bound([key, 0, ''], [key, Number.MAX_SAFE_INTEGER, '\uffff']);
-    const req = idx.openCursor(range, 'prev'); // newest -> older
-    req.onsuccess = e => {
-      const cur = e.target.result;
-      if (!cur || out.length >= PAGE_SIZE) return resolve(out);
-      out.push(cur.value);
-      cur.continue();
-    };
-    req.onerror = () => reject(req.error);
+  const first = await msgPageByRoom(serverUrl, roomId, {
+    beforeTs: Number.MAX_SAFE_INTEGER,
+    limit: PAGE_SIZE
   });
 
-  if (batch.length) {
-    batch.reverse(); // display ascending
+  // If the user switched rooms while we were fetching, abort
+  if (gen !== VL.viewGen) return;
 
-    VL.oldestTs  = batch[0].ts;
-    VL.newestTs  = batch[batch.length - 1].ts;
-    VL.oldestKey = { ts: batch[0].ts, id: batch[0].id };
-    VL.hasMoreOlder = (batch.length === PAGE_SIZE);
+  if (first.length) {
+    VL.oldestTs  = first[0].ts;
+    VL.newestTs  = first[first.length - 1].ts;
+    VL.oldestKey = { ts: first[0].ts, id: first[0].id };
+    VL.hasMoreOlder = (first.length === PAGE_SIZE);
 
     const frag = document.createDocumentFragment();
     const pendingFiles = [];
 
-    for (const rec of batch) {
+    for (const rec of first) {
+      // extra safety: skip any cross-room stragglers
+      if ((rec.roomId && rec.roomId !== VL.roomId) ||
+          (rec.serverUrl && rec.serverUrl !== VL.serverUrl)) continue;
       if (VL.seenIds.has(rec.id)) continue;
       VL.seenIds.add(rec.id);
 
@@ -1696,9 +1682,10 @@ async function initVirtualRoomView(serverUrl, roomId) {
       if (built.bubble) pendingFiles.push(built);
     }
 
+    // re-check token just before DOM write
+    if (gen !== VL.viewGen) return;
     ui.messages.appendChild(frag);
 
-    // Resolve file bubbles after insertion
     for (const { bubble, meta } of pendingFiles) {
       renderFileIfAvailable(bubble, meta).then(ok => {
         if (!ok) { showPendingBubble(bubble, meta); requestFile(roomId, meta.hash); }
@@ -1708,7 +1695,7 @@ async function initVirtualRoomView(serverUrl, roomId) {
     VL.hasMoreOlder = false;
   }
 
-  attachVirtualScroll();     // keep this if you already had it
+  attachVirtualScroll();
   requestAnimationFrame(scrollToEnd);
 }
 
