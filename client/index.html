@@ -23,10 +23,10 @@
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <link rel="manifest" href="manifest.json" />
-  <link rel="stylesheet" href="yam.css" /> 
+  <link rel="stylesheet" href="yam.css" />
 </head>
 <body>
-  
+
   <!-- Settings dialog -->
   <dialog id="settingsModal">
     <button id="btnCloseSettings" class="dialog-close" aria-label="Close">×</button>
@@ -43,6 +43,28 @@
 	<div>
 	  <button type="button" id="btnSaveRoomCfg">Save</button>
 	</div>
+      </div>
+    </form>
+  </dialog>
+
+  <!-- Unlock dialog -->
+  <dialog id="unlockModal">
+    <form id="unlockForm" autocomplete="off" novalidate>
+      <h3 class="modal-title">App locked</h3>
+      <p class="muted help">
+	Enter your startup password to unlock encrypted room keys.
+      </p>
+
+      <div class="settings-stack">
+	<div class="field">
+	  <label for="unlockPass">Password</label>
+	  <input id="unlockPass" type="password" autocomplete="current-password" />
+	</div>
+	<div id="unlockError" class="muted errormessage"></div>
+      </div>
+
+      <div class="settings-actions settings-actions--end">
+	<button type="submit" id="btnUnlock">Unlock</button>
       </div>
     </form>
   </dialog>
@@ -69,6 +91,17 @@
 	    <input id="profName" placeholder="Your name" autocomplete="off" autocapitalize="words" />
 	  </div>
 
+	  <div class="field field--switch">
+	    <label class="ytog ytog--compact" for="profRequirePass">
+	      <span class="ytog__label">Require password on startup</span>
+	      <input id="profRequirePass" type="checkbox" class="ytog__input" />
+	      <span class="ytog__track" aria-hidden="true">
+		<span class="ytog__thumb"></span>
+	      </span>
+	    </label>
+	    <p class="ytog__help muted help">When enabled, your master key is unlocked with a password you enter each time (not stored).</p>
+	  </div>
+	  
 	  <div class="field">
 	    <label class="muted">Public device key</label>
 	    <textarea id="profPubKey" class="codearea no-resize" rows="3" readonly spellcheck="false"></textarea>
@@ -85,8 +118,8 @@
       </div>
     </form>
   </dialog>
-  
-  <!-- Create room dialog -->  
+
+  <!-- Create room dialog -->
   <dialog id="createRoomModal">
     <button id="btnCloseCreateRoom" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
@@ -107,7 +140,7 @@
       </div>
     </form>
   </dialog>
-  
+
   <!-- Invite (sender) -->
   <dialog id="inviteModal">
     <button id="btnCloseInvite" class="dialog-close" aria-label="Close">×</button>
@@ -160,7 +193,7 @@
       </div>
     </form>
   </dialog>
-  
+
   <div id="app">
     <header>
       <div class="hdr-left">

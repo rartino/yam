@@ -2,6 +2,10 @@ Object.freeze(crypto.subtle);
 Object.freeze(crypto);
 
 // ====== CONFIG ======
+const MASTER_PASS_LS_KEY = 'secmsg_master_pass_v1';
+const MASTER_PASS_SS_KEY = 'secmsg_master_pass_session_v1';
+const KEYCHECK_LS_KEY = 'secmsg_kcv_v1';
+const KEYCHECK_PLAINTEXT = new TextEncoder().encode('YAM-KCV-1');
 const ROOMS_KEY = 'secmsg_rooms_v1';
 const SECRET_DB = 'secmsg_secret_db';
 const SECRET_STORE = 'roomsecrets';
@@ -82,6 +86,7 @@ const prof = {
   avatarInput: document.getElementById('avatarInput'),
   btnAvatarUpload: document.getElementById('btnAvatarUpload'),
   btnAvatarClear: document.getElementById('btnAvatarClear'),
+  requirePass: document.getElementById('profRequirePass'),
 };
 
 // Invite (sender)
@@ -105,8 +110,17 @@ const join = {
   btnClose: document.getElementById('btnCloseJoin'),
 };
 
+// Unlock dialog refs
+const unlock = {
+  dlg: document.getElementById('unlockModal'),
+  form: document.getElementById('unlockForm'),
+  input: document.getElementById('unlockPass'),
+  btn: document.getElementById('btnUnlock'),
+  err: document.getElementById('unlockError'),
+};
+
 // ====== STATE ======
-let SETTINGS = { username: '', roomSkB64: '' };
+let SETTINGS = { username: '', requirePass: false, roomSkB64: '' };
 let MASTER_PASS = null;
 let MASTER_BASE_KEY = null; // PBKDF2 base CryptoKey (non-extractable)
 
@@ -145,6 +159,10 @@ function nowMs() { return Date.now(); }
 function sevenDaysAgoMs() { return nowMs() - 7 * 24 * 60 * 60 * 1000; }
 function setStatus(text) { ui.status.textContent = text; }
 function shortId(idB64u) { return idB64u.slice(0, 6) + '…' + idB64u.slice(-6); }
+function randomB64u(n = 32) {
+  const a = new Uint8Array(n); crypto.getRandomValues(a);
+  return b64u(a); // you already have b64u(..) in your codebase
+}
 
 const _subtle = crypto.subtle;
 const subtleImportKey = _subtle.importKey.bind(_subtle);
@@ -154,19 +172,106 @@ const subtleDecrypt   = _subtle.decrypt.bind(_subtle);
 
 const te = new TextEncoder();
 
-// Ask user once per session; discard the string immediately after import.
+async function setKeyCheckMarker() {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv   = crypto.getRandomValues(new Uint8Array(12));
+  const key  = await deriveAesKey(salt, ['encrypt']);
+  const ct   = new Uint8Array(await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, KEYCHECK_PLAINTEXT));
+  const payload = { salt: b64u(salt), iv: b64u(iv), ct: b64u(ct) };
+  localStorage.setItem(KEYCHECK_LS_KEY, JSON.stringify(payload));
+}
+
+async function verifyKeyCheck() {
+  const raw = localStorage.getItem(KEYCHECK_LS_KEY);
+  if (!raw) {
+    // First run under this scheme: create marker now for future checks
+    await setKeyCheckMarker();
+    return true;
+  }
+  try {
+    const sealed = JSON.parse(raw);
+    const salt = fromB64u(sealed.salt);
+    const iv   = fromB64u(sealed.iv);
+    const ct   = fromB64u(sealed.ct);
+    const key  = await deriveAesKey(salt, ['decrypt']);
+    const pt   = new Uint8Array(await crypto.subtle.decrypt({ name: 'AES-GCM', iv }, key, ct));
+    if (pt.length !== KEYCHECK_PLAINTEXT.length) return false;
+    for (let i = 0; i < pt.length; i++) if (pt[i] !== KEYCHECK_PLAINTEXT[i]) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function getStartupPassString() {
+  if (SETTINGS.requirePass) {
+    const pass = sessionStorage.getItem(MASTER_PASS_SS_KEY);
+    if (!pass) throw new Error('locked');  // UI will handle unlocking
+    return pass;
+  } else {
+    let pass = localStorage.getItem(MASTER_PASS_LS_KEY);
+    if (!pass) {
+      pass = randomB64u(32);
+      localStorage.setItem(MASTER_PASS_LS_KEY, pass);
+    }
+    return pass;
+  }
+}
+
 async function ensureMasterBaseKey() {
   if (MASTER_BASE_KEY) return MASTER_BASE_KEY;
-  const pass = (await Promise.resolve(prompt('Enter passphrase to unlock rooms'))) || '';
-  MASTER_BASE_KEY = await subtleImportKey(
+  const pass = getStartupPassString();
+  MASTER_BASE_KEY = await crypto.subtle.importKey(
     'raw',
     te.encode(pass),
     { name: 'PBKDF2' },
     /* extractable */ false,
     ['deriveKey']
   );
-  // best-effort scrub (strings aren't reliably zeroable, but we avoid keeping it)
   return MASTER_BASE_KEY;
+}
+
+function getOrCreateMasterPass() {
+  let pass = localStorage.getItem(MASTER_PASS_LS_KEY);
+  if (!pass) {
+    pass = randomB64u(32);
+    localStorage.setItem(MASTER_PASS_LS_KEY, pass);
+  }
+  return pass;
+}
+
+// Re-key all sealed room secrets to a NEW password.
+// persist = true  -> store pass in localStorage (OFF mode; auto-unlock)
+// persist = false -> store pass in sessionStorage only (ON mode; prompt each run)
+async function rotateMasterPassTo(newPass, { persist }) {
+  // 1) Collect plaintext secrets with CURRENT base key
+  const secrets = [];
+  for (const r of rooms) {
+    const sealed = await secretGet(r.id);
+    if (!sealed) continue;
+    const skB64 = await openSecret(sealed); // uses current MASTER_BASE_KEY
+    secrets.push({ id: r.id, skB64 });
+  }
+
+  // 2) Swap storage & derive new base key
+  if (persist) {
+    localStorage.setItem(MASTER_PASS_LS_KEY, newPass);
+    sessionStorage.removeItem(MASTER_PASS_SS_KEY);
+  } else {
+    sessionStorage.setItem(MASTER_PASS_SS_KEY, newPass);
+    localStorage.removeItem(MASTER_PASS_LS_KEY);
+  }
+  MASTER_BASE_KEY = await crypto.subtle.importKey(
+    'raw', te.encode(newPass), { name:'PBKDF2' }, false, ['deriveKey']
+  );
+
+  // 3) Re-seal with the new base key
+  for (const s of secrets) {
+    const sealed2 = await sealSecret(s.skB64); // uses NEW MASTER_BASE_KEY under the hood
+    await secretPut(s.id, sealed2);
+  }
+
+  await setKeyCheckMarker();    
 }
 
 // Derive a per-room AES-GCM key (non-extractable) from the base key + salt
@@ -1923,21 +2028,49 @@ async function refreshAvatarPreview() {
 async function openProfile() {
   await ensureIdentity();
   prof.name.value = (SETTINGS.username || '').trim();
-
-  // Use myPeerId if set, otherwise derive from myIdPk
-  const pub = myPeerId || (myIdPk ? b64u(myIdPk) : '');
-  prof.pubKey.value = pub;
-
+  prof.pubKey.value = myPeerId || (myIdPk ? b64u(myIdPk) : '');
+  prof.requirePass.checked = !!SETTINGS.requirePass;   // <-- add this
   await refreshAvatarPreview();
   prof.dlg.showModal();
 }
 
 function closeProfile() { prof.dlg.close(); }
 
-function saveProfile() {
+async function saveProfile() {
   SETTINGS.username = (prof.name.value || '').trim();
-  saveSettings();
-  closeProfile();
+
+  const prev = !!SETTINGS.requirePass;
+  const next = !!prof.requirePass.checked;
+
+  try {
+    if (!prev && next) {
+      // Turning ON: ask the user to set a password and ROTATE to it (not persisted)
+      let pass = '';
+      for (let tries = 0; tries < 3 && (!pass || pass.length < 6); tries++) {
+        pass = prompt('Set a startup password (min 6 chars)');
+        if (pass === null) break;
+        pass = (pass || '').trim();
+      }
+      if (!pass || pass.length < 6) { alert('Password not set; leaving setting OFF.'); prof.requirePass.checked = false; return; }
+
+      await rotateMasterPassTo(pass, { persist: false }); // session-only
+      SETTINGS.requirePass = true;
+      saveSettings();
+      alert('Startup password enabled.');
+    } else if (prev && !next) {
+      // Turning OFF: persist the current pass so we can auto-unlock next run (no rotation needed)
+      const sessionPass = sessionStorage.getItem(MASTER_PASS_SS_KEY);
+      if (sessionPass) localStorage.setItem(MASTER_PASS_LS_KEY, sessionPass);
+      SETTINGS.requirePass = false;
+      saveSettings();
+      alert('Startup password disabled (auto-unlock enabled).');
+    } else {
+      // No change to the toggle; just save the other fields
+      saveSettings();
+    }
+  } finally {
+    closeProfile();
+  }
 }
 
 async function handleAvatarPicked(file) {
@@ -1960,6 +2093,70 @@ async function regenerateIdentity() {
   persistIdentity();                 // sets myPeerId too
   prof.pubKey.value = myPeerId;
   announceIdentityToServers();       // optional: re-announce to authed rooms
+}
+
+async function continueBootAfterUnlock() {
+  // Everything you normally do after settings are loaded + (optionally) identity ensured
+  await ensureIdentity();
+  loadRooms();
+  if (rooms.length) {
+    ensureAllServerConnections?.();   // if using multi-room version
+    await openRoom?.(currentRoomId);  // if present in your codebase
+  } else {
+    setStatus('✔️'); // idle state
+    const el = document.getElementById('currentRoomName');
+    if (el) el.textContent = 'No room';
+  }
+}
+
+// Show lock dialog and resolve only when correct password is provided
+function showLockDialog() {
+  unlock.err.textContent = '';
+  unlock.input.value = '';
+  unlock.dlg.showModal();
+
+  // Don't allow ESC to close while locked
+  const preventCancel = (e) => e.preventDefault();
+  unlock.dlg.addEventListener('cancel', preventCancel);
+
+  const onSubmit = async (e) => {
+    e.preventDefault(); // <-- critical; stops the form from closing the dialog
+
+    const pass = (unlock.input.value || '').trim();
+    if (!pass) {
+      unlock.err.textContent = 'Enter a password';
+      unlock.input.focus();
+      return;
+    }
+
+    try {
+      // Try this password
+      sessionStorage.setItem(MASTER_PASS_SS_KEY, pass);
+      MASTER_BASE_KEY = null;                // force re-derive with this pass
+      await ensureMasterBaseKey();           // derives PBKDF2 base key
+      const ok = await verifyKeyCheck();     // decrypt key-check marker
+      if (!ok) throw new Error('bad-pass');
+
+      // Success → proceed
+      unlock.err.textContent = '';
+      unlock.dlg.removeEventListener('cancel', preventCancel);
+      unlock.dlg.close();
+      await continueBootAfterUnlock();
+    } catch {
+      // Wrong password → keep dialog open
+      sessionStorage.removeItem(MASTER_PASS_SS_KEY);
+      MASTER_BASE_KEY = null;
+      unlock.err.textContent = 'Incorrect password. Try again.';
+      unlock.input.select();
+      unlock.input.focus();
+    }
+  };
+
+  // Set (or replace) the handler — no `{ once:true }`
+  unlock.form.onsubmit = onSubmit;
+
+  // Focus the input every time we open
+  setTimeout(() => unlock.input?.focus(), 0);
 }
 
 // ====== Events ======
@@ -2042,16 +2239,25 @@ prof.btnAvatarUpload.addEventListener('click', () => prof.avatarInput.click());
 prof.avatarInput.addEventListener('change', (e) => handleAvatarPicked(e.target.files && e.target.files[0]));
     prof.btnAvatarClear.addEventListener('click', clearAvatar);
 
+unlock.dlg.addEventListener('close', () => {
+  if (SETTINGS.requirePass && !sessionStorage.getItem(MASTER_PASS_SS_KEY)) {
+    // Re-open on next tick if still locked
+    setTimeout(() => unlock.dlg.showModal(), 0);
+  }
+});
+
 // ====== Boot ======
 loadSettings();
-await ensureIdentity();
-loadRooms();
-if (rooms.length) {
-  // connect to all servers & subscribe to all rooms
-  ensureAllServerConnections();
-  // open current room in the UI
-  await openRoom(currentRoomId);
+
+if (SETTINGS.requirePass) {
+  // Block boot here until unlocked
+  showLockDialog();
 } else {
-  setStatus(statuses.passive);
-  ui.currentRoomName.textContent = 'No room';
+  // Auto-unlock mode; derive base key immediately and create marker if missing
+  try {
+    await ensureMasterBaseKey();
+    await verifyKeyCheck(); // creates marker on first run
+  } catch {} // non-fatal in auto mode
+
+  await continueBootAfterUnlock();
 }
