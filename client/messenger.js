@@ -45,6 +45,7 @@ const ui = {
   settingsMenu: document.getElementById('settingsMenu'),
   menuProfile: document.getElementById('menuProfile'),
   menuRoomOpts: document.getElementById('menuRoomOpts'),
+  menuInvite: document.getElementById('menuInvite'),
 };
 
 // Gear -> configure room
@@ -54,7 +55,6 @@ const cfg = {
   btnSave: document.getElementById('btnSaveRoomCfg'),
   btnRemove: document.getElementById('btnRemoveRoom'),
   btnClose: document.getElementById('btnCloseSettings'),
-  btnInvite: document.getElementById('btnInvite'),
 };
 
 const prof = {
@@ -70,7 +70,7 @@ const prof = {
   btnAvatarUpload: document.getElementById('btnAvatarUpload'),
   btnAvatarClear: document.getElementById('btnAvatarClear'),
 };
-    
+
 // Invite (sender)
 const inv = {
   dlg: document.getElementById('inviteModal'),
@@ -111,7 +111,7 @@ let currentRoomId = null;  // string id = roomId (ed25519 pk b64u)
 const servers = new Map();
 
 let profileDbPromise = null;
-    
+
 // WebRTC maps
 // request_id -> { serverUrl, roomId, pc, dc, hash, remotePeerId?, iceBuf?, incomingIceBuf?, haveAnswer? }
 const pendingRequests = new Map();
@@ -189,7 +189,7 @@ async function profileDel(key) {
     req.onerror = () => reject(req.error);
   });
 }
-    
+
 async function ensureSodium() { await sodium.ready; }
 function normServer(url){
   if (!url) return '';
@@ -635,7 +635,7 @@ async function renderFileIfAvailable(bubbleEl, meta) {
     link.addEventListener('click', () => setTimeout(() => URL.revokeObjectURL(url), 0), { once: true });
     bubbleEl.appendChild(link);
   }
-    
+
   return true;
 }
 
@@ -746,7 +746,7 @@ async function handleIncoming(serverUrl, m, fromHistory=false) {
       // render to UI only if this is the visible room
       if (roomId === currentRoomId) {
         const bubble = fileBubbleSkeleton({ meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
-	  renderFileIfAvailable(bubble, obj).then(hasIt => { if (!hasIt) { showPendingBubble(bubble, obj); requestFile(roomId, obj.hash); } else { scrollToEnd(); } });
+          renderFileIfAvailable(bubble, obj).then(hasIt => { if (!hasIt) { showPendingBubble(bubble, obj); requestFile(roomId, obj.hash); } else { scrollToEnd(); } });
       }
       return;
     }
@@ -860,7 +860,7 @@ async function serveFileIfWeHaveIt(serverUrl, msg) {
     const dc = evt.channel;
     dc.binaryType = 'arraybuffer';
     dc.onopen = async () => {
-	  
+
       if (DEBUG_RTC) dbg('RTC/RESP', 'dc open', { request_id });
       dc.bufferedAmountLowThreshold = Math.max(16384, CHUNK_SIZE >> 2);
 
@@ -1057,14 +1057,14 @@ async function finishInviteDialog(){
       dbg('RTC/INV', 'dc open -> send room');
       const room = getCurrentRoom();
       const payload = {
-	ver:1, kind:'room-invite',
-	room: {
-	  id: room.id,
-	  name: room.name,
-	  server: normServer(room.server),
-	  roomSkB64: room.roomSkB64,
-	  createdAt: nowMs()
-	}
+        ver:1, kind:'room-invite',
+        room: {
+          id: room.id,
+          name: room.name,
+          server: normServer(room.server),
+          roomSkB64: room.roomSkB64,
+          createdAt: nowMs()
+        }
       };
       inviteDC.send(JSON.stringify(payload));
     };
@@ -1072,11 +1072,11 @@ async function finishInviteDialog(){
     let acked = false;
     inviteDC.onmessage = (evt) => {
       try {
-	const o = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data));
-	if (o && o.kind === 'invite-ack') { acked = true; inv.dlg.close(); try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{} }
+        const o = JSON.parse(typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data));
+        if (o && o.kind === 'invite-ack') { acked = true; inv.dlg.close(); try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{} }
       } catch {}
     };
-      
+
     // Send now if already open, otherwise on open
     if (inviteDC.readyState === 'open') {
       await sendRoom();
@@ -1087,9 +1087,9 @@ async function finishInviteDialog(){
     // Fallback close if no ACK within 5s
     setTimeout(() => {
       if (!acked) {
-	dbg('RTC/INV', 'no ack timeout; closing');
-	try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{}
-	inv.dlg.close();
+        dbg('RTC/INV', 'no ack timeout; closing');
+        try{ inviteDC.close(); }catch{} try{ invitePC.close(); }catch{}
+        inv.dlg.close();
       }
     }, 5000);
 
@@ -1150,7 +1150,7 @@ function connect(sc) {
     if (sc.heartbeatTimer) { clearInterval(sc.heartbeatTimer); sc.heartbeatTimer = null; }
     sc.authed.clear();
     const r = getCurrentRoom();
-    if (r && normServer(r.server) === sc.url) setStatus('Disconnected');
+    if (r && normServer(r.server) === sc.url) setStatus('❌');
     scheduleReconnect(sc);
   };
 
@@ -1189,23 +1189,23 @@ function connect(sc) {
       sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since }));
 
       if (room.id === currentRoomId) {
-	await ensureSodium();
-	setCryptoForRoom(room);
+        await ensureSodium();
+        setCryptoForRoom(room);
         await initVirtualRoomView(sc.url, room.id);
-	setStatus('Connected');
+        setStatus('✅');
       }
 
     } else if (m.type === 'history') {
       for (const item of (m.messages || [])) {
-	await handleIncoming(sc.url, item, true);
+        await handleIncoming(sc.url, item, true);
       }
       if (m.room_id === currentRoomId) {
-	if (!ui.messages.firstChild || !VL?.oldestKey) {
-	  await initVirtualRoomView(sc.url, m.room_id);
-	  setStatus('Connected');
-	} else if (ui.status && ui.status.textContent !== 'Connected') {
-	  setStatus('Connected');
-	}
+        if (!ui.messages.firstChild || !VL?.oldestKey) {
+          await initVirtualRoomView(sc.url, m.room_id);
+          setStatus('✅');
+        } else if (ui.status && ui.status.textContent !== 'Connected') {
+          setStatus('✅');
+        }
       }
 
     } else if (m.type === 'message') {
@@ -1236,7 +1236,7 @@ function connect(sc) {
 function scheduleReconnect(sc) {
   const base = Math.min(30000, 1000 * Math.pow(2, sc.reconnectAttempt));
   const jitter = Math.floor(Math.random() * 500);
-  const delay = base + jitter;  
+  const delay = base + jitter;
   sc.reconnectAttempt++;
   if (DEBUG_SIG) dbg('SIG/WS', 'reconnect in', delay, 'ms', sc.url);
   if (sc.reconnectTimer) clearTimeout(sc.reconnectTimer);
@@ -1356,7 +1356,7 @@ cfg.btnRemove.addEventListener('click', async () => {
   } else {
     // No rooms left; disconnect and prompt create
     clearMessagesUI();
-    setStatus('No room');
+    setStatus('✔️');
     document.getElementById('currentRoomName').textContent = 'No room';
     openCreateRoomDialog();
   }
@@ -1382,7 +1382,7 @@ async function openRoom(roomId){
   if (!room) return;
   await ensureSodium();
   setCryptoForRoom(room);
-  setStatus('Connecting…');
+  setStatus('☑️');
 
   const sc = ensureServerConnection(room.server); // your existing helper
 
@@ -1390,15 +1390,15 @@ async function openRoom(roomId){
     if (!sc.subscribed.has(room.id)) {
       sc.subscribed.add(room.id);
       sc.ws.send(JSON.stringify({ type: 'subscribe', room_id: room.id }));
-      setStatus('Connecting…');
+      setStatus('☑️');
     } else if (sc.authed.has(room.id)) {
       await initVirtualRoomView(sc.url, room.id);
-      setStatus('Connected');
+      setStatus('✅');
     } else {
-      setStatus('Connecting…');
+      setStatus('☑️');
     }
   } else {
-    setStatus('Connecting…');
+    setStatus('☑️');
   }
 }
 
@@ -1428,46 +1428,46 @@ async function generateJoinAnswer(){
     dc.onopen = () => dbg('RTC/JOIN', 'dc open');
     dc.onmessage = async (evt) => {
       try {
-	// Handle both string and binary frames
-	const text = (typeof evt.data === 'string')
-	  ? evt.data
-	  : new TextDecoder().decode(evt.data);
-	const obj = JSON.parse(text);
+        // Handle both string and binary frames
+        const text = (typeof evt.data === 'string')
+          ? evt.data
+          : new TextDecoder().decode(evt.data);
+        const obj = JSON.parse(text);
 
-	if (obj && obj.kind === 'room-invite' && obj.room) {
-	  const r = obj.room;
+        if (obj && obj.kind === 'room-invite' && obj.room) {
+          const r = obj.room;
 
-	  // Validate: derived id must match provided id
-	  await ensureSodium();
-	  const sk = fromB64u(r.roomSkB64);
-	  const pk = derivePubFromSk(sk);
-	  const derived = b64u(pk);
-	  if (derived !== r.id) { alert('Invalid room code received'); return; }
+          // Validate: derived id must match provided id
+          await ensureSodium();
+          const sk = fromB64u(r.roomSkB64);
+          const pk = derivePubFromSk(sk);
+          const derived = b64u(pk);
+          if (derived !== r.id) { alert('Invalid room code received'); return; }
 
-	  // Add room if not present
-	  if (!rooms.find(x => x.id === r.id)) {
-	    rooms.push({
-	      id: r.id,
-	      name: r.name || 'New room',
-	      server: normServer(r.server),
-	      roomSkB64: r.roomSkB64,
-	      roomId: r.id,
-	      createdAt: r.createdAt || nowMs()
-	    });
-	    saveRooms();
-	    ensureServerConnection(r.server);
-	    await registerRoomIfNeeded(r);
-	    await openRoom(r.id);
-	  }
+          // Add room if not present
+          if (!rooms.find(x => x.id === r.id)) {
+            rooms.push({
+              id: r.id,
+              name: r.name || 'New room',
+              server: normServer(r.server),
+              roomSkB64: r.roomSkB64,
+              roomId: r.id,
+              createdAt: r.createdAt || nowMs()
+            });
+            saveRooms();
+            ensureServerConnection(r.server);
+            await registerRoomIfNeeded(r);
+            await openRoom(r.id);
+          }
 
-	  // NEW: acknowledge so inviter knows it landed
-	  try { dc.send(JSON.stringify({ kind: 'invite-ack' })); } catch {}
+          // NEW: acknowledge so inviter knows it landed
+          try { dc.send(JSON.stringify({ kind: 'invite-ack' })); } catch {}
 
-	  join.dlg.close();
-	  setTimeout(() => { try { dc.close(); } catch{} try { pc.close(); } catch{} }, 300);
-	}
+          join.dlg.close();
+          setTimeout(() => { try { dc.close(); } catch{} try { pc.close(); } catch{} }, 300);
+        }
       } catch (e) {
-	dbg('RTC/JOIN', 'message parse error', e);
+        dbg('RTC/JOIN', 'message parse error', e);
       }
     };
   };
@@ -1821,7 +1821,6 @@ ui.fileInput?.addEventListener('change', async (e) => {
   ui.fileInput.value = '';
 });
 
-cfg.btnInvite?.addEventListener('click', openInviteDialog);
 inv.btnClose?.addEventListener('click', () => inv.dlg.close());
 inv.btnCopyOffer?.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(inv.offerTA.value); inv.btnCopyOffer.textContent='Copied'; setTimeout(()=>inv.btnCopyOffer.textContent='Copy',1000);} catch {}
@@ -1848,7 +1847,14 @@ ui.menuRoomOpts.addEventListener('click', () => {
   cfg.name.value = r.name || '';
   cfg.dlg.showModal();
 });
-    
+
+ui.menuInvite.addEventListener('click', () => {
+  toggleSettingsMenu(false);
+  const r = getCurrentRoom();
+  if (!r) { openCreateRoomDialog(); return; }
+  openInviteDialog();
+});
+
 // Profile dialog
 prof.btnClose.addEventListener('click', closeProfile);
 prof.btnSave.addEventListener('click', saveProfile);
@@ -1860,7 +1866,7 @@ prof.btnRegen.addEventListener('click', regenerateIdentity);
 prof.btnAvatarUpload.addEventListener('click', () => prof.avatarInput.click());
 prof.avatarInput.addEventListener('change', (e) => handleAvatarPicked(e.target.files && e.target.files[0]));
     prof.btnAvatarClear.addEventListener('click', clearAvatar);
-    
+
 // ====== Boot ======
 loadSettings();
 await ensureIdentity();
@@ -1871,6 +1877,6 @@ if (rooms.length) {
   // open current room in the UI
   await openRoom(currentRoomId);
 } else {
-  setStatus('No room');
+  setStatus('✔️');
   ui.currentRoomName.textContent = 'No room';
 }

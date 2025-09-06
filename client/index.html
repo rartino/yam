@@ -19,7 +19,9 @@
     .hdr-left{ display:flex; flex-direction:column; }
     .icon-btn{ background:transparent; border:0; padding:8px; border-radius:10px; color:#ccc; }
     .icon-btn:active{ transform:scale(0.98); }
-    header h1 { margin:0; font-size:16px; }
+    header h1 { margin:0; font-size:16px; display:flex; align-items:center; gap:8px; }
+    .app-logo { width:18px; height:18px; display:block; margin-left: 8px; }
+
     #diagnostics { color: var(--muted); margin-left: 6px; font-weight: 400; }
     
     main{
@@ -63,11 +65,49 @@
     .settings-stack{ display:flex; flex-direction:column; gap:14px; }
     .field label{ display:block; font-size:12px; color:#bbb; margin:0 0 6px; }
     .field input{ width:100%; padding:12px; border-radius:12px; border:1px solid #333; background:#151515; color:#eaeaea; }
-    .row-buttons{ display:grid; grid-template-columns:1fr 1fr; gap:8px; margin-top:8px; }
-    .row-buttons button, .settings-actions button{
-      padding:12px; border-radius:12px; border:1px solid #333; background:#1a1a1a; color:#eaeaea;
+
+    .row-buttons button,
+    .settings-actions button,
+    .avatar-actions button,
+    .profile-actions button{
+      padding:12px; border-radius:12px; border:1px solid #333;
+      background:#1a1a1a; color:#eaeaea; cursor:pointer;
     }
-    .row-buttons button:active, .settings-actions button:active{ transform:scale(0.98); }
+    .row-buttons button:active,
+    .settings-actions button:active,
+    .avatar-actions button:active,
+    .profile-actions button:active{ transform:scale(0.98); }
+
+    /* Make button groups responsive: stack on small screens, split on wider */
+    .avatar-actions,
+    .row-buttons,
+    .profile-actions{
+      display:grid;
+      grid-template-columns: 1fr;
+      gap:8px;
+    }
+    @media (min-width: 420px){
+      .avatar-actions,
+      .row-buttons,
+      .profile-actions{
+	grid-template-columns: 1fr 1fr;
+      }
+    }
+
+    /* If a group has only one button (e.g., just "Save"), keep it full width */
+    .profile-actions:has(> :only-child){ grid-template-columns: 1fr; }
+
+    /* Inputs match the rest */
+    .profile-fields .field input,
+    .profile-fields .field textarea{
+      width:100%;
+      padding:12px;
+      border-radius:12px;
+      border:1px solid #333;
+      background:#151515;
+      color:#eaeaea;
+    }
+
     .help{ margin:6px 0 0; }
     .settings-actions{ display:flex; justify-content:flex-end; gap:10px; margin-top:12px; }
 
@@ -106,15 +146,39 @@
     }
     .settings-item{ padding:8px 10px; border-radius:10px; cursor:pointer; display:flex; justify-content:space-between; gap:8px; }
     .settings-item:hover{ background:#1a1a1a; }
+    
+    .menu-head{ display:flex; gap:10px; align-items:center; padding:8px 10px 6px; }
+    .menu-logo{ width:28px; height:28px; display:block; }
+    .brand-line{ display:flex; align-items:baseline; gap:6px; }
+    .brand-name{ font-weight:600; }
+    .version{ color:#999; font-weight:400; }
+    .tagline{ font-size:11px; color:#aaa; }
+    .menu-sep{ border:0; border-top:1px solid #222; margin:6px 0; }
 
-    /* Profile dialog */
-    .profile-grid{ display:grid; grid-template-columns: 88px 1fr; gap:14px; align-items: start; }
-    .avatar-col{ display:flex; flex-direction:column; gap:8px; align-items:center; }
+    /* Profile dialog: make it single-column, mobile-first */
+    .profile-grid{
+      display:flex;
+      flex-direction:column;
+      gap:14px;
+    }
+
+    /* Keep avatar centered on top */
+    .avatar-col{
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+      align-items:center;
+    }
+
+    /* Avatar preview stays circular and contained */
     .avatar-preview{
-      width:84px; height:84px; border-radius:50%; overflow:hidden; background:#222;
-      display:flex; align-items:center; justify-content:center; color:#777; font-size:12px;
+      width:84px; height:84px;
+      border-radius:50%; overflow:hidden;
+      background:#222; color:#777; font-size:12px;
+      display:flex; align-items:center; justify-content:center;
     }
     .avatar-preview img{ width:100%; height:100%; object-fit:cover; display:block; }
+
     .avatar-actions{ display:flex; gap:8px; }
     .profile-fields{ display:flex; flex-direction:column; gap:14px; }
     .profile-fields .field input,
@@ -142,7 +206,6 @@
 	<button type="button" id="btnRemoveRoom" style="border-color:#7a1a1a;background:#2a0e0e;color:#ffb3b3">Remove room</button>
 	<div>
 	  <button type="button" id="btnSaveRoomCfg">Save</button>
-	  <button type="button" id="btnInvite">Invite</button>
 	</div>
       </div>
     </form>
@@ -265,7 +328,7 @@
   <div id="app">
     <header>
       <div class="hdr-left">
-        <h1>Yam<span id="diagnostics"><span id="appVersion" class="version"></span>&nbsp; [<span id="status">Not connected</span>]</span></h1>
+        <h1><img src="logo.svg" alt="" class="app-logo">Yam<span id="status">❌</span></span></h1>
       </div>
       <div class="hdr-center">
 	<button id="btnRoomMenu" class="room-button" aria-haspopup="true" aria-expanded="false">
@@ -284,8 +347,20 @@
 	  </svg>
 	</button>
 	<div id="settingsMenu" class="settings-menu" hidden>
-	  <div id="menuProfile" class="settings-item">Profile</div>
+	  <div class="menu-head">
+	    <img src="logo.svg" alt="Yam" class="menu-logo" />
+	    <div class="brand">
+	      <div class="brand-line">
+		<span class="brand-name">Yam</span>
+		<span id="menuVersion" class="version"></span>
+	      </div>
+	      <div class="tagline">Yet Another Messenger</div>
+	    </div>
+	  </div>
+	  <hr class="menu-sep" />
+	  <div id="menuProfile"  class="settings-item">Profile</div>
 	  <div id="menuRoomOpts" class="settings-item">Room options</div>
+	  <div id="menuInvite"   class="settings-item">Invite to room</div>
 	</div>
       </div>
     </header>
@@ -314,8 +389,8 @@
       .then(r => r.json())
       .then(manifest => {
         window.APP_VERSION = manifest.version;
-        const vEl = document.getElementById('appVersion');
-        if (vEl) vEl.textContent = `v${window.APP_VERSION}`;
+	const mv = document.getElementById('menuVersion');
+	if (mv) mv.textContent = `v${window.APP_VERSION}`;
         const script = document.createElement('script');
         script.type = 'module';
         script.src = `./messenger.js?v=${window.APP_VERSION}`;

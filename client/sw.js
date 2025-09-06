@@ -15,6 +15,7 @@ fetch('./manifest.json')
       './offline.html',
       './android-chrome-192x192.png',
       './android-chrome-512x512.png',
+      './logo.svg',
       './vendor/sodium/sodium.js'
     ];
 
@@ -41,13 +42,13 @@ fetch('./manifest.json')
 
       event.respondWith(
         caches.match(req).then(cached => {
-	  const fetchPromise = fetch(req).then(networkRes => {
-	    if (networkRes && networkRes.ok) {
-	      const resClone = networkRes.clone();
-	      caches.open(CACHE_NAME).then(cache => cache.put(req, resClone));
-	    }
-	    return networkRes;
-	  }).catch(() => cached);
+          const fetchPromise = fetch(req).then(networkRes => {
+            if (networkRes && networkRes.ok) {
+              const resClone = networkRes.clone();
+              caches.open(CACHE_NAME).then(cache => cache.put(req, resClone));
+            }
+            return networkRes;
+          }).catch(() => cached);
         })
       );
     });
