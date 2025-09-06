@@ -459,6 +459,9 @@ def ws_handler(ws):
             pass
 
 # ---------- utils ----------
+def now_ms() -> int:
+    return int(time.time() * 1000)
+
 def _b64u(b: bytes) -> str:
     import base64
     return base64.urlsafe_b64encode(b).decode('utf-8').rstrip('=')
