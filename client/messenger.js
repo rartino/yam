@@ -715,9 +715,9 @@ async function sendFileMetadata(room, meta) {
   sc.ws.send(JSON.stringify(payload));
 }
 
-async function handleIncoming(serverUrl, m, fromHistory = false) {
+async function handleIncoming(serverUrl, m, fromHistory=false) {
   const pt = decryptToString(m.ciphertext);
-  const roomId = m.room_id || currentRoomId;
+  const roomId = m.room_id || currentRoomId; // server includes this for history/live
   const rKey = roomKey(serverUrl, roomId);
   const id = `${rKey}|${await sha256_b64u_string(m.ciphertext)}`;
 
@@ -733,33 +733,42 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
 
   const tsVal = m.ts || nowMs();
 
-  // File or text?
   try {
     const obj = JSON.parse(pt);
     if (obj && obj.kind === 'file' && obj.hash) {
-      await msgPut({ id, roomKey: rKey, roomId, serverUrl,
-        ts: tsVal, nickname: m.nickname, senderId: m.sender_id,
-        verified, kind: 'file', meta: obj });
+      // persist
+      await msgPut({
+        id, roomKey: rKey, roomId, serverUrl,
+        ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
+        verified, kind: 'file', meta: obj
+      });
 
-      if (!fromHistory && roomId === currentRoomId) {
-        // live append
-        appendLiveRecord({ id, roomKey: rKey, roomId, serverUrl,
-          ts: tsVal, nickname: m.nickname, senderId: m.sender_id,
-          verified, kind: 'file', meta: obj });
+      // render to UI only if this is the visible room
+      if (roomId === currentRoomId) {
+        const bubble = fileBubbleSkeleton({ meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
+	  renderFileIfAvailable(bubble, obj).then(hasIt => { if (!hasIt) { showPendingBubble(bubble, obj); requestFile(roomId, obj.hash); } else { scrollToEnd(); } });
       }
       return;
     }
-  } catch (_) {}
+  } catch (_) { /* not JSON */ }
 
-  // Text
-  await msgPut({ id, roomKey: rKey, roomId, serverUrl,
-    ts: tsVal, nickname: m.nickname, senderId: m.sender_id,
-    verified, kind: 'text', text: pt });
-
-  if (!fromHistory && roomId === currentRoomId) {
-    appendLiveRecord({ id, roomKey: rKey, roomId, serverUrl,
-      ts: tsVal, nickname: m.nickname, senderId: m.sender_id,
-      verified, kind: 'text', text: pt });
+  // plain text
+  await msgPut({
+    id, roomKey: rKey, roomId, serverUrl,
+    ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
+    verified, kind: 'text', text: pt
+  });
+  if (roomId === currentRoomId && !fromHistory) {
+    const rec = (/* determine kind */ (() => {
+      try {
+        const obj = JSON.parse(pt);
+        if (obj && obj.kind === 'file' && obj.hash) {
+          return { kind: 'file', ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id, verified, meta: obj };
+       }
+      } catch {}
+      return { kind: 'text', ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id, verified, text: pt };
+    })());
+    appendLiveRecord(rec);
   }
 }
 
@@ -1100,16 +1109,14 @@ function ensureServerConnection(serverUrl) {
       return sc;
     }
   }
-
   const sc = {
     url: serverUrl,
     ws: null,
     reconnectAttempt: 0,
     reconnectTimer: null,
     heartbeatTimer: null,
-    subscribed: new Set(),
-    authed: new Set(),
-    pendingInitialHistory: new Set(),
+    subscribed: new Set(), // rooms we asked to subscribe
+    authed: new Set(),     // rooms that are 'ready'
   };
   servers.set(serverUrl, sc);
 
@@ -1181,8 +1188,6 @@ function connect(sc) {
 
       sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since }));
 
-      sc.pendingInitialHistory.add(room.id);
-	
       if (room.id === currentRoomId) {
 	await ensureSodium();
 	setCryptoForRoom(room);
@@ -1194,17 +1199,10 @@ function connect(sc) {
       for (const item of (m.messages || [])) {
 	await handleIncoming(sc.url, item, true);
       }
-      const isPending = sc.pendingInitialHistory.has(m.room_id);
-      if (m.room_id === currentRoomId && isPending) {
-        sc.pendingInitialHistory.delete(m.room_id);
-        const viewIsEmpty = ui.messages.childElementCount === 0 || (VL && VL.seenIds && VL.seenIds.size === 0);
-        if (viewIsEmpty) {
-          await initVirtualRoomView(sc.url, m.room_id);   // reads from freshly-filled IDB
-          setStatus('Connected');
-        }
-      } else if (m.room_id === currentRoomId) {
-        if (ui.status && ui.status.textContent !== 'Connected') setStatus('Connected');
+      if (m.room_id === currentRoomId) {
+	  if (ui.status && ui.status.textContent !== 'Connected') setStatus('Connected');
       }
+
     } else if (m.type === 'message') {
       handleIncoming(sc.url, m);
 
