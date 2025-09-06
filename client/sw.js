@@ -13,7 +13,6 @@ fetch('./manifest.json')
       './sw.js',
       './yam.css',
       './boot.js',
-      './messenger.js',
       `./messenger.js?v=${APP_VERSION}`,
       './offline.html',
       './android-chrome-192x192.png',
@@ -40,22 +39,31 @@ fetch('./manifest.json')
       if (req.method !== 'GET') return;
 
       if (req.mode === 'navigate') {
-        event.respondWith(fetch(req).catch(() => caches.match('./offline.html')));
-        return;
+	event.respondWith(fetch(req).catch(() => caches.match('./offline.html')));
+	return;
       }
 
-      event.respondWith(
-	caches.match(req).then(cached => {
-	  const fetchPromise = fetch(req).then(networkRes => {
-	    if (networkRes && networkRes.ok) {
-	      const resClone = networkRes.clone();
-	      caches.open(CACHE_NAME).then(cache => cache.put(req, resClone));
+      const url = new URL(req.url);
+      const sameOrigin = url.origin === location.origin;
+
+      event.respondWith((async () => {
+	const cached = await caches.match(req);
+	try {
+	  const net = await fetch(req);
+	  // Only cache small, same-origin, basic (non-opaque) responses
+	  if (sameOrigin && net.ok && net.type === 'basic') {
+	    const len = Number(net.headers.get('content-length') || '0');
+	    if (len === 0 || len <= 3_000_000) {
+	      const clone = net.clone();
+	      const cache = await caches.open(CACHE_NAME);
+	      cache.put(req, clone);
 	    }
-	    return networkRes;
-	  }).catch(() => cached);
-	  return cached || fetchPromise;
-	})
-      );
+	  }
+	  return cached || net;
+	} catch {
+	  return cached;
+	}
+      })());
     });
   })
   .catch(err => console.error('Failed to init SW via manifest:', err));

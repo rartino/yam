@@ -8,7 +8,7 @@ from flask_sock import Sock
 
 DB_PATH = os.environ.get("WS_DB_PATH", "messages.db")
 ALLOWED_ORIGINS = set(
-    [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://rickard.armiento.se").split(",") if o.strip()]
+    [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://rickard.armiento.se,http://localhost,http://127.0.0.1").split(",") if o.strip()]
 )
 
 app = Flask(__name__)
@@ -33,6 +33,7 @@ def LOG(*args):
 # ---------- DB ----------
 def get_db():
     conn = sqlite3.connect(DB_PATH)
+    conn.execute('PRAGMA journal_mode=WAL;')
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -58,6 +59,12 @@ def init_db():
 
 init_db()
 
+@app.after_request
+def _sec_headers(resp):
+    resp.headers.setdefault('Cross-Origin-Opener-Policy', 'same-origin')
+    resp.headers.setdefault('Cross-Origin-Embedder-Policy', 'require-corp')
+    return resp
+
 # ---------- “Create room” endpoint (no-op but useful) ----------
 @app.route("/rooms", methods=["POST"])
 def rooms_post():
@@ -82,6 +89,7 @@ ROOM_PEERS = {}
 
 # Simple sliding-window rate limit (per IP + room + kind)
 _RATE = {}  # key -> (reset_epoch_ms, count)
+_RATE_SOFT_LIMIT = int(os.environ.get("RATE_SOFT_LIMIT", "50000"))
 
 # ---------- Helpers ----------
 def broadcast(room_id, payload, exclude=None):
@@ -125,6 +133,17 @@ def unicast(room_id, peer_id_b64, payload):
         LOG("unicast-error", "room=", room_id, "peer=", peer_id_b64)
         return False
 
+def _rate_gc(now_ms):
+    # prune expired windows
+    expired = [k for k, (reset, _) in _RATE.items() if reset <= now_ms]
+    for k in expired:
+        _RATE.pop(k, None)
+    # soft cap: drop oldest windows if still too big
+    if len(_RATE) > _RATE_SOFT_LIMIT:
+        items = sorted(_RATE.items(), key=lambda kv: kv[1][0])  # by reset time
+        for k, _ in items[: len(_RATE) - _RATE_SOFT_LIMIT]:
+            _RATE.pop(k, None)
+    
 def _ws_origin(ws) -> str:
     return (ws.environ.get("HTTP_ORIGIN") or "").strip()
 
@@ -138,10 +157,13 @@ def _too_many(kind: str, ip: str, room_id: str | None, limit: int, window_sec: i
     reset, cnt = _RATE.get(key, (0, 0))
     if now > reset:
         _RATE[key] = (now + window_sec * 1000, 1)
-        return False
-    cnt += 1
-    _RATE[key] = (reset, cnt)
-    return cnt > limit
+    else:
+        cnt += 1
+        _RATE[key] = (reset, cnt)
+    # periodic GC (cheap)
+    if (len(_RATE) & 0x3FF) == 0:  # every ~1024 different keys
+        _rate_gc(now)
+    return _RATE[key][1] > limit
 
 def _is_authed(ws, room_id: str) -> bool:
     return ws in ROOM_CONNECTIONS.get(room_id, set())
@@ -330,16 +352,12 @@ def ws_handler(ws):
                 # De-dupe: skip if this ciphertext already exists for this room
                 conn = get_db()
                 cur = conn.cursor()
-                cur.execute("SELECT 1 FROM messages WHERE room_id=? AND ciphertext=? LIMIT 1",
-                            (room_id, ciphertext))
-                exists = cur.fetchone() is not None
-                if not exists:
-                    cur.execute(
-                        "INSERT OR IGNORE INTO messages (room_id, ts, nickname, sender_id, sig, ciphertext) "
-                        "VALUES (?,?,?,?,?,?)",
-                        (room_id, ts, nickname, sender_id, sig, ciphertext)
-                    )
-                    conn.commit()
+                cur.execute(
+                    "INSERT OR IGNORE INTO messages (room_id, ts, nickname, sender_id, sig, ciphertext) VALUES (?,?,?,?,?,?)",
+                    (room_id, ts, nickname, sender_id, sig, ciphertext)
+                )
+                inserted = (cur.rowcount or 0) > 0
+                conn.commit()
                 conn.close()
 
                 payload = {
@@ -347,12 +365,17 @@ def ws_handler(ws):
                     'room_id': room_id,
                     'ts': ts,
                     'nickname': nickname,
-                    'sender_id': sender_id,
-                    'sig': sig,
-                    'ciphertext': ciphertext
+                    'sender_id': sender_id_b64u,  # whichever var you use
+                    'sig': sig_b64u,
+                    'ciphertext': ciph_b64u
                 }
-                fanout = broadcast(room_id, payload)
-                LOG("send", "room=", room_id, "bytes=", len(ciphertext), "fanout=", fanout)
+
+                if inserted:
+                    fanout = broadcast(room_id, payload)
+                    LOG("send", "room=", room_id, "bytes=", len(ciph_b64u), "fanout=", fanout)
+                else:
+                    LOG("send-replay-ignored", "room=", room_id)
+                
                 continue
 
             # ---------- WebRTC signaling ----------

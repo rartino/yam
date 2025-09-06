@@ -1,6 +1,3 @@
-Object.freeze(crypto.subtle);
-Object.freeze(crypto);
-
 // ====== CONFIG ======
 const MASTER_PASS_LS_KEY = 'secmsg_master_pass_v1';
 const MASTER_PASS_SS_KEY = 'secmsg_master_pass_session_v1';
@@ -15,6 +12,8 @@ const MSG_DB = 'secmsg_msgs_db';
 const MSG_STORE = 'msgs';
 const PROFILE_DB = 'secmsg_profile_db';
 const PROFILE_STORE = 'kv';
+const PBKDF2_ITERS_CURRENT = 250_000;
+const KDF_ALGO = { name: 'PBKDF2', hash: 'SHA-256' };
 const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302'] },
@@ -275,33 +274,13 @@ async function rotateMasterPassTo(newPass, { persist }) {
 }
 
 // Derive a per-room AES-GCM key (non-extractable) from the base key + salt
-async function deriveAesKey(saltU8, usages = ['encrypt', 'decrypt']) {
+async function deriveAesKey(saltU8, usages = ['encrypt','decrypt'], iterations = PBKDF2_ITERS_CURRENT) {
   return subtleDeriveKey(
-    { name: 'PBKDF2', hash: 'SHA-256', salt: saltU8, iterations: 250_000 },
+    { name: 'PBKDF2', hash: 'SHA-256', salt: saltU8, iterations },
     await ensureMasterBaseKey(),
     { name: 'AES-GCM', length: 256 },
-    /* extractable */ false,
-    usages
-  );
-}
-
-async function ensureMasterPass() {
-  if (MASTER_PASS) return MASTER_PASS;
-  // Replace prompt() with your own modal if you prefer
-  const p = (await Promise.resolve(prompt('Set/enter a passphrase to unlock room keys'))) || '';
-  MASTER_PASS = p;
-  return MASTER_PASS;
-}
-
-async function deriveKey(pass, salt) {
-  const enc = new TextEncoder();
-  const baseKey = await crypto.subtle.importKey('raw', enc.encode(pass), 'PBKDF2', false, ['deriveKey']);
-  return crypto.subtle.deriveKey(
-    { name: 'PBKDF2', salt, iterations: 250_000, hash: 'SHA-256' },
-    baseKey,
-    { name: 'AES-GCM', length: 256 },
     false,
-    ['encrypt','decrypt']
+    usages
   );
 }
 
@@ -309,19 +288,22 @@ async function deriveKey(pass, salt) {
 async function sealSecret(roomSkB64) {
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv   = crypto.getRandomValues(new Uint8Array(12));
-  const key  = await deriveAesKey(salt, ['encrypt']);
-  const pt   = fromB64u(roomSkB64); // Uint8Array
+  const key  = await deriveAesKey(salt, ['encrypt'], PBKDF2_ITERS_CURRENT);
+  const pt   = fromB64u(roomSkB64);
   const ct   = new Uint8Array(await subtleEncrypt({ name: 'AES-GCM', iv }, key, pt));
-  return { salt: b64u(salt), iv: b64u(iv), ct: b64u(ct) };
+  return {
+    kdf: { a: 'PBKDF2-SHA256', i: PBKDF2_ITERS_CURRENT },   // <— stored for migration
+    salt: b64u(salt), iv: b64u(iv), ct: b64u(ct)
+  };
 }
 
 async function openSecret(sealed) {
   const salt = fromB64u(sealed.salt);
   const iv   = fromB64u(sealed.iv);
   const ct   = fromB64u(sealed.ct);
-  const key  = await deriveAesKey(salt, ['decrypt']);
+  const iters = (sealed.kdf && sealed.kdf.i) ? Number(sealed.kdf.i) : PBKDF2_ITERS_CURRENT;
+  const key  = await deriveAesKey(salt, ['decrypt'], iters);
   const pt   = new Uint8Array(await subtleDecrypt({ name: 'AES-GCM', iv }, key, ct));
-  // Return the original base64url string for your existing callers
   return b64u(pt);
 }
 
@@ -847,6 +829,7 @@ async function renderFileIfAvailable(bubbleEl, meta) {
     link.className = 'file-link';
     link.target = '_blank';
     link.rel = 'noopener';
+    link.download = meta.name || 'file';
     link.addEventListener('click', () => setTimeout(() => URL.revokeObjectURL(url), 0), { once: true });
     bubbleEl.appendChild(link);
   }
@@ -936,60 +919,101 @@ async function sendFileMetadata(room, meta) {
   sc.ws.send(JSON.stringify(payload));
 }
 
-async function handleIncoming(serverUrl, m, fromHistory=false) {
+async function handleIncoming(serverUrl, m, fromHistory = false) {
+  // Decrypt
   const pt = decryptToString(m.ciphertext);
-  const roomId = m.room_id || currentRoomId; // server includes this for history/live
-  const rKey = roomKey(serverUrl, roomId);
-  const id = `${rKey}|${await sha256_b64u_string(m.ciphertext)}`;
 
+  // Figure out which room this belongs to
+  const roomId = m.room_id || currentRoomId;
+  const rKey   = roomKey(serverUrl, roomId);
+
+  // Stable message id: roomKey + sha256(ciphertext)
+  const idHash = await sha256_b64u_string(m.ciphertext);
+  const id     = `${rKey}|${idHash}`;
+
+  // Optional signature verification (over the ciphertext)
   let verified = undefined;
   if (m.sender_id && m.sig) {
     try {
-      const senderPk = fromB64u(m.sender_id);
-      const sig = fromB64u(m.sig);
-      const ciphertext = fromB64u(m.ciphertext);
-      verified = sodium.crypto_sign_verify_detached(sig, ciphertext, senderPk);
+      const senderPk   = fromB64u(m.sender_id);
+      const sigBytes   = fromB64u(m.sig);
+      const cipherBytes= fromB64u(m.ciphertext);
+      verified = sodium.crypto_sign_verify_detached(sigBytes, cipherBytes, senderPk);
     } catch { verified = false; }
   }
 
   const tsVal = m.ts || nowMs();
 
+  // Try to interpret payload as a file-metadata message
+  let isFile = false, meta = null;
   try {
     const obj = JSON.parse(pt);
     if (obj && obj.kind === 'file' && obj.hash) {
-      // persist
-      await msgPut({
-        id, roomKey: rKey, roomId, serverUrl,
-        ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
-        verified, kind: 'file', meta: obj
-      });
-
-      // render to UI only if this is the visible room
-      if (roomId === currentRoomId) {
-        const bubble = fileBubbleSkeleton({ meta: obj, ts: m.ts, nickname: m.nickname, senderId: m.sender_id, verified });
-          renderFileIfAvailable(bubble, obj).then(hasIt => { if (!hasIt) { showPendingBubble(bubble, obj); requestFile(roomId, obj.hash); } else { scrollToEnd(); } });
-      }
-      return;
+      isFile = true;
+      // carry room for convenience in requestFile()
+      meta = { ...obj, room_id: roomId };
     }
-  } catch (_) { /* not JSON */ }
+  } catch { /* not JSON → plain text */ }
 
-  // plain text
-  await msgPut({
-    id, roomKey: rKey, roomId, serverUrl,
-    ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id,
-    verified, kind: 'text', text: pt
-  });
-  if (roomId === currentRoomId && !fromHistory) {
-    const rec = (/* determine kind */ (() => {
-      try {
-        const obj = JSON.parse(pt);
-        if (obj && obj.kind === 'file' && obj.hash) {
-          return { kind: 'file', ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id, verified, meta: obj };
-       }
-      } catch {}
-      return { kind: 'text', ts: m.ts || nowMs(), nickname: m.nickname, senderId: m.sender_id, verified, text: pt };
-    })());
-    appendLiveRecord(rec);
+  // Persist first (IDB dedupe is by primary key 'id')
+  if (isFile) {
+    await msgPut({
+      id,
+      roomKey: rKey,
+      roomId,
+      serverUrl,
+      ts: tsVal,
+      nickname: m.nickname,
+      senderId: m.sender_id,
+      verified,
+      kind: 'file',
+      meta
+    });
+  } else {
+    await msgPut({
+      id,
+      roomKey: rKey,
+      roomId,
+      serverUrl,
+      ts: tsVal,
+      nickname: m.nickname,
+      senderId: m.sender_id,
+      verified,
+      kind: 'text',
+      text: pt
+    });
+  }
+
+  // Only render if this message is for the *currently visible* room and not from history
+  const isActive = (VL && VL.serverUrl === serverUrl && VL.roomId === roomId);
+  if (!isActive || fromHistory) return;
+
+  // Runtime replay guard: if we've already rendered this id in the live view, skip
+  if (VL.seenIds && VL.seenIds.has(id)) return;
+  if (VL.seenIds) VL.seenIds.add(id);
+
+  // Render
+  if (isFile) {
+    const bubble = fileBubbleSkeleton(
+      { meta, ts: tsVal, nickname: m.nickname, senderId: m.sender_id, verified }
+    );
+    renderFileIfAvailable(bubble, meta).then(ok => {
+      if (!ok) {
+        showPendingBubble(bubble, meta);
+        requestFile(roomId, meta.hash);
+      } else {
+        scrollToEnd();
+      }
+    });
+  } else {
+    appendLiveRecord({
+      kind: 'text',
+      ts: tsVal,
+      nickname: m.nickname,
+      senderId: m.sender_id,
+      verified,
+      text: pt
+    });
   }
 }
 
@@ -1726,7 +1750,7 @@ async function generateJoinAnswer(){
             });
             saveRooms();
           }
-          await secretPut(r.id, await sealSecret(b64u(privateKey)));
+          await secretPut(r.id, await sealSecret(b64u(r.roomSkB64)));
 
           // ---- Connect & open
           ensureServerConnection(serverUrl);
@@ -2103,7 +2127,7 @@ async function continueBootAfterUnlock() {
     ensureAllServerConnections?.();   // if using multi-room version
     await openRoom?.(currentRoomId);  // if present in your codebase
   } else {
-    setStatus('✔️'); // idle state
+    setStatus(statuses.passive); // idle state
     const el = document.getElementById('currentRoomName');
     if (el) el.textContent = 'No room';
   }
@@ -2247,6 +2271,7 @@ unlock.dlg.addEventListener('close', () => {
 });
 
 // ====== Boot ======
+ensureSodium();
 loadSettings();
 
 if (SETTINGS.requirePass) {
