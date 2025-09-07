@@ -1801,7 +1801,7 @@ async function openJoinDialog(){
         const plain  = sodium.crypto_box_seal_open(sealed, _joinWait.curvePk, _joinWait.curveSk);
         const obj    = JSON.parse(bytesToUtf8(plain));
 
-        if (!obj || obj.k !== 'yam-invite' || !obj.room || !obj.room.sk || !obj.room.id) {
+        if (!obj || obj.k !== 'room-invite' || !obj.room || !obj.room.sk || !obj.room.id) {
           alert('Bad invite payload'); return;
         }
         const skBytes = fromB64u(obj.room.sk);
