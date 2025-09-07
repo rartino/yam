@@ -150,13 +150,12 @@
 
       <div class="settings-stack">
 	<div class="field">
-	  <label for="joinServer" class="muted">Server</label>
+	  <label for="joinServer" class="muted">Server hosting the room</label>
 	  <input id="joinServer" placeholder="https://rartino.pythonanywhere.com" />
-	  <p class="muted help">Change only if you and the inviter use a different relay.</p>
 	</div>
 
 	<div class="field">
-	  <label class="muted">Your invite code</label>
+	  <label class="muted">Your identity code (send to inviter to get invited)</label>
 	  <textarea id="joinCode" class="codearea" readonly rows="3" spellcheck="false"></textarea>
 	  <div class="row-buttons row-buttons--auto2">
 	    <button type="button" id="btnCopyJoinCode">Copy</button>
@@ -165,9 +164,8 @@
 	</div>
 
 	<div class="field">
-	  <label class="muted">QR (scan this on inviter’s device)</label>
+	  <label class="muted">... or ask inviter to scan this QR code</label>
 	  <canvas id="joinQrCanvas" width="0" height="0" class="qr-canvas"></canvas>
-	  <p id="joinQrHint" class="muted help">If QR isn’t visible, share the code above.</p>
 	</div>
       </div>
     </form>
@@ -177,11 +175,11 @@
   <dialog id="inviteModal">
     <button id="btnCloseInvite" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
-      <h3 class="modal-title">Invite to this room</h3>
+      <h3 class="modal-title">Invite to the current room</h3>
 
       <div class="settings-stack">
 	<div class="field">
-	  <label class="muted">Paste invite code (or scan)</label>
+	  <label class="muted">Identity to invite</label>
 	  <textarea id="inviteCodeInput" class="codearea" rows="3" placeholder="yam-v1:relay.example.com:AbCd…" spellcheck="false"></textarea>
 	  <div class="row-buttons row-buttons--auto2">
 	    <button type="button" id="btnScanInviteQr">Scan QR</button>
