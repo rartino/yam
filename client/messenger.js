@@ -169,10 +169,9 @@ function randomB64u(n = 32) {
 function hostFromUrl(u){
   try { const x = new URL(normServer(u)); return x.host; } catch { return u; }
 }
-async function sha256_b64u_bytes(bytes){
-  const buf = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes);
-  const digest = await crypto.subtle.digest('SHA-256', buf);
-  return b64u(new Uint8Array(digest));
+async function sha256_b64u_bytes(u8) {
+  const d = await crypto.subtle.digest('SHA-256', u8);
+  return b64u(new Uint8Array(d));
 }
 
 const _subtle = crypto.subtle;
@@ -352,13 +351,156 @@ async function secretGet(roomId) {
 function encodeInviteCode(host, pkB64u){
   return `yam-v1:${host}:${pkB64u}`;
 }
-function parseInviteCode(code){
-  const s = (code || '').trim();
-  // allow accidental "yam-v1://" prefix too
-  const cleaned = s.replace(/^yam-v1:\/\//, 'yam-v1:');
-  const m = /^yam-v1:([^:]+):([A-Za-z0-9_-]+)$/.exec(cleaned);
-  if (!m) return null;
-  return { host: m[1], pkB64u: m[2] };
+
+async function parseInviteCode(raw) {
+  const s = (raw || '').trim();
+  const prefix = 'yam-v1:';
+  if (!s.toLowerCase().startsWith(prefix)) throw new Error('Code must start with yam-v1:');
+  const rest = s.slice(prefix.length);
+  const i = rest.indexOf(':');
+  if (i < 0) throw new Error('Missing server or key.');
+  const serverPart = rest.slice(0, i).trim();
+  const keyPart    = rest.slice(i + 1).trim();
+  if (!serverPart) throw new Error('Missing server.');
+  if (!keyPart) throw new Error('Missing invite public key.');
+  const server = normServer(serverPart);
+
+  await ensureSodium();
+  let pub;
+  try { pub = fromB64u(keyPart); } catch { throw new Error('Bad base64url key.'); }
+  if (!(pub instanceof Uint8Array) || pub.length !== 32) throw new Error('Invite public key must be 32 bytes.');
+  const pubHashB64 = await sha256_b64u_bytes(pub);
+  return { server, pubB64: keyPart, pub, pubHashB64 };
+}
+
+// Camera QR scanning (BarcodeDetector API). Graceful fallback to manual paste.
+let _scanStream = null, _scanRAF = 0, _detector = null;
+async function startInviteScan() {
+  if (!('BarcodeDetector' in window)) {
+    alert('QR scanning not supported in this browser. Paste the code instead.');
+    return;
+  }
+  try {
+    _detector = new BarcodeDetector({ formats: ['qr_code'] });
+  } catch {
+    alert('QR scanning unavailable on this device. Paste the code instead.');
+    return;
+  }
+  inv.scanArea.classList.remove('hidden');
+  try {
+    _scanStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false });
+  } catch {
+    alert('Camera permission denied. Paste the code instead.');
+    stopInviteScan();
+    return;
+  }
+  inv.scanVideo.srcObject = _scanStream;
+  await inv.scanVideo.play();
+
+  const loop = async () => {
+    if (!_scanStream) return;
+    try {
+      const results = await _detector.detect(inv.scanVideo);
+      if (results && results.length) {
+        const val = (results[0].rawValue || '').trim();
+        if (val) {
+          inv.codeInput.value = val;
+          stopInviteScan();
+          // optional: auto-send after successful scan:
+          // deliverInvite();
+          return;
+        }
+      }
+    } catch {}
+    _scanRAF = requestAnimationFrame(loop);
+  };
+  _scanRAF = requestAnimationFrame(loop);
+}
+
+function stopInviteScan() {
+  if (_scanRAF) cancelAnimationFrame(_scanRAF);
+  _scanRAF = 0;
+  if (inv.scanVideo) {
+    try { inv.scanVideo.pause(); } catch {}
+    inv.scanVideo.srcObject = null;
+  }
+  if (_scanStream) {
+    try { _scanStream.getTracks().forEach(t => t.stop()); } catch {}
+    _scanStream = null;
+  }
+  inv.scanArea.classList.add('hidden');
+}
+
+// Send the encrypted room secret to the invitee’s waiting connection
+async function deliverInvite() {
+  const code = (inv.codeInput.value || '').trim();
+  if (!code) { alert('Paste or scan the invite code first.'); return; }
+
+  // Need an active room (the one you’re inviting to)
+  const room = getCurrentRoom?.();
+  if (!room) { alert('Open a room to invite someone to.'); return; }
+
+  let parsed;
+  try {
+    parsed = await parseInviteCode(code);
+  } catch (e) {
+    alert(e.message || 'Invalid invite code.');
+    return;
+  }
+
+  // Enforce relay match to avoid accidental cross-server delivery
+  const expected = normServer(room.server);
+  if (parsed.server !== expected) {
+    alert(`Server mismatch.\nCode is for: ${parsed.server}\nCurrent room uses: ${expected}`);
+    return;
+  }
+
+  // Ensure we have the room secret locally
+  let sealedSecret;
+  try {
+    const sealed = await secretGet(room.id);               // sealed under your master password
+    const roomSkB64 = await openSecret(sealed);            // base64url string (Ed25519 private key)
+    await ensureSodium();
+    const payload = JSON.stringify({
+      ver: 1,
+      kind: 'room-invite',
+      room: {
+        id: room.id,
+        name: room.name || 'Room',
+        server: expected,
+        roomSkB64,
+        createdAt: room.createdAt || nowMs()
+      }
+    });
+    // Encrypt to invitee’s X25519 public key (sealed box)
+    sealedSecret = b64u(sodium.crypto_box_seal(utf8ToBytes(payload), parsed.pub));
+  } catch (e) {
+    console.error(e);
+    alert('Could not access or encrypt the room key on this device.');
+    return;
+  }
+
+  // Use the existing WS connection for this relay (no new socket)
+  const sc = servers.get(expected) || ensureServerConnection(expected);
+  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN) {
+    alert('Not connected to the relay yet. Try again in a moment.');
+    return;
+  }
+
+  try {
+    sc.ws.send(JSON.stringify({
+      type: 'invite-deliver',
+      to_pub_hash: parsed.pubHashB64,
+      payload: sealedSecret
+    }));
+    inv.btnSend.disabled = true;
+    const old = inv.btnSend.textContent;
+    inv.btnSend.textContent = 'Sent';
+    setTimeout(() => { inv.btnSend.disabled = false; inv.btnSend.textContent = old; inv.dlg.close(); }, 900);
+  } catch (e) {
+    console.error(e);
+    alert('Failed to send invite to the relay.');
+  }
 }
 
 async function clearRoomData(serverUrl, roomId){
@@ -1290,114 +1432,6 @@ function openInviteDialog(){
   inv.dlg.showModal();
 }
 
-let _scanStream = null;
-async function startInviteScan(){
-  if (!('BarcodeDetector' in window)) {
-    alert('QR scanning not supported in this browser. Paste the code instead.');
-    return;
-  }
-  try {
-    const det = new window.BarcodeDetector({ formats: ['qr_code'] });
-    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio:false });
-    _scanStream = stream;
-    inv.scanVideo.srcObject = stream;
-    await inv.scanVideo.play();
-    inv.scanArea.classList.remove('hidden');
-
-    let stopped = false;
-    inv.btnStopScan.onclick = () => { stopped = true; stopInviteScan(); };
-
-    (async function loop(){
-      while (!stopped && _scanStream) {
-        try {
-          const codes = await det.detect(inv.scanVideo);
-          if (codes && codes.length) {
-            const raw = (codes[0].rawValue || '').trim();
-            if (parseInviteCode(raw)) {
-              inv.codeInput.value = raw;
-              stopInviteScan();
-              break;
-            }
-          }
-        } catch {}
-        await new Promise(r => setTimeout(r, 120));
-      }
-    })();
-  } catch (e) {
-    console.error(e);
-    alert('Could not start camera. Paste the code instead.');
-  }
-}
-function stopInviteScan(){
-  if (_scanStream) {
-    for (const t of _scanStream.getTracks()) try { t.stop(); } catch {}
-    _scanStream = null;
-  }
-  try { inv.scanVideo.pause(); inv.scanVideo.srcObject = null; } catch {}
-  inv.scanArea.classList.add('hidden');
-}
-
-inv.btnClose?.addEventListener('click', () => { stopInviteScan(); inv.dlg.close(); });
-inv.btnScan?.addEventListener('click', startInviteScan);
-inv.btnPaste?.addEventListener('click', async () => {
-  try {
-    const txt = await navigator.clipboard.readText();
-    if (txt) inv.codeInput.value = txt.trim();
-  } catch {}
-});
-
-// Send the sealed invite (same logic you already added previously; just reads from inv.codeInput)
-async function finishInviteDialog(){
-  const room = getCurrentRoom();
-  if (!room) { alert('No active room'); return; }
-  const code = (inv.codeInput.value || '').trim();
-  const parsed = parseInviteCode(code);
-  if (!parsed) { alert('Invalid code. Expect: yam-v1:<host>:<pk>'); return; }
-
-  // Server/host must match this room’s server
-  const expectedHost = hostFromUrl(room.server);
-  if (parsed.host !== expectedHost) {
-    alert(`Server mismatch.\nCode host: ${parsed.host}\nRoom host: ${expectedHost}`);
-    return;
-  }
-
-  await ensureSodium();
-
-  const inviteePkCurve = fromB64u(parsed.pkB64u);
-  if (!(inviteePkCurve instanceof Uint8Array) || inviteePkCurve.length !== 32) {
-    alert('Bad invitee public key'); return;
-  }
-
-  const skBytes = await getRoomPrivateKeyBytes(room.id);
-  const rid = b64u(derivePubFromSk(skBytes));
-  if (rid !== room.id) { alert('Local room secret mismatch'); return; }
-
-  const envelope = {
-    v: 1, k: 'yam-invite', t0: nowMs(),
-    room: { id: rid, name: room.name || 'Room', sk: b64u(skBytes) }
-  };
-  const encBytes = utf8ToBytes(JSON.stringify(envelope));
-
-  // Optional authenticity (as before)
-  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encBytes));
-  const sig = sodium.crypto_sign_detached(digest, myIdSk);
-  envelope.inv = { pk: b64u(myIdPk), sig: b64u(sig) };
-
-  const encBytes2 = utf8ToBytes(JSON.stringify(envelope));
-  const sealed = sodium.crypto_box_seal(encBytes2, inviteePkCurve);
-  const ciphertextB64 = b64u(sealed);
-  const hash = await sha256_b64u_bytes(inviteePkCurve);
-
-  const sc = servers.get(normServer(room.server));
-  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN) { alert('Not connected to server'); return; }
-
-  if (DEBUG_SIG) dbg('SIG/TX','invite-send',{host:parsed.host, hash:hash.slice(0,12)+'…'});
-  sc.ws.send(JSON.stringify({ type:'invite-send', hash, ciphertext: ciphertextB64 }));
-
-  stopInviteScan();
-  inv.dlg.close();
-}
-
 // ====== Server connection mgmt ======
 function ensureServerConnection(serverUrl) {
   serverUrl = normServer(serverUrl);
@@ -2229,13 +2263,19 @@ ui.fileInput?.addEventListener('change', async (e) => {
   ui.fileInput.value = '';
 });
 
-// Invitation dialog
-inv.btnClose?.addEventListener('click', () => inv.dlg.close());
-inv.btnCopyOffer?.addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText(inv.offerTA.value); inv.btnCopyOffer.textContent='Copied'; setTimeout(()=>inv.btnCopyOffer.textContent='Copy',1000);} catch {}
+//// Invitation dialog
+inv.btnClose?.addEventListener('click', () => { stopInviteScan(); inv.dlg.close(); });
+
+// Actions
+inv.btnScan?.addEventListener('click', startInviteScan);
+inv.btnStopScan?.addEventListener('click', stopInviteScan);
+inv.btnPaste?.addEventListener('click', async () => {
+  try {
+    const txt = await navigator.clipboard.readText();
+    if (txt) inv.codeInput.value = txt.trim();
+  } catch {}
 });
-inv.btnRefreshOffer?.addEventListener('click', () => { inv.offerTA.value = ''; });
-inv.btnFinish?.addEventListener('click', finishInviteDialog);
+inv.btnSend?.addEventListener('click', deliverInvite);
 
 // Settings dropdown
 ui.btnSettings.addEventListener('click', (e) => {
