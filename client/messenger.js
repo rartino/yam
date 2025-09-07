@@ -489,9 +489,9 @@ async function deliverInvite() {
 
   try {
     sc.ws.send(JSON.stringify({
-      type: 'invite-deliver',
-      to_pub_hash: parsed.pubHashB64,
-      payload: sealedSecret
+      type: 'invite-send',
+      hash: parsed.pubHashB64,
+      ciphertext: sealedSecret
     }));
     inv.btnSend.disabled = true;
     const old = inv.btnSend.textContent;
