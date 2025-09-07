@@ -1793,39 +1793,51 @@ async function openJoinDialog(){
     if (DEBUG_SIG) dbg('SIG/TX','invite-open',{hash:_joinWait.hash.slice(0,12)+'…'});
     w.send(JSON.stringify({ type:'invite-open', hash: _joinWait.hash }));
   };
+
   w.onmessage = async (evt) => {
     const m = JSON.parse(evt.data);
     if (m.type === 'invite-deliver') {
       try {
-        const sealed = fromB64u(m.ciphertext);
-        const plain  = sodium.crypto_box_seal_open(sealed, _joinWait.curvePk, _joinWait.curveSk);
-        const obj    = JSON.parse(bytesToUtf8(plain));
+	const sealed = fromB64u(m.ciphertext);
+	const plain  = sodium.crypto_box_seal_open(sealed, _joinWait.curvePk, _joinWait.curveSk);
+	const obj    = JSON.parse(bytesToUtf8(plain));
 
-        if (!obj || obj.k !== 'room-invite' || !obj.room || !obj.room.sk || !obj.room.id) {
-          alert('Bad invite payload'); return;
-        }
-        const skBytes = fromB64u(obj.room.sk);
-        const pkBytes = derivePubFromSk(skBytes);
-        if (b64u(pkBytes) !== obj.room.id) { alert('Invite id mismatch'); return; }
+	// 🔧 Align with sender: 'kind' (not 'k'), 'room.roomSkB64' (not 'room.sk')
+	if (!obj || obj.kind !== 'room-invite' || !obj.room || !obj.room.roomSkB64 || !obj.room.id) {
+	  alert('Bad invite payload'); return;
+	}
 
-        // Upsert room & secret
-        const serverUrl = 'https://' + _joinWait.host;
-        const rid = obj.room.id;
-        if (!rooms.find(x => x.id === rid)) {
-          rooms.push({ id: rid, name: obj.room.name || 'Room', server: serverUrl, roomId: rid, createdAt: nowMs() });
-          saveRooms();
-        }
-        await secretPut(rid, await sealSecret(b64u(skBytes)));
+	const skBytes = fromB64u(obj.room.roomSkB64);
+	const pkBytes = derivePubFromSk(skBytes);
+	if (b64u(pkBytes) !== obj.room.id) { alert('Invite id mismatch'); return; }
 
-        ensureServerConnection(serverUrl);
-        await registerRoomIfNeeded({ id: rid, server: serverUrl });
-        await openRoom(rid);
+	// Prefer the explicit server in payload; fall back to the host we’re connected to
+	const serverUrl = obj.room.server || ('https://' + _joinWait.host);
+	const rid = obj.room.id;
 
-        try { _joinWait.ws.close(); } catch {}
-        join.dlg.close();
+	// Upsert room (if not present)
+	if (!rooms.find(x => x.id === rid)) {
+	  rooms.push({
+	    id: rid,
+	    name: obj.room.name || 'Room',
+	    server: serverUrl,
+	    roomId: rid,
+	    createdAt: obj.room.createdAt || nowMs()
+	  });
+	  saveRooms();
+	}
+
+	await secretPut(rid, await sealSecret(b64u(skBytes)));
+
+	ensureServerConnection(serverUrl);
+	await registerRoomIfNeeded({ id: rid, server: serverUrl });
+	await openRoom(rid);
+
+	try { _joinWait.ws.close(); } catch {}
+	join.dlg.close();
       } catch (e) {
-        console.error(e);
-        alert('Failed to decrypt invite.');
+	console.error(e);
+	alert('Failed to decrypt invite.');
       }
     } else if (m.type === 'error') {
       alert(`Server error: ${m.error}`);
