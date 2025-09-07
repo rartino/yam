@@ -12,6 +12,7 @@ ALLOWED_ORIGINS = set(
     [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://rickard.armiento.se,http://localhost:8000,http://127.0.0.1:8000").split(",") if o.strip()]
 )
 MAX_PAYLOAD_SIZE = 128 * 1024  # bytes (base64 will be ~1.33x)
+MAX_PROFILE_BYTES = int(os.environ.get("MAX_PROFILE_BYTES", str(64 * 1024)))  # 64 KiB cap
 INVITE_WAIT = {}   # { str: (ws, int) }
 INVITE_TTL_MS = int(os.environ.get("INVITE_TTL_MS", "180000"))  # 3 minutes default
 
@@ -55,6 +56,15 @@ def init_db():
         CREATE TABLE IF NOT EXISTS room_counters (
         room_id TEXT PRIMARY KEY,
         next    INTEGER NOT NULL
+      )
+      """)
+      CONN.execute("""
+      CREATE TABLE IF NOT EXISTS profiles (
+        room_id    TEXT NOT NULL,
+        sender_id  TEXT NOT NULL,      -- base64url string
+        ciphertext BLOB NOT NULL,      -- sealed to room public key
+        updated_ts INTEGER NOT NULL,
+        PRIMARY KEY (room_id, sender_id)
       )
       """)
       CONN.execute("""
@@ -168,6 +178,9 @@ ROOM_PEERS = {}
 # Simple sliding-window rate limit (per IP + room + kind)
 _RATE = {}  # key -> (reset_epoch_ms, count)
 _RATE_SOFT_LIMIT = int(os.environ.get("RATE_SOFT_LIMIT", "5000"))
+
+# ws -> (room_id, peer_id) for identity binding (prevents profile spoof)
+PEER_BY_WS = {}
 
 # ---------- Helpers ----------
 def broadcast(room_id, payload, exclude=None):
@@ -396,7 +409,7 @@ def ws_handler(ws):
 
             # ---------- Everything below requires room_id + authorization ----------
             room_id = m.get('room_id')
-            if t not in ('history', 'send', 'announce', 'webrtc-request', 'webrtc-response', 'webrtc-ice', 'webrtc-taken'):
+            if t not in ('history', 'send', 'announce', 'profile-change','profile-retrieve', 'webrtc-request', 'webrtc-response', 'webrtc-ice', 'webrtc-taken'):
                 ws.send(json.dumps({'type': 'error', 'error': f'unknown type: {t}'}))
                 continue
             if not isinstance(room_id, str) or not room_id:
@@ -411,8 +424,73 @@ def ws_handler(ws):
                 pid = m.get('peer_id')
                 if isinstance(pid, str) and pid:
                     ROOM_PEERS.setdefault(room_id, {})[pid] = ws
+                    PEER_BY_WS[ws] = (room_id, pid)
                     LOG("announce", "room=", room_id, "peer=", pid[:6] + "…")
                 continue
+
+            if t == 'profile-change':
+                sender_id = m.get('sender_id')
+                ct_b64    = m.get('ciphertext')
+
+                if not (isinstance(sender_id, str) and isinstance(ct_b64, str)):
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_profile_args'}))
+                    continue
+
+                # Bind profile updates to the announcing identity on this socket
+                rid_pid = PEER_BY_WS.get(ws)
+                if not rid_pid or rid_pid[0] != room_id or rid_pid[1] != sender_id:
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'peer_mismatch'}))
+                    continue
+
+                try:
+                    ct = _from_b64u(ct_b64)
+                except Exception:
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_encoding'}))
+                    continue
+
+                if len(ct) > MAX_PROFILE_BYTES:
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'profile_too_large'}))
+                    continue
+
+                now = now_ms()
+                with CONN:
+                    CONN.execute("""
+                        INSERT INTO profiles(room_id, sender_id, ciphertext, updated_ts)
+                        VALUES (?,?,?,?)
+                        ON CONFLICT(room_id, sender_id)
+                        DO UPDATE SET ciphertext=excluded.ciphertext, updated_ts=excluded.updated_ts
+                    """, (room_id, sender_id, ct, now))
+
+                # notify all (including sender, harmless)
+                broadcast(room_id, {
+                    'type': 'profile-notify',
+                    'room_id': room_id,
+                    'sender_id': sender_id,
+                    'ciphertext': ct_b64
+                })
+                continue
+
+            # ---------- Profile retrieve (one-shot reply to requester) ----------
+            if t == 'profile-retrieve':
+                target = m.get('sender_id')
+                if not isinstance(target, str):
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_profile_args'}))
+                    continue
+                row = CONN.execute(
+                    "SELECT ciphertext FROM profiles WHERE room_id=? AND sender_id=?",
+                    (room_id, target)
+                ).fetchone()
+                if not row:
+                    ws.send(json.dumps({'type': 'profile-none', 'room_id': room_id, 'sender_id': target}))
+                else:
+                    ws.send(json.dumps({
+                        'type': 'profile-retrieve',
+                        'room_id': room_id,
+                        'sender_id': target,
+                        'ciphertext': _b64u(row['ciphertext'])
+                    }))
+                continue
+            
 
             # ---------- History ----------
             if t == 'history':
@@ -590,6 +668,7 @@ def ws_handler(ws):
         # remove pending challenges for this ws
         for key in [k for k in PENDING_CHALLENGES.keys() if k[0] is ws]:
             PENDING_CHALLENGES.pop(key, None)
+        PEER_BY_WS.pop(ws, None)
         LOG("WS close", "ip=", ip)
         try:
             ws.close()

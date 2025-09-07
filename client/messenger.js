@@ -14,6 +14,11 @@ const PROFILE_DB = 'secmsg_profile_db';
 const PROFILE_STORE = 'kv';
 const PBKDF2_ITERS_CURRENT = 250_000;
 const KDF_ALGO = { name: 'PBKDF2', hash: 'SHA-256' };
+const PROFILE_AVATAR_TARGET_BYTES = 12 * 1024;   // try to keep avatar ≤ 12 KiB
+const PROFILE_AVATAR_HARD_BYTES   = 16 * 1024;   // refuse above this after retries
+const PROFILE_AVATAR_W = 192;
+const PROFILE_AVATAR_H = 192;
+
 const RTC_CONFIG = {
   iceServers: [
     { urls: ['stun:stun.l.google.com:19302'] },
@@ -153,8 +158,56 @@ const pendingRequests = new Map();
 const serveRequests   = new Map();
 // request_id -> ICE buffered before responder PC exists
 const preServeIce     = new Map();
+// Cached profiles: key = roomKey(serverUrl, roomId) + '|' + senderId  -> { name, avatarHash }
+const profileCache = new Map();
+// Throttle duplicate in-flight requests
+const profileReqInflight = new Set();
+const profileRetryState = new Map(); // key -> { tries, timer }
 
 // ====== UTIL ======
+async function transcodeBlob(blob, {type, quality}) {
+  const bmp = await createImageBitmap(blob);
+  const canvas = (typeof OffscreenCanvas !== 'undefined')
+    ? new OffscreenCanvas(PROFILE_AVATAR_W, PROFILE_AVATAR_H)
+    : Object.assign(document.createElement('canvas'), {width: PROFILE_AVATAR_W, height: PROFILE_AVATAR_H});
+  const ctx = canvas.getContext('2d');
+  ctx.imageSmoothingEnabled = true;
+  if ('imageSmoothingQuality' in ctx) ctx.imageSmoothingQuality = 'high';
+  ctx.clearRect(0, 0, PROFILE_AVATAR_W, PROFILE_AVATAR_H);
+  // Fit-crop center to square
+  const s = Math.min(bmp.width, bmp.height);
+  const sx = ((bmp.width  - s) / 2) | 0;
+  const sy = ((bmp.height - s) / 2) | 0;
+  ctx.drawImage(bmp, sx, sy, s, s, 0, 0, PROFILE_AVATAR_W, PROFILE_AVATAR_H);
+
+  if (canvas.convertToBlob) return await canvas.convertToBlob({type, quality});
+  return await new Promise(res => canvas.toBlob(res, type, quality));
+}
+
+async function normalizeAvatarSize(inputBlob) {
+  const tryOrders = [
+    {type: 'image/webp', qualities: [0.82, 0.72, 0.62, 0.52, 0.4]},
+    {type: 'image/jpeg', qualities: [0.82, 0.72, 0.62, 0.52, 0.4]},
+    // As a last resort, a tiny PNG (often larger than JPEG/WEBP)
+    {type: 'image/png',   qualities: [1]}
+  ];
+  for (const {type, qualities} of tryOrders) {
+    for (const q of qualities) {
+      const out = await transcodeBlob(inputBlob, {type, quality: q});
+      if (out.size <= PROFILE_AVATAR_TARGET_BYTES) return out;
+      if (out.size <= PROFILE_AVATAR_HARD_BYTES && q === qualities[qualities.length - 1]) return out;
+    }
+  }
+  // If we get here, pick the smallest tried.
+  let best = await transcodeBlob(inputBlob, {type:'image/webp', quality:0.35});
+  if (best.size > PROFILE_AVATAR_HARD_BYTES) {
+    // Give JPEG a shot at very low quality
+    const alt = await transcodeBlob(inputBlob, {type:'image/jpeg', quality:0.35});
+    if (alt.size < best.size) best = alt;
+  }
+  return best;
+}
+
 function roomKey(serverUrl, roomId){ return `${normServer(serverUrl)}|${roomId}`; }
 function b64u(bytes) { return sodium.to_base64(bytes, sodium.base64_variants.URLSAFE_NO_PADDING); }
 function fromB64u(str) { return sodium.from_base64(str, sodium.base64_variants.URLSAFE_NO_PADDING); }
@@ -173,6 +226,13 @@ async function sha256_b64u_bytes(u8) {
   const d = await crypto.subtle.digest('SHA-256', u8);
   return b64u(new Uint8Array(d));
 }
+async function blobToU8(blob) {
+  const buf = await blob.arrayBuffer();
+  return new Uint8Array(buf);
+}
+async function blobToB64u(blob) {
+  return b64u(await blobToU8(blob));
+}
 
 const _subtle = crypto.subtle;
 const subtleImportKey = _subtle.importKey.bind(_subtle);
@@ -181,6 +241,121 @@ const subtleEncrypt   = _subtle.encrypt.bind(_subtle);
 const subtleDecrypt   = _subtle.decrypt.bind(_subtle);
 
 const te = new TextEncoder();
+
+function profileRetryKey(serverUrl, roomId, senderId) {
+  return `${serverUrl}|${roomId}|${senderId}`;
+}
+
+function scheduleProfileRetry(serverUrl, roomId, senderId) {
+  const key = profileRetryKey(serverUrl, roomId, senderId);
+  const st = profileRetryState.get(key) || { tries: 0, timer: null };
+  if (st.tries >= 5) return; // cap retries
+
+  st.tries += 1;
+  const delay = [400, 1000, 2000, 4000, 8000][st.tries - 1]; // backoff
+  clearTimeout(st.timer);
+  st.timer = setTimeout(() => {
+    profileReqInflight.delete(profileKeyLocal(serverUrl, roomId, senderId)); // allow another request
+    requestProfileIfMissing(serverUrl, roomId, senderId);
+  }, delay);
+
+  profileRetryState.set(key, st);
+}
+
+function clearProfileRetry(serverUrl, roomId, senderId) {
+  const key = profileRetryKey(serverUrl, roomId, senderId);
+  const st = profileRetryState.get(key);
+  if (st) { clearTimeout(st.timer); profileRetryState.delete(key); }
+}
+
+function profileKeyLocal(serverUrl, roomId, senderId) {
+  return `${roomKey(serverUrl, roomId)}|${senderId}`;
+}
+async function profileMetaGet(serverUrl, roomId, senderId) {
+  const k = 'prof|' + profileKeyLocal(serverUrl, roomId, senderId);
+  const v = await profileGet(k);
+  if (v) profileCache.set(profileKeyLocal(serverUrl, roomId, senderId), v);
+  return v || null;
+}
+async function profileMetaPut(serverUrl, roomId, senderId, meta) {
+  const k = 'prof|' + profileKeyLocal(serverUrl, roomId, senderId);
+  await profilePut(k, meta);
+  profileCache.set(profileKeyLocal(serverUrl, roomId, senderId), meta);
+}
+
+async function buildMyProfilePayload() {
+  const name = (SETTINGS.username || '').trim();
+  const avatar = await profileGet('avatar');  // the 192×192 PNG
+  let ah = null, ab = null;
+  if (avatar) {
+    const hash = await sha256_b64u(avatar);
+    await idbPut(hash, avatar);
+    ah = hash;
+    ab = await blobToB64u(avatar);
+  }
+  return { v: 1, name, ah, ab, ts: nowMs() };
+}
+
+async function sendMyProfile(serverUrl, roomId) {
+  try {
+    await ensureSodium();
+    const profObj = await buildMyProfilePayload();
+    const ctB64 = b64u(sodium.crypto_box_seal(utf8ToBytes(JSON.stringify(profObj)), curvePk));
+    const sc = servers.get(normServer(serverUrl));
+    if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN || !sc.authed?.has(roomId)) return;
+    sc.ws.send(JSON.stringify({
+      type: 'profile-change',
+      room_id: roomId,
+      sender_id: myPeerId,
+      ciphertext: ctB64
+    }));
+  } catch (e) {
+    console.error('sendMyProfile failed', e);
+  }
+}
+
+async function applyProfileCipher(serverUrl, roomId, senderId, ctB64) {
+  await ensureSodium();
+  let obj;
+  try {
+    const pt = decryptToString(ctB64);
+    obj = JSON.parse(pt);
+  } catch {
+    return; // ignore malformed
+  }
+  const name = (obj.name || '').trim();
+  let avatarHash = obj.ah || null;
+
+  // If bytes are included, store them and trust their hash
+  if (obj.ab) {
+    try {
+      const bytes = fromB64u(obj.ab);
+      const blob = new Blob([bytes], { type: 'image/png' });
+      const h = await sha256_b64u(blob);
+      avatarHash = avatarHash || h;
+      await idbPut(avatarHash, blob);
+    } catch {}
+  }
+
+  await profileMetaPut(serverUrl, roomId, senderId, { name, avatarHash });
+  updateMessagesForSender(serverUrl, roomId, senderId);
+}
+
+function requestProfileIfMissing(serverUrl, roomId, senderId) {
+  const key = profileKeyLocal(serverUrl, roomId, senderId);
+  if (profileCache.has(key)) return;
+
+  const sc = servers.get(normServer(serverUrl));
+  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN || !sc.authed?.has(roomId)) return;
+
+  // Let retries through if a backoff timer scheduled us
+  if (profileReqInflight.has(key)) return;
+
+  profileReqInflight.add(key);
+  sc.ws.send(JSON.stringify({ type: 'profile-retrieve', room_id: roomId, sender_id: senderId }));
+  // Auto-clear the inflight guard after a short window so retries can fire
+  setTimeout(() => profileReqInflight.delete(key), 1500);
+}
 
 async function setKeyCheckMarker() {
   const salt = crypto.getRandomValues(new Uint8Array(16));
@@ -987,23 +1162,39 @@ function announceIdentityToServers() {
 }
 
 // ====== Rendering ======
-function renderTextMessage({ text, ts, nickname, senderId, verified }, { prepend=false } = {}) {
+function renderTextMessage({ text, ts, senderId, verified }, { prepend=false } = {}) {
   const row = document.createElement('div');
   const isMe = senderId && myPeerId && senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
+  row.dataset.senderId = senderId || '';
 
   const wrap = document.createElement('div'); wrap.className = 'wrap';
-  const label = document.createElement('div'); label.className = 'name-label';
-  const who = nickname || (senderId ? shortId(senderId) : 'room');
-  const when = new Date(ts || nowMs()).toLocaleString();
-  label.textContent = `${who} • ${when}${verified === false ? ' • ⚠︎ unverified' : ''}`;
 
+  // Avatar chip
+  const avatar = document.createElement('div'); avatar.className = 'msg-avatar';
+  wrap.appendChild(avatar);
+
+  // Name label (uses profile; fallback to short id or 'room')
+  const label = document.createElement('div'); label.className = 'name-label';
+  const whoFallback = senderId ? shortId(senderId) : 'room';
+  label.textContent = `${whoFallback} • ${new Date(ts || nowMs()).toLocaleString()}${verified === false ? ' • ⚠︎ unverified' : ''}`;
+  wrap.appendChild(label);
+
+  // Bubble
   const bubble = document.createElement('div'); bubble.className = 'bubble';
   bubble.textContent = text;
+  wrap.appendChild(bubble);
 
-  wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+  row.appendChild(wrap);
   if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
   else ui.messages.appendChild(row);
+
+  // Try to fill profile bits asynchronously
+  const active = { serverUrl: VL?.serverUrl, roomId: VL?.roomId };
+  if (senderId && active.serverUrl && active.roomId) {
+    requestProfileIfMissing(active.serverUrl, active.roomId, senderId);
+    fillAvatarAndName(avatar, label, active.serverUrl, active.roomId, senderId, ts);
+  }
   return row;
 }
 
@@ -1584,6 +1775,7 @@ function connect(sc) {
 
       sc.authed.add(room.id);
       sc.ws.send(JSON.stringify({ type: 'announce', room_id: room.id, peer_id: myPeerId }));
+      sendMyProfile(sc.url, room.id);
 
       const lastTs = await msgGetLastTs(sc.url, room.id);
       const since = lastTs > 0 ? (lastTs + 1) : sevenDaysAgoMs();
@@ -1596,6 +1788,18 @@ function connect(sc) {
         await initVirtualRoomView(sc.url, room.id);
         setStatus(statuses.connected);
       }
+
+    } else if (m.type === 'profile-notify') {
+      await applyProfileCipher(sc.url, m.room_id, m.sender_id, m.ciphertext);
+      clearProfileRetry(sc.url, m.room_id, m.sender_id);	
+
+    } else if (m.type === 'profile-retrieve') {
+      await applyProfileCipher(sc.url, m.room_id, m.sender_id, m.ciphertext);
+      clearProfileRetry(sc.url, m.room_id, m.sender_id);
+	
+    } else if (m.type === 'profile-none') {
+      // no profile available; you could cache a sentinel if you like
+      scheduleProfileRetry(sc.url, m.room_id, m.sender_id);
 
     } else if (m.type === 'history') {
       const serverUrl = sc?.url || normServer(getCurrentRoom()?.server);
@@ -1971,36 +2175,92 @@ function pruneBottomIfNeeded() {
   while (el.children.length > MAX_DOM_MESSAGES) el.removeChild(el.lastChild);
 }
 
+async function fillAvatarAndName(avatarEl, labelEl, serverUrl, roomId, senderId, ts) {
+  const meta = await profileMetaGet(serverUrl, roomId, senderId);
+  // Update name if present
+  if (meta?.name) {
+    const base = `${meta.name} • ${new Date(ts || nowMs()).toLocaleString()}`;
+    labelEl.textContent = base;
+  }
+  // Update avatar if present
+  if (meta?.avatarHash) {
+    const blob = await idbGet(meta.avatarHash);
+    if (blob) {
+      avatarEl.innerHTML = '';
+      const url = URL.createObjectURL(blob);
+      const img = document.createElement('img');
+      img.onload = () => URL.revokeObjectURL(url);
+      img.src = url;
+      avatarEl.appendChild(img);
+      return;
+    }
+  }
+  // Fallback: keep gray circle (optional initial)
+  avatarEl.textContent = '';
+}
+
+async function updateMessagesForSender(serverUrl, roomId, senderId) {
+  const meta = await profileMetaGet(serverUrl, roomId, senderId);
+  const children = Array.from(ui.messages.children);
+  for (const row of children) {
+    if (row.dataset.senderId !== senderId) continue;
+    const wrap = row.querySelector('.wrap');
+    const avatarEl = wrap?.querySelector('.msg-avatar');
+    const labelEl  = wrap?.querySelector('.name-label');
+    if (avatarEl && labelEl) {
+      const ts = (labelEl.textContent.match(/• (.*)$/) ? Date.parse(RegExp.$1) : nowMs());
+      fillAvatarAndName(avatarEl, labelEl, serverUrl, roomId, senderId, ts);
+    }
+  }
+}
+
 function buildRowFromRecord(rec) {
+  // ---- GAP ROW (unchanged, except class names kept consistent) ----
+  if (rec.kind === 'gap') {
+    const row = document.createElement('div');
+    row.className = 'row other';
+
+    const wrap  = document.createElement('div'); wrap.className = 'wrap';
+    const label = document.createElement('div'); label.className = 'name-label';
+    label.textContent = '';
+
+    const bubble = document.createElement('div'); bubble.className = 'bubble';
+    const count = Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0));
+    bubble.textContent = `${count} messages missing`;
+
+    wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+    return { node: row, bubble: null, meta: null };
+  }
+
+  // ---- NORMAL ROW (text/file) ----
   const row = document.createElement('div');
   const isMe = rec.senderId && myPeerId && rec.senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
-
   if (rec.id) row.dataset.msgId = rec.id;
+  if (rec.senderId) row.dataset.senderId = rec.senderId;
 
   const wrap  = document.createElement('div'); wrap.className = 'wrap';
+
+  // Avatar holder (will be filled by profile later)
+  const avatar = document.createElement('div');
+  avatar.className = 'msg-avatar';           // style optional; safe if missing
+  wrap.appendChild(avatar);
+
+  // Name/when label (fallback text now; will be replaced on profile fill)
   const label = document.createElement('div'); label.className = 'name-label';
   const who = rec.nickname || (rec.senderId ? shortId(rec.senderId) : 'room');
   const when = new Date(rec.ts || nowMs()).toLocaleString();
   label.textContent = `${who} • ${when}${rec.verified === false ? ' • ⚠︎ unverified' : ''}`;
+  wrap.appendChild(label);
 
+  // Bubble
   const bubble = document.createElement('div'); bubble.className = 'bubble';
 
   let fileMeta = null;
-  if (rec.kind === 'gap') {
-    const row = document.createElement('div');
-    row.className = 'row other';
-    const wrap = document.createElement('div'); wrap.className = 'wrap';
-    const label = document.createElement('div'); label.className = 'name-label';
-    label.textContent = '';
-    const bubble = document.createElement('div'); bubble.className = 'bubble';
-    const count = Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0));
-    bubble.textContent = `${count} messages missing`;
-    wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
-    return { node: row, bubble: null, meta: null };
-  } else if (rec.kind === 'text') {
+  if (rec.kind === 'text') {
     bubble.textContent = rec.text;
   } else {
+    // file
     fileMeta = rec.meta;
     bubble.dataset.hash = fileMeta.hash;
     if (fileMeta.mime && fileMeta.mime.startsWith('image/')) {
@@ -2012,7 +2272,20 @@ function buildRowFromRecord(rec) {
     }
   }
 
-  wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+  wrap.appendChild(bubble);
+  row.appendChild(wrap);
+
+  // ---- Profile hooks (fills avatar + name when available) ----
+  // 1) Ask for a profile after a tiny delay (reduces “none” races on fast peers)
+  if (rec.senderId && VL?.serverUrl && VL?.roomId) {
+    const serverUrl = VL.serverUrl;
+    const roomId    = VL.roomId;
+    setTimeout(() => requestProfileIfMissing(serverUrl, roomId, rec.senderId), 250);
+
+    // 2) Immediate best-effort fill from cache; it will re-fill again on notify/retrieve
+    fillAvatarAndName?.(avatar, label, serverUrl, roomId, rec.senderId, rec.ts);
+  }
+
   return { node: row, bubble: (rec.kind === 'file') ? bubble : null, meta: fileMeta };
 }
 
@@ -2173,6 +2446,17 @@ function appendLiveRecord(rec) {
   const autoscroll = nearBottom();
   const built = buildRowFromRecord(rec);
   ui.messages.appendChild(built.node);
+
+  // ↓ ensure live messages also trigger a profile fetch/fill
+  if (rec.senderId && VL?.serverUrl && VL?.roomId) {
+    setTimeout(() => requestProfileIfMissing(VL.serverUrl, VL.roomId, rec.senderId), 250);
+    fillAvatarAndName?.(
+      built.node.querySelector('.msg-avatar'),
+      built.node.querySelector('.name-label'),
+      VL.serverUrl, VL.roomId, rec.senderId, rec.ts
+    );
+  }
+
   if (built.bubble) {
     renderFileIfAvailable(built.bubble, built.meta).then(ok => {
       if (!ok) { showPendingBubble(built.bubble, built.meta); requestFile(VL.roomId, built.meta.hash); }
@@ -2252,6 +2536,11 @@ async function saveProfile() {
       // No change to the toggle; just save the other fields
       saveSettings();
     }
+    for (const [, sc] of servers) {
+      for (const rid of sc.authed || []) {
+        try { await sendMyProfile(sc.url, rid); } catch {}
+      }
+    }
   } finally {
     closeProfile();
   }
@@ -2259,8 +2548,11 @@ async function saveProfile() {
 
 async function handleAvatarPicked(file) {
   if (!file) return;
-  // Optional: resize/compress here if you want. For now store as-is.
-  await profilePut('avatar', file);
+  const resized = await normalizeAvatarSize(file);
+  console.warn('[handleAvatarPicked] image size:', resized);
+  await profilePut('avatar', resized);                     // keep latest avatar blob for self-preview
+  const hash = await sha256_b64u(resized);
+  await idbPut(hash, resized);                             // reuse the files DB as an avatar cache
   await refreshAvatarPreview();
 }
 
