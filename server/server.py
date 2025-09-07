@@ -12,6 +12,8 @@ ALLOWED_ORIGINS = set(
     [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://rickard.armiento.se,http://localhost:8000,http://127.0.0.1:8000").split(",") if o.strip()]
 )
 MAX_PAYLOAD_SIZE = 128 * 1024  # bytes (base64 will be ~1.33x)
+INVITE_WAIT = {}   # { str: (ws, int) }
+INVITE_TTL_MS = int(os.environ.get("INVITE_TTL_MS", "180000"))  # 3 minutes default
 
 app = Flask(__name__)
 APP = app
@@ -179,6 +181,13 @@ def _ensure_peer_maps_for(room_id: str):
     ROOM_CONNECTIONS.setdefault(room_id, set())
     ROOM_PEERS.setdefault(room_id, {})
 
+# ---------- Invitations --------
+
+def _invite_gc(now_ms):
+    remove = [h for h, (_, exp) in INVITE_WAIT.items() if exp <= now_ms]
+    for h in remove:
+        INVITE_WAIT.pop(h, None)
+
 # ---------- WebSocket (no room in URL; subscribe per room) ----------
 @sock.route('/ws')
 def ws_handler(ws):
@@ -214,6 +223,53 @@ def ws_handler(ws):
             if t == 'ping':
                 ws.send(json.dumps({'type': 'pong', 'ts': now_ms()}))
                 continue
+
+            # ---------- Invite (joiner opens waiting slot) ----------
+            if t == 'invite-open':
+                hash_b64 = m.get('hash')
+                if not _is_b64url(hash_b64):
+                    ws.send(json.dumps({'type': 'error', 'error': 'bad_hash'}))
+                    continue
+                now = now_ms()
+                if _too_many('invite_open', _peer_ip(ws), None, limit=60):
+                    ws.send(json.dumps({'type': 'error', 'error': 'rate_limited'}))
+                    continue
+                _invite_gc(now)
+                # Replace previous waiter (if any)
+                prev = INVITE_WAIT.get(hash_b64)
+                if prev and prev[0] is not ws:
+                    try: prev[0].close()
+                    except Exception: pass
+                INVITE_WAIT[hash_b64] = (ws, now + INVITE_TTL_MS)
+                ws.send(json.dumps({'type': 'invite-waiting', 'hash': hash_b64, 'ttl': INVITE_TTL_MS}))
+                continue
+
+            # ---------- Invite (inviter sends sealed payload for hash) ----------
+            if t == 'invite-send':
+                hash_b64 = m.get('hash')
+                ct_b64 = m.get('ciphertext')
+                if not (_is_b64url(hash_b64) and isinstance(ct_b64, str) and len(ct_b64) <= 8192):
+                    ws.send(json.dumps({'type': 'error', 'error': 'bad_invite'}))
+                    continue
+                now = now_ms()
+                if _too_many('invite_send', _peer_ip(ws), None, limit=200):
+                    ws.send(json.dumps({'type': 'error', 'error': 'rate_limited'}))
+                    continue
+                _invite_gc(now)
+                waiter = INVITE_WAIT.pop(hash_b64, None)
+                if not waiter:
+                    ws.send(json.dumps({'type': 'error', 'error': 'no_waiter'}))
+                    continue
+                to_ws, _exp = waiter
+                try:
+                    to_ws.send(json.dumps({'type': 'invite-deliver', 'ciphertext': ct_b64}))
+                    try: to_ws.close()
+                    except Exception: pass
+                except Exception:
+                    ws.send(json.dumps({'type': 'error', 'error': 'deliver_failed'}))
+                # No response needed; one-shot fire-and-forget
+                continue
+            
 
             # ---------- Subscribe (per room) -> send auth challenge ----------
             if t == 'subscribe':
@@ -456,6 +512,10 @@ def ws_handler(ws):
     except Exception as e:
         LOG("WS error", str(e))
     finally:
+        # remove any invites registered by this ws
+        for h, (w, _exp) in list(INVITE_WAIT.items()):
+            if w is ws:
+                INVITE_WAIT.pop(h, None)
         # Full cleanup of this socket from all structures
         for rid in list(SUBSCRIPTIONS.get(ws, set())):
             try:
@@ -477,6 +537,9 @@ def ws_handler(ws):
             pass
 
 # ---------- utils ----------
+def _is_b64url(s: str) -> bool:
+    return isinstance(s, str) and all(c.isalnum() or c in '-_' for c in s)
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 

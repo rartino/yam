@@ -162,6 +162,14 @@ function randomB64u(n = 32) {
   const a = new Uint8Array(n); crypto.getRandomValues(a);
   return b64u(a); // you already have b64u(..) in your codebase
 }
+function hostFromUrl(u){
+  try { const x = new URL(normServer(u)); return x.host; } catch { return u; }
+}
+async function sha256_b64u_bytes(bytes){
+  const buf = (bytes instanceof Uint8Array) ? bytes : new Uint8Array(bytes);
+  const digest = await crypto.subtle.digest('SHA-256', buf);
+  return b64u(new Uint8Array(digest));
+}
 
 const _subtle = crypto.subtle;
 const subtleImportKey = _subtle.importKey.bind(_subtle);
@@ -334,6 +342,19 @@ async function secretGet(roomId) {
     req.onsuccess = () => res(req.result || null);
     req.onerror = () => rej(req.error);
   });
+}
+
+// yam-v1:<host[:port]>:<pk_b64u>
+function encodeInviteCode(host, pkB64u){
+  return `yam-v1:${host}:${pkB64u}`;
+}
+function parseInviteCode(code){
+  const s = (code || '').trim();
+  // allow accidental "yam-v1://" prefix too
+  const cleaned = s.replace(/^yam-v1:\/\//, 'yam-v1:');
+  const m = /^yam-v1:([^:]+):([A-Za-z0-9_-]+)$/.exec(cleaned);
+  if (!m) return null;
+  return { host: m[1], pkB64u: m[2] };
 }
 
 async function clearRoomData(serverUrl, roomId){
@@ -1262,113 +1283,82 @@ async function handleWebRtcIce(serverUrl, msg) {
 let invitePC = null, inviteDC = null;
 
 async function openInviteDialog(){
-  const room = getCurrentRoom();
-  if (!room) { alert('No active room'); return; }
-  await ensureSodium();
-
-  if (invitePC) { try { invitePC.close(); } catch{} invitePC = null; }
-  const pc = new RTCPeerConnection(RTC_CONFIG);
-  invitePC = pc;
-
-  pc.oniceconnectionstatechange = () => dbg('RTC/INV iceState', pc.iceConnectionState);
-  pc.onconnectionstatechange = () => dbg('RTC/INV pcState', pc.connectionState);
-
-  const dc = pc.createDataChannel('invite');
-  inviteDC = dc;
-  inviteDC.onopen = () => dbg('RTC/INV', 'dc open');
-  inviteDC.onmessage = (evt) => {
-    // (Optional) early ACKs before finishInviteDialog attaches handler
-    try {
-      const txt = typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data);
-      const o = JSON.parse(txt);
-      if (o && o.kind === 'invite-ack') dbg('RTC/INV', 'early ack');
-    } catch {}
-  };
-
-  // Build offer (no trickle; short gather window)
-  const offer = await pc.createOffer({ offerToReceiveAudio:false, offerToReceiveVideo:false });
-  await pc.setLocalDescription(offer);
-
-  const { sdp, candidates } = await gatherIceCandidates(pc, 1200);
-  inv.offerTA.value = packSignal({ type:'offer', sdp, candidates });
-  inv.answerTA.value = '';
-
+  // Reuse existing UI; user pastes the *invitee* code here.
+  const r = getCurrentRoom();
+  if (!r) { alert('No active room'); return; }
+  inv.offerTA.value = '';       // where inviter will paste "yam-v1:host:pk"
+  inv.answerTA.value = '';      // not used anymore
   inv.dlg.showModal();
 }
 
 async function finishInviteDialog(){
   const room = getCurrentRoom();
-  if (!room) return;
+  if (!room) { alert('No active room'); return; }
+  const code = (inv.offerTA.value || '').trim();
+  const parsed = parseInviteCode(code);
+  if (!parsed) { alert('Invalid code. Expect: yam-v1:<host>:<pk>'); return; }
 
-  const code = (inv.answerTA.value || '').trim();
-  if (!code) { alert('Paste response code first'); return; }
-  const msg = unpackSignal(code);
-  if (!msg || msg.type !== 'answer' || !msg.sdp) { alert('Invalid response code'); return; }
-
-  try {
-    await invitePC.setRemoteDescription({ type: 'answer', sdp: msg.sdp });
-    dbg('RTC/INV', 'answer applied');
-
-    const ansCands = Array.isArray(msg.candidates) ? msg.candidates : [];
-    for (const c of ansCands) {
-      try { await invitePC.addIceCandidate(new RTCIceCandidate(c)); }
-      catch (e) { dbg('RTC/INV addIce answer', e); }
-    }
-
-    const edSkBytes = await getRoomPrivateKeyBytes(room.id);
-    await ensureSodium(); // needed for b64u(..) using sodium’s encoder
-    const roomSkB64 = b64u(edSkBytes);
-
-    const sendRoom = async () => {
-      dbg('RTC/INV', 'dc open -> send room');
-      const active = getCurrentRoom(); // in case user switched during flow
-      const payload = {
-        ver: 1,
-        kind: 'room-invite',
-        room: {
-          id: active.id,
-          name: active.name,
-          server: normServer(active.server),
-          roomSkB64,
-          createdAt: active.createdAt || nowMs()
-        }
-      };
-      inviteDC.send(JSON.stringify(payload));
-    };
-
-    let acked = false;
-    inviteDC.onmessage = (evt) => {
-      try {
-        const txt = typeof evt.data === 'string' ? evt.data : new TextDecoder().decode(evt.data);
-        const o = JSON.parse(txt);
-        if (o && o.kind === 'invite-ack') {
-          acked = true;
-          inv.dlg.close();
-          try { inviteDC.close(); } catch {}
-          try { invitePC.close(); } catch {}
-        }
-      } catch {}
-    };
-
-    if (inviteDC.readyState === 'open') {
-      await sendRoom();
-    } else {
-      inviteDC.onopen = sendRoom; // overwrite earlier noop handler is fine
-    }
-
-    setTimeout(() => {
-      if (!acked) {
-        dbg('RTC/INV', 'no ack timeout; closing');
-        try { inviteDC.close(); } catch {}
-        try { invitePC.close(); } catch {}
-        inv.dlg.close();
-      }
-    }, 5000);
-
-  } catch (e) {
-    console.error(e);
-    alert('Failed to apply response');
+  // Host sanity: code host must match this room's server host
+  const expectedHost = hostFromUrl(room.server);
+  if (parsed.host !== expectedHost) {
+    alert(`Server mismatch.\nCode host: ${parsed.host}\nRoom host: ${expectedHost}`);
+    return;
   }
+
+  await ensureSodium();
+
+  // Build sealed envelope
+  const inviteePkCurve = fromB64u(parsed.pkB64u);      // 32 bytes Curve25519
+  if (!(inviteePkCurve instanceof Uint8Array) || inviteePkCurve.length !== 32) {
+    alert('Bad invitee public key'); return;
+  }
+
+  // room secret: Ed25519 64B; verify and include
+  const skBytes = await getRoomPrivateKeyBytes(room.id);
+  const pkBytes = derivePubFromSk(skBytes);
+  const rid     = b64u(pkBytes);
+  if (rid !== room.id) { alert('Local room secret does not match room id'); return; }
+
+  const envelope = {
+    v: 1,
+    k: 'yam-invite',         // short tag
+    t0: nowMs(),
+    room: {
+      id: rid,
+      name: room.name || 'Room',
+      sk: b64u(skBytes),     // Ed25519 64B, base64url
+    },
+    // Optional inviter authenticity (detached signature over plaintext bytes)
+    // Keep it small by signing SHA-256(envelope_bytes)
+  };
+
+  // Canonical bytes to sign/seal
+  const encBytes = utf8ToBytes(JSON.stringify(envelope));
+
+  // (Optional) sign by device identity for recipient verification
+  // small and server-opaque (sign hash, not plaintext):
+  const digest = new Uint8Array(await crypto.subtle.digest('SHA-256', encBytes));
+  const sig = sodium.crypto_sign_detached(digest, myIdSk);
+  envelope.inv = { pk: b64u(myIdPk), sig: b64u(sig) };
+
+  const encBytes2 = utf8ToBytes(JSON.stringify(envelope));
+  const sealed = sodium.crypto_box_seal(encBytes2, inviteePkCurve);
+  const ciphertextB64 = b64u(sealed);
+
+  // Hash(invitee_pk) key
+  const hash = await sha256_b64u_bytes(inviteePkCurve);
+
+  // Send via existing WS to THIS room's server
+  const sc = servers.get(normServer(room.server));
+  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN) {
+    alert('Not connected to server'); return;
+  }
+
+  if (DEBUG_SIG) dbg('SIG/TX', 'invite-send', { host: parsed.host, hash: hash.slice(0,12)+'…' });
+  sc.ws.send(JSON.stringify({ type: 'invite-send', hash, ciphertext: ciphertextB64 }));
+
+  // UX: close dialog
+  inv.dlg.close();
 }
 
 // ====== Server connection mgmt ======
@@ -1693,115 +1683,115 @@ async function openRoom(roomId){
 
 let joinPC = null, joinDC = null;
 
-function openJoinDialog(){
-  join.offerTA.value = '';
-  join.answerTA.value = '';
+let _joinWait = { ws: null, curvePk: null, curveSk: null, hash: null, host: null };
+
+async function openJoinDialog(){
+  // Generate a temporary Curve25519 keypair (32B pk/sk)
+  await ensureSodium();
+
+  // Choose server host: default to your standard if you don't add a field in UI
+  const defaultServer = 'https://rartino.pythonanywhere.com';
+  const host = hostFromUrl(defaultServer);
+
+  const kp = sodium.crypto_box_keypair();
+  _joinWait.curvePk = kp.publicKey;
+  _joinWait.curveSk = kp.privateKey;
+  _joinWait.host = host;
+  _joinWait.hash = await sha256_b64u_bytes(_joinWait.curvePk);
+
+  // Render the compact code into the existing textarea
+  join.offerTA.value = encodeInviteCode(host, b64u(_joinWait.curvePk));
+  join.answerTA.value = ''; // not used anymore
+
+  // Open a dedicated WS to that server and register invite-open
+  if (_joinWait.ws) { try { _joinWait.ws.close(); } catch{} }
+  const wsUrl = normServer(defaultServer).replace(/^http/i,'ws') + '/ws';
+  const w = new WebSocket(wsUrl);
+  _joinWait.ws = w;
+
+  w.onopen = () => {
+    if (DEBUG_SIG) dbg('SIG/TX', 'invite-open', { host, hash: _joinWait.hash.slice(0,12)+'…' });
+    w.send(JSON.stringify({ type: 'invite-open', hash: _joinWait.hash }));
+  };
+  w.onerror = () => dbg('INVITE', 'waiting ws error');
+  w.onclose = () => dbg('INVITE', 'waiting ws closed');
+
+  w.onmessage = async (evt) => {
+    const m = JSON.parse(evt.data);
+    if (DEBUG_SIG) dbg('SIG/RX', m.type, m.type === 'invite-deliver' ? { ciphertextLen: (m.ciphertext||'').length } : m);
+    if (m.type === 'invite-waiting') {
+      // optional ack
+    } else if (m.type === 'invite-deliver') {
+      try {
+        const sealed = fromB64u(m.ciphertext);
+        const plain = sodium.crypto_box_seal_open(sealed, _joinWait.curvePk, _joinWait.curveSk);
+        const obj = JSON.parse(bytesToUtf8(plain));
+
+        if (!obj || obj.k !== 'yam-invite' || !obj.room || !obj.room.sk || !obj.room.id) {
+          alert('Bad invite payload'); return;
+        }
+
+        // Optional inviter authenticity check (sig over SHA-256 of envelope)
+        if (obj.inv && obj.inv.pk && obj.inv.sig) {
+          try {
+            const envBytes = utf8ToBytes(JSON.stringify({ ...obj, inv: undefined }));
+            const d = new Uint8Array(await crypto.subtle.digest('SHA-256', envBytes));
+            const pk = fromB64u(obj.inv.pk);
+            const sg = fromB64u(obj.inv.sig);
+            const ok = sodium.crypto_sign_verify_detached(sg, d, pk);
+            if (!ok) console.warn('Invite signature failed verification');
+          } catch {}
+        }
+
+        // Validate that secret matches id
+        await ensureSodium();
+        const skBytes = fromB64u(obj.room.sk);
+        if (!(skBytes instanceof Uint8Array) || skBytes.length !== 64) { alert('Invite secret invalid'); return; }
+        const pkBytes = derivePubFromSk(skBytes);
+        const rid = b64u(pkBytes);
+        if (rid !== obj.room.id) { alert('Invite id mismatch'); return; }
+
+        // Upsert room locally
+        const serverUrl = 'https://' + _joinWait.host; // re-hydrate
+        const existing = rooms.find(x => x.id === rid);
+        if (!existing) {
+          rooms.push({ id: rid, name: obj.room.name || 'Room', server: serverUrl, roomId: rid, createdAt: nowMs() });
+          saveRooms();
+        }
+        await secretPut(rid, await sealSecret(b64u(skBytes)));
+
+        // Connect & open room
+        ensureServerConnection(serverUrl);
+        await registerRoomIfNeeded({ id: rid, server: serverUrl });
+        await openRoom(rid);
+
+        // Clean up
+        try { _joinWait.ws.close(); } catch {}
+        join.dlg.close();
+      } catch (e) {
+        console.error(e);
+        alert('Failed to decrypt invite');
+      }
+    } else if (m.type === 'error') {
+      alert(`Server error: ${m.error}`);
+    }
+  };
+
   join.dlg.showModal();
 }
 
 async function generateJoinAnswer(){
-  const code = (join.offerTA.value || '').trim();
-  const msg = unpackSignal(code);
-  if (!msg || msg.type !== 'offer' || !msg.sdp) { alert('Invalid invitation code'); return; }
-
-  if (joinPC) { try { joinPC.close(); } catch{} joinPC = null; }
-  const pc = new RTCPeerConnection(RTC_CONFIG);
-  joinPC = pc;
-
-  pc.oniceconnectionstatechange = () => dbg('RTC/JOIN iceState', pc.iceConnectionState);
-  pc.onconnectionstatechange = () => dbg('RTC/JOIN pcState', pc.connectionState);
-
-  pc.ondatachannel = (evt) => {
-    const dc = evt.channel;
-    joinDC = dc;
-    dc.onopen = () => dbg('RTC/JOIN', 'dc open');
-
-    dc.onmessage = async (evt) => {
-      try {
-        const text = (typeof evt.data === 'string') ? evt.data : new TextDecoder().decode(evt.data);
-        const obj = JSON.parse(text);
-
-        if (obj && obj.kind === 'room-invite' && obj.room) {
-          const r = obj.room;
-
-          // ---- Validate secret & derived id
-          await ensureSodium();
-          if (typeof r.roomSkB64 !== 'string') { alert('Invalid room code (secret missing)'); return; }
-          const skBytes = fromB64u(r.roomSkB64);
-          if (!(skBytes instanceof Uint8Array) || skBytes.length !== 64) {
-            alert('Invalid room code (bad secret format)'); return;
-          }
-          const pk = derivePubFromSk(skBytes);
-          const derived = b64u(pk);
-          if (derived !== r.id) { alert('Invalid room code (mismatched id)'); return; }
-
-          // ---- Upsert room (without secret on the object)
-          const serverUrl = normServer(r.server);
-          const existing = rooms.find(x => x.id === r.id);
-          if (existing) {
-            // update name/server if they changed (optional)
-            let changed = false;
-            if (r.name && existing.name !== r.name) { existing.name = r.name; changed = true; }
-            if (serverUrl && normServer(existing.server) !== serverUrl) { existing.server = serverUrl; changed = true; }
-            if (changed) saveRooms();
-          } else {
-            rooms.push({
-              id: r.id,
-              name: r.name || 'New room',
-              server: serverUrl,
-              roomId: r.id,
-              createdAt: r.createdAt || nowMs()
-            });
-            saveRooms();
-          }
-          await secretPut(r.id, await sealSecret(r.roomSkB64));
-
-          // ---- Connect & open
-          ensureServerConnection(serverUrl);
-          await registerRoomIfNeeded({ id: r.id, server: serverUrl });
-          await openRoom(r.id);
-
-          // Ack so inviter can auto-close their dialog
-          try { dc.send(JSON.stringify({ kind: 'invite-ack' })); } catch {}
-
-          // Clean up
-          join.dlg.close();
-          setTimeout(() => {
-            try { dc.close(); } catch {}
-            try { pc.close(); } catch {}
-            if (joinDC === dc) joinDC = null;
-            if (joinPC === pc) joinPC = null;
-          }, 300);
-        }
-      } catch (e) {
-        dbg('RTC/JOIN', 'message parse error', e);
-      }
-    };
-  };
-
-  // Apply inviter offer + any early ICE
-  await pc.setRemoteDescription({ type:'offer', sdp: msg.sdp });
-
-  const offerCands = Array.isArray(msg.candidates) ? msg.candidates : [];
-  for (const c of offerCands) {
-    try { await pc.addIceCandidate(new RTCIceCandidate(c)); }
-    catch (e) { dbg('RTC/JOIN addIce offer', e); }
-  }
-
-  // Create/Set local answer
-  const answer = await pc.createAnswer();
-  await pc.setLocalDescription(answer);
-
-  // Short ICE gather window for compact response code
-  const { sdp, candidates } = await gatherIceCandidates(pc, 1500);
-  const answerCode = packSignal({ type: 'answer', sdp, candidates });
-  join.answerTA.value = answerCode;
+  try { await navigator.clipboard.writeText(join.offerTA.value); }
+  catch {}
 }
 
-join.btnClose?.addEventListener('click', () => join.dlg.close());
+join.btnClose?.addEventListener('click', () => {
+  try { _joinWait.ws && _joinWait.ws.close(); } catch{}
+  join.dlg.close();
+});
 join.btnGen?.addEventListener('click', generateJoinAnswer);
 join.btnCopy?.addEventListener('click', async () => {
-  try { await navigator.clipboard.writeText(join.answerTA.value); join.btnCopy.textContent='Copied'; setTimeout(()=>join.btnCopy.textContent='Copy',1000);} catch {}
+  try { await navigator.clipboard.writeText(join.offerTA.value); join.btnCopy.textContent='Copied'; setTimeout(()=>join.btnCopy.textContent='Copy',1000);} catch {}
 });
 
 // ---- Virtual list state for current room ----
@@ -2221,11 +2211,12 @@ ui.fileInput?.addEventListener('change', async (e) => {
   ui.fileInput.value = '';
 });
 
+// Invitation dialog
 inv.btnClose?.addEventListener('click', () => inv.dlg.close());
 inv.btnCopyOffer?.addEventListener('click', async () => {
   try { await navigator.clipboard.writeText(inv.offerTA.value); inv.btnCopyOffer.textContent='Copied'; setTimeout(()=>inv.btnCopyOffer.textContent='Copy',1000);} catch {}
 });
-inv.btnRefreshOffer?.addEventListener('click', openInviteDialog);
+inv.btnRefreshOffer?.addEventListener('click', () => { inv.offerTA.value = ''; });
 inv.btnFinish?.addEventListener('click', finishInviteDialog);
 
 // Settings dropdown
