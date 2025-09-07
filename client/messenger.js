@@ -1,4 +1,4 @@
-import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl} from './utils.js';
+import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId} from './utils.js';
 import {loadSettings, saveSettings} from './settings.js';
 
 async function ensureSodium() { await sodium.ready; }
@@ -152,6 +152,7 @@ cfg.btnRemove.addEventListener('click', async () => {
     document.getElementById('currentRoomName').textContent = 'No room';
     openCreateRoomDialog();
   }
+  ROOM_KEYS.delete(r.id);
 });
 
 // Room dropdown interactions
@@ -543,8 +544,28 @@ async function msgGetLastSeq(serverUrl, roomId){
 ///////////////////////
 
 const ROOMS_KEY = 'secmsg_rooms_v1';
+const ROOM_KEYS = new Map(); // (roomId -> { edSk, edPk, curvePk, curveSk })
+
 let rooms = [];            // [{id, name, server, roomSkB64, roomId, createdAt}]
 let currentRoomId = null;  // string id = roomId (ed25519 pk b64u)
+
+async function getRoomKeys(roomId) {
+  await ensureSodium();
+  let k = ROOM_KEYS.get(roomId);
+  if (k) return k;
+
+  const edSk = await getRoomPrivateKeyBytes(roomId); // 64 bytes
+  if (!(edSk instanceof Uint8Array) || edSk.length !== 64) {
+    throw new Error('invalid-room-secret');
+  }
+  const edPk    = derivePubFromSk(edSk); // 32 bytes
+  const curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(edPk);
+  const curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(edSk);
+
+  k = { edSk, edPk, curvePk, curveSk };
+  ROOM_KEYS.set(roomId, k);
+  return k;
+}
 
 async function msgDeleteRoom(serverUrl, roomId){
   const list = await msgListByRoom(serverUrl, roomId);
@@ -798,7 +819,7 @@ async function sendMyProfile(serverUrl, roomId) {
   try {
     await ensureSodium();
     const profObj = await buildMyProfilePayload();
-    const ctB64 = b64u(sodium.crypto_box_seal(utf8ToBytes(JSON.stringify(profObj)), curvePk));
+    const ctB64 = await encryptStringForRoom(roomId, JSON.stringify(profObj));
     const sc = servers.get(normServer(serverUrl));
     if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN || !sc.authed?.has(roomId)) return;
     sc.ws.send(JSON.stringify({
@@ -816,7 +837,7 @@ async function applyProfileCipher(serverUrl, roomId, senderId, ctB64) {
   await ensureSodium();
   let obj;
   try {
-    const pt = decryptToString(ctB64);
+    const pt = await decryptToStringForRoom(roomId, ctB64);
     obj = JSON.parse(pt);
   } catch {
     return; // ignore malformed
@@ -1603,15 +1624,17 @@ function appendLiveRecord(rec) {
 // ENCRYPTION
 ///////////////////////
 
-function encryptStringForRoom(str) {
+async function encryptStringForRoom(roomId, str) {
+  const { curvePk } = await getRoomKeys(roomId);
   const cipher = sodium.crypto_box_seal(sodium.from_string(str), curvePk);
   return b64u(cipher);
 }
-function decryptToString(cipherB64u) {
-  const cipher = fromB64u(cipherB64u);
+async function decryptToStringForRoom(roomId, ciphertextB64) {
+  await ensureSodium();
+  const { curvePk, curveSk } = await getRoomKeys(roomId);
   try {
-    const plain = sodium.crypto_box_seal_open(cipher, curvePk, curveSk);
-    return sodium.to_string(plain);
+    const pt = sodium.crypto_box_seal_open(fromB64u(ciphertextB64), curvePk, curveSk);
+    return bytesToUtf8(pt);
   } catch {
     return '[unable to decrypt]';
   }
@@ -1631,11 +1654,6 @@ const subtleDeriveKey = _subtle.deriveKey.bind(_subtle);
 const subtleEncrypt   = _subtle.encrypt.bind(_subtle);
 const subtleDecrypt   = _subtle.decrypt.bind(_subtle);
 
-let edPk = null;   // room public key (Uint8Array) — set per active room when switching
-let edSk = null;   // room private key (Uint8Array)
-let curvePk = null;
-let curveSk = null;
-
 let myIdPk = null; // device identity public key (Uint8Array)
 let myIdSk = null; // device identity private key (Uint8Array)
 let myPeerId = null; // base64url of myIdPk
@@ -1646,14 +1664,7 @@ function derivePubFromSk(sk) {
 }
 
 async function setCryptoForRoom(room) {
-  edSk = await getRoomPrivateKeyBytes(room.id);
-  if (!(edSk instanceof Uint8Array) || edSk.length !== 64) {
-    console.error('Room secret must be 64 bytes; got', edSk && edSk.length);
-    throw new Error('invalid-room-secret');
-  }
-  edPk = derivePubFromSk(edSk);
-  curvePk = sodium.crypto_sign_ed25519_pk_to_curve25519(edPk);
-  curveSk = sodium.crypto_sign_ed25519_sk_to_curve25519(edSk);
+  await getRoomKeys(room.id);
 }
 
 async function sealSecret(roomSkB64) {
@@ -1719,7 +1730,7 @@ const servers = new Map();
 const lastSeqSeen = new Map(); // key: roomKey(serverUrl, roomId) -> integer
 
 async function sendTextMessage(room, text) {
-  const ciphertextB64 = encryptStringForRoom(text);
+  const ciphertextB64 = await encryptStringForRoom(room.id, text);
   const payload = {
     type: 'send',
     room_id: room.id,
@@ -1740,7 +1751,7 @@ async function sendTextMessage(room, text) {
 
 async function sendFileMetadata(room, meta) {
   const metaJson = JSON.stringify({ kind: 'file', ...meta });
-  const ciphertextB64 = encryptStringForRoom(metaJson);
+  const ciphertextB64 = await encryptStringForRoom(room.id, metaJson);
   const payload = {
     type: 'send',
     room_id: room.id,
@@ -1760,13 +1771,13 @@ async function sendFileMetadata(room, meta) {
 }
 
 async function handleIncoming(serverUrl, m, fromHistory = false) {
-  // Decrypt
-  const pt = decryptToString(m.ciphertext);
-
+    
   // Figure out which room this belongs to
-  const roomId = m.room_id || currentRoomId;
+  const roomId = m.room_id;
+  if (!roomId) return; 
+  const pt = await decryptToStringForRoom(roomId, m.ciphertext);
   const rKey   = roomKey(serverUrl, roomId);
-
+    
   // Stable message id: roomKey + sha256(ciphertext)
   const idHash = await sha256_b64u_string(m.ciphertext);
   const id     = `${rKey}|${idHash}`;
@@ -2292,7 +2303,7 @@ function connect(sc) {
       scheduleProfileRetry(sc.url, m.room_id, m.sender_id);
 
     } else if (m.type === 'history') {
-      const serverUrl = sc?.url || normServer(getCurrentRoom()?.server);
+      const serverUrl = sc.url;
       const rid = m.room_id;
       const rKey = roomKey(serverUrl, rid);
       // Start from whatever we already had persisted
