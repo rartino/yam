@@ -281,7 +281,7 @@ async function rotateMasterPassTo(newPass, { persist }) {
     await secretPut(s.id, sealed2);
   }
 
-  await setKeyCheckMarker();    
+  await setKeyCheckMarker();
 }
 
 // Derive a per-room AES-GCM key (non-extractable) from the base key + salt
@@ -739,7 +739,7 @@ let msgDbPromise = null;
 function openMsgDB(){
   if (msgDbPromise) return msgDbPromise;
   msgDbPromise = new Promise((resolve, reject) => {
-    const req = indexedDB.open(MSG_DB, 2);
+    const req = indexedDB.open(MSG_DB, 3);
     req.onupgradeneeded = () => {
       const db = req.result;
       let s;
@@ -748,12 +748,66 @@ function openMsgDB(){
       } else {
         s = req.transaction.objectStore(MSG_STORE);
       }
-      if (!s.indexNames.contains('byRoomTsId')) s.createIndex('byRoomTsId', ['roomKey','ts', 'id'], { unique:false });
+      if (!s.indexNames.contains('byRoomTsId')) s.createIndex('byRoomTsId', ['roomKey','ts','id'], { unique:false });
+      if (!s.indexNames.contains('byRoomSeq'))  s.createIndex('byRoomSeq',  ['roomKey','seq'], { unique:false });
     };
     req.onsuccess = () => resolve(req.result);
     req.onerror = () => reject(req.error);
   });
   return msgDbPromise;
+}
+
+async function msgGetLastSeq(serverUrl, roomId){
+  const key = roomKey(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const tx  = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomSeq');
+    // openCursor with prev across roomKey to get highest seq; but we don't know max bound -> use IDBKeyRange.bound
+    const lower = [key, 0];
+    const upper = [key, Number.MAX_SAFE_INTEGER];
+    const range = IDBKeyRange.bound(lower, upper);
+    const req = idx.openCursor(range, 'prev');
+    req.onsuccess = e => {
+      const cur = e.target.result;
+      if (!cur) return res(-1); // none seen yet
+      res(cur.value.seq ?? -1);
+    };
+    req.onerror = () => rej(req.error);
+  });
+}
+
+const lastSeqSeen = new Map(); // key: roomKey(serverUrl, roomId) -> integer
+
+function renderGapBubble(count, { prepend=false } = {}) {
+  const row = document.createElement('div');
+  row.className = 'row other';
+  const wrap = document.createElement('div'); wrap.className = 'wrap';
+  const label = document.createElement('div'); label.className = 'name-label';
+  label.textContent = ''; // neutral
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+  bubble.textContent = `${count} messages missing`;
+  wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
+  else ui.messages.appendChild(row);
+  return row;
+}
+
+
+async function putGapRecord({ serverUrl, roomId, ts, fromSeq, toSeq }) {
+  const rKey = roomKey(serverUrl, roomId);
+  const id = `${rKey}|gap|${fromSeq + 1}-${toSeq}`; // stable id
+  const rec = {
+    id,
+    roomKey: rKey,
+    roomId, serverUrl,
+    ts: ts || nowMs(),
+    kind: 'gap',
+    fromSeq, toSeq,
+    seq: fromSeq + 0.5 // lets 'byRoomSeq' place it between from and to (not relied upon, but handy)
+  };
+  try { await msgPut(rec); } catch {}
+  return rec;
 }
 
 async function msgPut(rec){
@@ -1114,6 +1168,7 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
   }
 
   const tsVal = m.ts || nowMs();
+  const seqVal = (typeof m.seq === 'number') ? m.seq : null;
 
   // Try to interpret payload as a file-metadata message
   let isFile = false, meta = null;
@@ -1134,6 +1189,7 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
       roomId,
       serverUrl,
       ts: tsVal,
+      seq: seqVal,	
       nickname: m.nickname,
       senderId: m.sender_id,
       verified,
@@ -1147,12 +1203,26 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
       roomId,
       serverUrl,
       ts: tsVal,
+      seq: seqVal,
       nickname: m.nickname,
       senderId: m.sender_id,
       verified,
       kind: 'text',
       text: pt
     });
+  }
+
+  // Gap detection for live stream
+  if (!fromHistory && seqVal !== null) {
+    const rk = roomKey(serverUrl, roomId);
+    const prev = lastSeqSeen.has(rk) ? lastSeqSeen.get(rk) : await msgGetLastSeq(serverUrl, roomId);
+    if (prev >= -1 && seqVal > prev + 1) {
+      await putGapRecord({ serverUrl, roomId, ts: tsVal, fromSeq: prev, toSeq: seqVal });
+      if (VL && VL.serverUrl === serverUrl && VL.roomId === roomId) {
+	renderGapBubble(seqVal - prev - 1);
+      }
+    }
+    lastSeqSeen.set(rk, seqVal);
   }
 
   // Only render if this message is for the *currently visible* room and not from history
@@ -1368,7 +1438,7 @@ async function handleWebRtcResponse(serverUrl, msg) {
     }
   }
   if (DEBUG_RTC) dbg('RTC/REQ', 'answer applied', { request_id });
-    
+
   // Flush buffered OUTGOING ICE
   const sc = servers.get(serverUrl);
   for (const cand of st.iceBuf) {
@@ -1528,16 +1598,34 @@ function connect(sc) {
       }
 
     } else if (m.type === 'history') {
+      const serverUrl = sc?.url || normServer(getCurrentRoom()?.server);
+      const rid = m.room_id;
+      const rKey = roomKey(serverUrl, rid);
+      // Start from whatever we already had persisted
+      let prev = await msgGetLastSeq(serverUrl, rid); // -1 if none
       for (const item of (m.messages || [])) {
-        await handleIncoming(sc.url, item, true);
+	const s = typeof item.seq === 'number' ? item.seq : null;
+	if (s === null) continue; // malformed, but you're wiping anyway
+	if (prev >= -1 && s > prev + 1) {
+	  await putGapRecord({ serverUrl, roomId: rid, ts: item.ts, fromSeq: prev, toSeq: s });
+	  // If this is the active room, render immediately
+	  if (VL && VL.serverUrl === serverUrl && VL.roomId === rid) {
+	    renderGapBubble(s - prev - 1);
+	  }
+	}
+	// store the message itself (handleIncoming true=fromHistory so it won't double-render)
+	await handleIncoming(serverUrl, item, true);
+	prev = s;
+	lastSeqSeen.set(rKey, prev);
       }
+      // If active room, (re)draw initial view if needed
       if (m.room_id === currentRoomId) {
-        if (!ui.messages.firstChild || !VL?.oldestKey) {
-          await initVirtualRoomView(sc.url, m.room_id);
-          setStatus(statuses.connected);
-        } else if (ui.status && ui.status.textContent !== 'Connected') {
-          setStatus(statuses.connected);
-        }
+	if (!ui.messages.firstChild || !VL?.oldestKey) {
+	  await initVirtualRoomView(serverUrl, rid);
+	  setStatus(statuses.connected);
+	} else if (ui.status && ui.status.textContent !== 'Connected') {
+	  setStatus(statuses.connected);
+	}
       }
 
     } else if (m.type === 'message') {
@@ -1568,7 +1656,7 @@ function connect(sc) {
 	try { p.pc.close(); } catch {}
 	pendingRequests.delete(request_id);
 	if (DEBUG_RTC) dbg('RTC/REQ', 'taken (not me) -> closing', { request_id, chosen });
-      }	
+      }
 
     } else if (m.type === 'pong') {
       // noop
@@ -1899,7 +1987,18 @@ function buildRowFromRecord(rec) {
   const bubble = document.createElement('div'); bubble.className = 'bubble';
 
   let fileMeta = null;
-  if (rec.kind === 'text') {
+  if (rec.kind === 'gap') {
+    const row = document.createElement('div');
+    row.className = 'row other';
+    const wrap = document.createElement('div'); wrap.className = 'wrap';
+    const label = document.createElement('div'); label.className = 'name-label';
+    label.textContent = '';
+    const bubble = document.createElement('div'); bubble.className = 'bubble';
+    const count = Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0));
+    bubble.textContent = `${count} messages missing`;
+    wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+    return { node: row, bubble: null, meta: null };
+  } else if (rec.kind === 'text') {
     bubble.textContent = rec.text;
   } else {
     fileMeta = rec.meta;
@@ -1925,6 +2024,9 @@ function renderRecord(rec, { prepend=false } = {}) {
     renderFileIfAvailable(bubble, rec.meta).then(ok => {
       if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(VL.roomId, rec.meta.hash); }
     });
+  } else if (rec.kind === 'gap') {
+      renderGapBubble(Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0)), { prepend });
+      return;
   }
 }
 

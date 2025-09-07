@@ -38,35 +38,104 @@ def LOG(*args):
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('PRAGMA journal_mode=WAL;')
-    conn.execute('PRAGMA synchronous=NORMAL;')    
+    conn.execute('PRAGMA synchronous=NORMAL;')
     conn.row_factory = sqlite3.Row
     return conn
 
+CONN = get_db()
+
 def init_db():
-    conn = get_db()
-    cur = conn.cursor()
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS messages (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      room_id TEXT NOT NULL,
-      ts INTEGER NOT NULL,
-      nickname TEXT,
-      sender_id TEXT,
-      sig TEXT,
-      ciphertext TEXT NOT NULL
-    )
-    """)
-    cur.execute("""
-    CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_room_cipher ON messages(room_id, ciphertext)
-    """)
-    cur.execute("""
-    CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages(room_id, ts);
-    """)
-   
-    conn.commit()
-    conn.close()
+    with CONN:
+      CONN.execute("""
+      CREATE TABLE IF NOT EXISTS rooms (
+        room_id TEXT PRIMARY KEY
+      )
+      """)
+      CONN.execute("""
+        CREATE TABLE IF NOT EXISTS room_counters (
+        room_id TEXT PRIMARY KEY,
+        next    INTEGER NOT NULL
+      )
+      """)
+      CONN.execute("""
+        CREATE TABLE IF NOT EXISTS messages (
+          room_id   TEXT    NOT NULL,
+          seq       INTEGER NOT NULL,
+          ts        INTEGER NOT NULL,
+          nickname  TEXT,
+          sender_id BLOB,
+          sig       BLOB,
+          ciphertext BLOB   NOT NULL,
+          PRIMARY KEY (room_id, seq)
+      ) WITHOUT ROWID
+      """)
+      CONN.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_room_cipher ON messages(room_id, ciphertext)")
+      CONN.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages(room_id, ts)")
 
 init_db()
+
+def _sqlite_supports_returning() -> bool:
+    try:
+        # minimal probe that uses RETURNING in a harmless CTE
+        CONN.execute("WITH x(v) AS (SELECT 1) SELECT v FROM x RETURNING 1").fetchone()
+        return True
+    except Exception:
+        return False
+
+SQLITE_HAS_RETURNING = _sqlite_supports_returning()
+
+def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, ciphertext: bytes):
+    """
+    Atomically bump per-room counter and insert a message.
+    Returns (seq) on success; returns None if ciphertext replay (unique violation).
+    Raises on unexpected DB errors.
+    """
+    if SQLITE_HAS_RETURNING:
+        sql = """
+        WITH next AS (
+          INSERT INTO room_counters (room_id, next)
+          VALUES (?, 1)
+          ON CONFLICT(room_id) DO UPDATE
+            SET next = room_counters.next + 1
+          RETURNING room_id, (next - 1) AS seq
+        )
+        INSERT INTO messages (room_id, seq, ts, nickname, sender_id, sig, ciphertext)
+        SELECT room_id, seq, ?, ?, ?, ?, ?
+        FROM next
+        RETURNING seq
+        """
+        try:
+            CONN.execute(sql, (room_id, ts, nickname, sender_id, sig, ciphertext))
+            row = cur.fetchone()
+            return int(row["seq"])
+        except sqlite3.IntegrityError as e:
+            # UNIQUE(room_id, ciphertext) hit → replay: ignore
+            CONN.rollback()
+            return None
+    else:
+        # Fallback for older SQLite (no RETURNING). Keep it strictly transactional.
+        try:
+            with CONN:  # starts a transaction
+                # Seed or bump next
+                CONN.execute("""
+                    INSERT INTO room_counters(room_id, next) VALUES(?, 1)
+                    ON CONFLICT(room_id) DO UPDATE SET next = next + 1
+                """, (room_id,))
+                # Read just-assigned seq = next - 1
+                row = CONN.execute("SELECT next - 1 AS seq FROM room_counters WHERE room_id=?",
+                                   (room_id,)).fetchone()
+                seq = int(row["seq"])
+                # Insert message at that seq
+                CONN.execute("""
+                    INSERT INTO messages(room_id, seq, ts, nickname, sender_id, sig, ciphertext)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                """, (room_id, seq, ts, nickname, sender_id, sig, ciphertext))
+                # with-block commits here
+                return seq
+        except sqlite3.IntegrityError:
+            # Either ciphertext replay or (rare) PK collision; treat as replay/ignore.
+            return None
+
 
 @app.after_request
 def _sec_headers(resp):
@@ -269,7 +338,7 @@ def ws_handler(ws):
                     ws.send(json.dumps({'type': 'error', 'error': 'deliver_failed'}))
                 # No response needed; one-shot fire-and-forget
                 continue
-            
+
 
             # ---------- Subscribe (per room) -> send auth challenge ----------
             if t == 'subscribe':
@@ -351,18 +420,16 @@ def ws_handler(ws):
                     since = int(m.get('since', 0))
                 except Exception:
                     since = 0
-                conn = get_db()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT ts,nickname,sender_id,sig,ciphertext FROM messages "
-                    "WHERE room_id=? AND ts>=? ORDER BY ts ASC",
+                cur = CONN.execute(
+                    "SELECT seq, ts, nickname, sender_id, sig, ciphertext FROM messages "
+                    "WHERE room_id=? AND ts>=? ORDER BY seq ASC",
                     (room_id, since)
                 )
                 rows = cur.fetchall()
-                conn.close()
                 items = [{
                     'type': 'message',
                     'room_id': room_id,
+                    'seq': r['seq'],
                     'ts': r['ts'],
                     'nickname': r['nickname'],
                     # ensure strings for JSON:
@@ -401,7 +468,7 @@ def ws_handler(ws):
                 if len(ciphertext) > MAX_PAYLOAD_SIZE:
                   ws.send(json.dumps({'type':'error','room_id':room_id,'error':'payload_too_large'}))
                   continue
-                
+
                 # If either sender_id or sig is present, require and verify both
                 if (sender_id_b64u is not None) or (sig_b64u is not None):
                     if not sender_id_b64u or not sig_b64u:
@@ -424,32 +491,25 @@ def ws_handler(ws):
                 except Exception:
                     ts = now_ms()
 
-                # Insert-or-ignore; gate broadcast on actual insert → prevents replay rebroadcast
-                conn = get_db()
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT OR IGNORE INTO messages (room_id, ts, nickname, sender_id, sig, ciphertext) VALUES (?,?,?,?,?,?)",
-                    (room_id, ts, nickname, sender_id, sig, ciphertext)
-                )
-                inserted = (cur.rowcount or 0) > 0
-                conn.commit()
-                conn.close()
+                seq = insert_message_with_seq(room_id, ts, nickname, sender_id, sig, ciphertext)
 
-                if inserted:
-                    payload = {
-                        'type': 'message',
-                        'room_id': room_id,
-                        'ts': ts,
-                        'nickname': nickname,
-                        'sender_id': sender_id_b64u,   # <- send the string form to clients
-                        'sig': sig_b64u,               # <- string form
-                        'ciphertext': ciphertext_b64u  # <- string form
-                    }
-                    fanout = broadcast(room_id, payload)
-                    LOG("send", "room=", room_id, "bytes=", len(ciphertext_b64u), "fanout=", fanout)
-                else:
-                    LOG("send-replay-ignored", "room=", room_id)
+                if seq is None:
+                  # Replay (same ciphertext) → ignore silently (or send a soft notice)
+                  LOG("send-replay-ignored", "room=", room_id)
+                  continue
 
+                payload = {
+                    'type': 'message',
+                    'room_id': room_id,
+                    'seq': seq,
+                    'ts': ts,
+                    'nickname': nickname,
+                    'sender_id': sender_id_b64u,   # <- send the string form to clients
+                    'sig': sig_b64u,               # <- string form
+                    'ciphertext': ciphertext_b64u  # <- string form
+                }
+                fanout = broadcast(room_id, payload)
+                LOG("send", "room=", room_id, "bytes=", len(ciphertext_b64u), "fanout=", fanout)
                 continue
 
             # ---------- WebRTC signaling ----------
