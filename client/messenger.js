@@ -1766,55 +1766,74 @@ async function drawInviteQr(text){
   c.width = c.height = 0;
 }
 
-w.onmessage = async (evt) => {
-  const m = JSON.parse(evt.data);
-  if (m.type === 'invite-deliver') {
-    try {
-      const sealed = fromB64u(m.ciphertext);
-      const plain  = sodium.crypto_box_seal_open(sealed, _joinWait.curvePk, _joinWait.curveSk);
-      const obj    = JSON.parse(bytesToUtf8(plain));
+async function openJoinDialog(){
+  await ensureSodium();
 
-      // 🔧 Align with sender: 'kind' (not 'k'), 'room.roomSkB64' (not 'room.sk')
-      if (!obj || obj.kind !== 'room-invite' || !obj.room || !obj.room.roomSkB64 || !obj.room.id) {
-        alert('Bad invite payload'); return;
+  // Prefill server
+  join.server.value = rooms[0]?.server || 'https://rartino.pythonanywhere.com';
+
+  // Generate fresh Curve25519 pair and code
+  const kp = sodium.crypto_box_keypair();
+  _joinWait.curvePk = kp.publicKey;
+  _joinWait.curveSk = kp.privateKey;
+  _joinWait.host    = hostFromUrl(join.server.value);
+  _joinWait.hash    = await sha256_b64u_bytes(_joinWait.curvePk);
+
+  const code = encodeInviteCode(_joinWait.host, b64u(_joinWait.curvePk));
+  join.codeTA.value = code;
+  await drawInviteQr(code);
+
+  // Open waiting WS to this server, register invite-open
+  if (_joinWait.ws) { try { _joinWait.ws.close(); } catch{} }
+  const wsUrl = normServer(join.server.value).replace(/^http/i,'ws') + '/ws';
+  const w = new WebSocket(wsUrl);
+  _joinWait.ws = w;
+
+  w.onopen = () => {
+    if (DEBUG_SIG) dbg('SIG/TX','invite-open',{hash:_joinWait.hash.slice(0,12)+'…'});
+    w.send(JSON.stringify({ type:'invite-open', hash: _joinWait.hash }));
+  };
+  w.onmessage = async (evt) => {
+    const m = JSON.parse(evt.data);
+    if (m.type === 'invite-deliver') {
+      try {
+        const sealed = fromB64u(m.ciphertext);
+        const plain  = sodium.crypto_box_seal_open(sealed, _joinWait.curvePk, _joinWait.curveSk);
+        const obj    = JSON.parse(bytesToUtf8(plain));
+
+        if (!obj || obj.k !== 'room-invite' || !obj.room || !obj.room.sk || !obj.room.id) {
+          alert('Bad invite payload'); return;
+        }
+        const skBytes = fromB64u(obj.room.sk);
+        const pkBytes = derivePubFromSk(skBytes);
+        if (b64u(pkBytes) !== obj.room.id) { alert('Invite id mismatch'); return; }
+
+        // Upsert room & secret
+        const serverUrl = 'https://' + _joinWait.host;
+        const rid = obj.room.id;
+        if (!rooms.find(x => x.id === rid)) {
+          rooms.push({ id: rid, name: obj.room.name || 'Room', server: serverUrl, roomId: rid, createdAt: nowMs() });
+          saveRooms();
+        }
+        await secretPut(rid, await sealSecret(b64u(skBytes)));
+
+        ensureServerConnection(serverUrl);
+        await registerRoomIfNeeded({ id: rid, server: serverUrl });
+        await openRoom(rid);
+
+        try { _joinWait.ws.close(); } catch {}
+        join.dlg.close();
+      } catch (e) {
+        console.error(e);
+        alert('Failed to decrypt invite.');
       }
-
-      const skBytes = fromB64u(obj.room.roomSkB64);
-      const pkBytes = derivePubFromSk(skBytes);
-      if (b64u(pkBytes) !== obj.room.id) { alert('Invite id mismatch'); return; }
-
-      // Prefer the explicit server in payload; fall back to the host we’re connected to
-      const serverUrl = obj.room.server || ('https://' + _joinWait.host);
-      const rid = obj.room.id;
-
-      // Upsert room (if not present)
-      if (!rooms.find(x => x.id === rid)) {
-        rooms.push({
-          id: rid,
-          name: obj.room.name || 'Room',
-          server: serverUrl,
-          roomId: rid,
-          createdAt: obj.room.createdAt || nowMs()
-        });
-        saveRooms();
-      }
-
-      await secretPut(rid, await sealSecret(b64u(skBytes)));
-
-      ensureServerConnection(serverUrl);
-      await registerRoomIfNeeded({ id: rid, server: serverUrl });
-      await openRoom(rid);
-
-      try { _joinWait.ws.close(); } catch {}
-      join.dlg.close();
-    } catch (e) {
-      console.error(e);
-      alert('Failed to decrypt invite.');
+    } else if (m.type === 'error') {
+      alert(`Server error: ${m.error}`);
     }
-  } else if (m.type === 'error') {
-    alert(`Server error: ${m.error}`);
-  }
-};
+  };
+
+  join.dlg.showModal();
+}
 
 async function generateJoinAnswer(){
   try { await navigator.clipboard.writeText(join.offerTA.value); }
