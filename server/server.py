@@ -5,11 +5,13 @@ import sqlite3
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sock import Sock
+from urllib.parse import urlparse
 
 DB_PATH = os.environ.get("WS_DB_PATH", "messages.db")
 ALLOWED_ORIGINS = set(
-    [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://rickard.armiento.se,http://localhost,http://127.0.0.1").split(",") if o.strip()]
+    [o.strip() for o in os.environ.get("ALLOWED_ORIGINS", "https://rickard.armiento.se,http://localhost:8000,http://127.0.0.1:8000").split(",") if o.strip()]
 )
+MAX_PAYLOAD_SIZE = 128 * 1024  # bytes (base64 will be ~1.33x)
 
 app = Flask(__name__)
 APP = app
@@ -34,6 +36,7 @@ def LOG(*args):
 def get_db():
     conn = sqlite3.connect(DB_PATH)
     conn.execute('PRAGMA journal_mode=WAL;')
+    conn.execute('PRAGMA synchronous=NORMAL;')    
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -54,6 +57,10 @@ def init_db():
     cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_room_cipher ON messages(room_id, ciphertext)
     """)
+    cur.execute("""
+    CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages(room_id, ts);
+    """)
+   
     conn.commit()
     conn.close()
 
@@ -89,7 +96,7 @@ ROOM_PEERS = {}
 
 # Simple sliding-window rate limit (per IP + room + kind)
 _RATE = {}  # key -> (reset_epoch_ms, count)
-_RATE_SOFT_LIMIT = int(os.environ.get("RATE_SOFT_LIMIT", "50000"))
+_RATE_SOFT_LIMIT = int(os.environ.get("RATE_SOFT_LIMIT", "5000"))
 
 # ---------- Helpers ----------
 def broadcast(room_id, payload, exclude=None):
@@ -143,7 +150,7 @@ def _rate_gc(now_ms):
         items = sorted(_RATE.items(), key=lambda kv: kv[1][0])  # by reset time
         for k, _ in items[: len(_RATE) - _RATE_SOFT_LIMIT]:
             _RATE.pop(k, None)
-    
+
 def _ws_origin(ws) -> str:
     return (ws.environ.get("HTTP_ORIGIN") or "").strip()
 
@@ -264,7 +271,7 @@ def ws_handler(ws):
 
             # ---------- Everything below requires room_id + authorization ----------
             room_id = m.get('room_id')
-            if t not in ('history', 'send', 'announce', 'webrtc-request', 'webrtc-response', 'webrtc-ice'):
+            if t not in ('history', 'send', 'announce', 'webrtc-request', 'webrtc-response', 'webrtc-ice', 'webrtc-taken'):
                 ws.send(json.dumps({'type': 'error', 'error': f'unknown type: {t}'}))
                 continue
             if not isinstance(room_id, str) or not room_id:
@@ -302,9 +309,10 @@ def ws_handler(ws):
                     'room_id': room_id,
                     'ts': r['ts'],
                     'nickname': r['nickname'],
-                    'sender_id': r['sender_id'],
-                    'sig': r['sig'],
-                    'ciphertext': r['ciphertext'],
+                    # ensure strings for JSON:
+                    'sender_id': _as_b64u_or_str(r['sender_id']),
+                    'sig': _as_b64u_or_str(r['sig']),
+                    'ciphertext': _as_b64u_or_str(r['ciphertext']),
                 } for r in rows]
                 LOG("history", "room=", room_id, "count=", len(items))
                 ws.send(json.dumps({'type': 'history', 'room_id': room_id, 'messages': items}))
@@ -334,6 +342,10 @@ def ws_handler(ws):
                     ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_encoding'}))
                     continue
 
+                if len(ciphertext) > MAX_PAYLOAD_SIZE:
+                  ws.send(json.dumps({'type':'error','room_id':room_id,'error':'payload_too_large'}))
+                  continue
+                
                 # If either sender_id or sig is present, require and verify both
                 if (sender_id_b64u is not None) or (sig_b64u is not None):
                     if not sender_id_b64u or not sig_b64u:
@@ -381,7 +393,7 @@ def ws_handler(ws):
                     LOG("send", "room=", room_id, "bytes=", len(ciphertext_b64u), "fanout=", fanout)
                 else:
                     LOG("send-replay-ignored", "room=", room_id)
-                
+
                 continue
 
             # ---------- WebRTC signaling ----------
@@ -439,7 +451,7 @@ def ws_handler(ws):
                 }
                 broadcast(room_id, payload, exclude=ws)
                 LOG("rtc/taken", "room=", room_id, "req=", m.get('request_id'), "chosen=", m.get('chosen'))
-                continue            
+                continue
 
     except Exception as e:
         LOG("WS error", str(e))
@@ -476,6 +488,18 @@ def _from_b64u(s: str) -> bytes:
     import base64
     pad = '=' * (-len(s) % 4)
     return base64.urlsafe_b64decode((s + pad).encode('utf-8'))
+
+def _as_b64u_or_str(v):
+    if v is None:
+        return None
+    # if it's already a str (e.g., old rows stored as text), pass through
+    if isinstance(v, str):
+        return v
+    # bytes / bytearray / memoryview → base64url
+    if isinstance(v, (bytes, bytearray, memoryview)):
+        return _b64u(bytes(v))
+    # SQLite can sometimes hand back ints for empty blobs; just stringify
+    return str(v)
 
 if __name__ == "__main__":
     # For local testing; on PythonAnywhere you’ll use WSGI

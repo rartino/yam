@@ -56,3 +56,5 @@
 Other links:
 
 - https://learn.microsoft.com/en-us/microsoft-edge/progressive-web-apps/
+
+* Somehow handle (too?) large files
