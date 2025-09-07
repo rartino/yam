@@ -11,6 +11,7 @@ fetch('./manifest.json')
       './manifest.json',
       './site.webmanifest',
       './sw.js',
+      './qr.js',
       './yam.css',
       './boot.js',
       `./messenger.js?v=${APP_VERSION}`,

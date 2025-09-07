@@ -142,59 +142,69 @@
     </form>
   </dialog>
 
-  <!-- Invite (sender) -->
-  <dialog id="inviteModal">
-    <button id="btnCloseInvite" class="dialog-close" aria-label="Close">×</button>
-    <form method="dialog">
-      <h3 class="modal-title">Invite to this room</h3>
-      <div class="settings-stack">
-	<p class="muted help">Step 1: Copy this invitation code and send it to your friend.</p>
-	<div class="field">
-	  <label>Invitation code</label>
-	  <textarea id="inviteOffer" class="codearea" readonly rows="5"></textarea>
-	  <div class="row-buttons row-buttons--auto2">
-	    <button type="button" id="btnCopyInviteOffer">Copy</button>
-	    <button type="button" id="btnRefreshInviteOffer">Regenerate</button>
-	  </div>
-	</div>
-
-	<p class="muted help">Step 2: Paste the response code you get back and finish.</p>
-	<div class="field">
-	  <label>Response code</label>
-	  <textarea id="inviteAnswer" class="codearea" rows="5" placeholder="Paste response code here"></textarea>
-	</div>
-      </div>
-      <div class="settings-actions settings-actions--end">
-	<button type="button" id="btnFinishInvite">Finish</button>
-      </div>
-    </form>
-  </dialog>
-
   <!-- Join (receiver) -->
   <dialog id="joinModal">
     <button id="btnCloseJoin" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
       <h3 class="modal-title">Join a room</h3>
+
       <div class="settings-stack">
-	<p class="muted help">Step 1: Paste the invitation code you received.</p>
 	<div class="field">
-	  <label>Invitation code</label>
-	  <textarea id="joinOffer" class="codearea" spellcheck="false" rows="5" placeholder="Paste invitation code here"></textarea>
+	  <label for="joinServer" class="muted">Server</label>
+	  <input id="joinServer" placeholder="https://rartino.pythonanywhere.com" />
+	  <p class="muted help">Change only if you and the inviter use a different relay.</p>
 	</div>
 
-	<p class="muted help">Step 2: Copy the response code below and send it back.</p>
 	<div class="field">
-	  <label>Response code</label>
-	  <textarea id="joinAnswer" class="codearea" spellcheck="false" readonly rows="5"></textarea>
+	  <label class="muted">Your invite code</label>
+	  <textarea id="joinCode" class="codearea" readonly rows="3" spellcheck="false"></textarea>
 	  <div class="row-buttons row-buttons--auto2">
-	    <button type="button" id="btnMakeJoinAnswer">Generate response</button>
-	    <button type="button" id="btnCopyJoinAnswer">Copy</button>
+	    <button type="button" id="btnCopyJoinCode">Copy</button>
+	    <button type="button" id="btnRefreshJoinCode">Regenerate</button>
 	  </div>
+	</div>
+
+	<div class="field">
+	  <label class="muted">QR (scan this on inviter’s device)</label>
+	  <canvas id="joinQrCanvas" width="0" height="0" class="qr-canvas"></canvas>
+	  <p id="joinQrHint" class="muted help">If QR isn’t visible, share the code above.</p>
 	</div>
       </div>
     </form>
   </dialog>
 
+  <!-- Invite (sender) -->
+  <dialog id="inviteModal">
+    <button id="btnCloseInvite" class="dialog-close" aria-label="Close">×</button>
+    <form method="dialog">
+      <h3 class="modal-title">Invite to this room</h3>
+
+      <div class="settings-stack">
+	<div class="field">
+	  <label class="muted">Paste invite code (or scan)</label>
+	  <textarea id="inviteCodeInput" class="codearea" rows="3" placeholder="yam-v1:relay.example.com:AbCd…" spellcheck="false"></textarea>
+	  <div class="row-buttons row-buttons--auto2">
+	    <button type="button" id="btnScanInviteQr">Scan QR</button>
+	    <button type="button" id="btnPasteInviteCode">Paste</button>
+	  </div>
+	</div>
+
+	<div id="scanArea" class="field hidden">
+	  <label class="muted">Scanning…</label>
+	  <video id="inviteScanVideo" playsinline class="qr-video" muted></video>
+	  <div class="row-buttons row-buttons--auto2">
+	    <button type="button" id="btnStopScan">Stop</button>
+	    <span class="muted help" id="scanHint">Point the camera at the QR code</span>
+	  </div>
+	</div>
+      </div>
+
+      <div class="settings-actions settings-actions--end">
+	<button type="button" id="btnSendInvite">Send invite</button>
+      </div>
+    </form>
+  </dialog>
+  
   <div id="app">
     <header>
       <div class="hdr-left">
@@ -246,7 +256,7 @@
           </svg>
         </button>
         <input id="messageInput" placeholder="Type a message…" />
-        <button id="btnSend">Send</button>
+        <button id="btnSend">➤</button>
         <input id="fileInput" type="file" class="hidden" />
       </div>
     </main>

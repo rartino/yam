@@ -1,0 +1,355 @@
+// --- Tiny QR renderer (no deps). Public API: window.drawQRCode(canvas, text, opts) ---
+(() => {
+  // ---- Tables (cut to versions 1..10, ECC M only) ----
+  // Per version: [ecwPerBlock, g1Blocks, g1Data, g2Blocks, g2Data]
+  const EC_M = {
+    1:[10,1,16,0,0], 2:[16,1,28,0,0], 3:[26,1,44,0,0], 4:[18,2,32,0,0], 5:[24,2,43,0,0],
+    6:[16,4,27,0,0], 7:[18,2,31,2,32], 8:[22,2,38,2,39], 9:[22,4,36,0,0], 10:[26,2,43,2,44]
+  }; // from QR spec tables (Thonky) :contentReference[oaicite:0]{index=0}
+  const REM_BITS = {1:0,2:7,3:7,4:7,5:7,6:7,7:0,8:0,9:0,10:0}; // remainder bits per version (1..10) :contentReference[oaicite:1]{index=1}
+  const ALIGN = {
+    1:[],2:[6,18],3:[6,22],4:[6,26],5:[6,30],6:[6,34],7:[6,22,38],8:[6,24,42],9:[6,26,46],10:[6,28,50]
+  }; // alignment pattern centers :contentReference[oaicite:2]{index=2}
+  // Format info bits (masked) for ECC M by mask 0..7 (15 bits)
+  const FMT_M = [
+    0b101010000010010, 0b101000100100101, 0b101111001111100, 0b101101101001011,
+    0b100010111111001, 0b100000011001110, 0b100111110010111, 0b100101010100000
+  ]; // :contentReference[oaicite:3]{index=3}
+  // Version info (bits) for v>=7 (18 bits). We only need 7..10.
+  const VER_INFO = {
+    7:  0b000111110010010100, 8:  0b001000010110111100,
+    9:  0b001001101010011001, 10: 0b001010010011010011
+  }; // :contentReference[oaicite:4]{index=4}
+
+  // ---- GF(256) for Reed–Solomon (QR uses primitive poly 0x11D) ----
+  const GF_EXP = new Uint8Array(512);
+  const GF_LOG = new Uint8Array(256);
+  (function initGF(){
+    let x = 1;
+    for (let i=0;i<255;i++){ GF_EXP[i]=x; GF_LOG[x]=i; x<<=1; if (x&0x100) x^=0x11D; }
+    for (let i=255;i<512;i++) GF_EXP[i]=GF_EXP[i-255];
+  })();
+  function gfMul(a,b){ if (a===0||b===0) return 0; return GF_EXP[GF_LOG[a]+GF_LOG[b]]; }
+  function rsGenPoly(deg){
+    // Build generator polynomial (x-α^0)(x-α^1)...(x-α^(deg-1))
+    let poly = new Uint8Array(deg+1); poly[0]=1;
+    for (let d=0; d<deg; d++){
+      const nxt = new Uint8Array(deg+1);
+      for (let i=0;i<=d;i++){
+        // multiply by x
+        nxt[i+1] ^= poly[i];
+        // add α^d * poly
+        nxt[i]   ^= gfMul(poly[i], GF_EXP[d]);
+      }
+      poly = nxt;
+    }
+    return poly;
+  }
+  function rsComputeECC(data, ecw){
+    const gen = rsGenPoly(ecw);
+    const res = new Uint8Array(ecw);
+    for (let i=0;i<data.length;i++){
+      const factor = data[i] ^ res[0];
+      // shift left
+      res.copyWithin(0,1); res[res.length-1]=0;
+      if (factor!==0){
+        for (let j=0;j<gen.length;j++){
+          res[j] ^= gfMul(gen[j], factor);
+        }
+      }
+    }
+    return res;
+  }
+
+  // ---- Bit buffer helper ----
+  class BitBuf {
+    constructor(){ this.bits=[]; }
+    put(val, n){
+      for (let i=n-1;i>=0;i--) this.bits.push((val>>>i)&1);
+    }
+    putBytes(u8){
+      for (const b of u8) this.put(b,8);
+    }
+    padToBytes(){
+      while (this.bits.length % 8) this.bits.push(0);
+    }
+    get length(){ return this.bits.length; }
+    toBytes(){
+      const out = new Uint8Array(this.bits.length/8|0);
+      for (let i=0;i<out.length;i++){
+        let v=0; for (let j=0;j<8;j++){ v=(v<<1)|this.bits[i*8+j]; }
+        out[i]=v;
+      }
+      return out;
+    }
+  }
+
+  // ---- Capacity & structure helpers for ECC M (versions 1..10) ----
+  function dataCapacityBits(ver){
+    const cfg = EC_M[ver];
+    const k = cfg[1]*cfg[2] + cfg[3]*cfg[4]; // total data codewords
+    return k * 8;
+  }
+  function makeBlocks_M(ver, dataBytes){
+    const [ecw, g1n, g1k, g2n, g2k] = EC_M[ver];
+    let off = 0;
+    const blocks = [];
+    for (let i=0;i<g1n;i++){ blocks.push({data: dataBytes.slice(off, off+g1k), ec: null}); off+=g1k; }
+    for (let i=0;i<g2n;i++){ blocks.push({data: dataBytes.slice(off, off+g2k), ec: null}); off+=g2k; }
+    // compute ecc for each
+    for (const b of blocks){ b.ec = rsComputeECC(b.data, ecw); }
+    // interleave
+    const maxK = Math.max(g1k, g2k);
+    const out = [];
+    for (let i=0;i<maxK;i++){
+      for (const b of blocks){ if (i < b.data.length) out.push(b.data[i]); }
+    }
+    for (let i=0;i<ecw;i++){
+      for (const b of blocks){ out.push(b.ec[i]); }
+    }
+    return new Uint8Array(out);
+  }
+
+  // ---- Matrix building ----
+  function sizeFor(ver){ return 17 + 4*ver; }
+  function emptyMatrix(n){ const m=new Array(n); for (let y=0;y<n;y++){ m[y]=new Array(n).fill(null); } return m; }
+
+  function placeFinder(m, x, y){
+    for (let dy=-1; dy<=7; dy++){
+      for (let dx=-1; dx<=7; dx++){
+        const xx = x+dx, yy=y+dy;
+        if (xx<0||yy<0||yy>=m.length||xx>=m.length) continue;
+        const on = (dx>=0&&dx<=6 && dy>=0&&dy<=6 &&
+                   (dx===0||dx===6||dy===0||dy===6 || (dx>=2&&dx<=4 && dy>=2&&dy<=4)));
+        m[yy][xx] = on ? 1 : 0; // include separator (0) around
+      }
+    }
+  }
+  function placeTiming(m){
+    const n=m.length;
+    for (let i=0;i<n;i++){
+      if (m[6][i]===null) m[6][i] = (i%2===0)?1:0;
+      if (m[i][6]===null) m[i][6] = (i%2===0)?1:0;
+    }
+  }
+  function placeAlign(m, ver){
+    const centers = ALIGN[ver]||[];
+    if (centers.length===0) return;
+    for (let cy of centers){
+      for (let cx of centers){
+        // skip the three finder zones overlaps
+        if ((cx===6 && cy===6)||(cx===m.length-7 && cy===6)||(cx===6 && cy===m.length-7)) continue;
+        for (let dy=-2;dy<=2;dy++){
+          for (let dx=-2;dx<=2;dx++){
+            const xx=cx+dx, yy=cy+dy;
+            m[yy][xx] = (Math.max(Math.abs(dx),Math.abs(dy))===2) ? 1 : (dx===0&&dy===0 ? 1 : 0);
+          }
+        }
+      }
+    }
+  }
+  function reserveFormatAreas(m){
+    const n=m.length;
+    for (let i=0;i<9;i++){
+      if (i!==6){ m[8][i]=0; m[i][8]=0; }
+    }
+    for (let i=0;i<8;i++){ m[n-1-i][8]=0; m[8][n-1-i]=0; }
+    m[n-8][8]=1; // dark module (fixed)
+  }
+  function placeVersionInfo(m, ver){
+    if (ver<7) return;
+    const n=m.length, bits = VER_INFO[ver];
+    for (let i=0;i<18;i++){
+      const b = (bits >> i) & 1;
+      const r = Math.floor(i/3), c = i%3;
+      // top-right below finder
+      m[r][n-11+c] = b;
+      // left-bottom to the left of finder
+      m[n-11+c][r] = b;
+    }
+  }
+
+  function fillData(m, dataBits, maskId){
+    const n=m.length;
+    let i = dataBits.length-1;
+    let dirUp = true;
+    for (let x = n-1; x>=0; x-=2){
+      if (x===6) x--; // skip timing column
+      for (let yInner=0; yInner<n; yInner++){
+        const y = dirUp ? (n-1-yInner) : yInner;
+        for (let dx=0; dx<2; dx++){
+          const xx = x-dx, yy=y;
+          if (m[yy][xx] !== null) continue;
+          let bit = (i>=0) ? dataBits[i--] : 0;
+          // apply mask
+          if (mask(maskId, xx, yy)) bit ^= 1;
+          m[yy][xx] = bit;
+        }
+      }
+      dirUp = !dirUp;
+    }
+  }
+
+  function mask(id, x, y){
+    switch(id){
+      case 0: return ((x+y) % 2) === 0;
+      case 1: return (y % 2) === 0;
+      case 2: return (x % 3) === 0;
+      case 3: return ((x + y) % 3) === 0;
+      case 4: return (((Math.floor(y/2) + Math.floor(x/3)) % 2) === 0);
+      case 5: return (((x*y) % 2) + ((x*y) % 3)) === 0;
+      case 6: return ((((x*y) % 2) + ((x*y) % 3)) % 2) === 0;
+      case 7: return ((((x+y) % 2) + ((x*y) % 3)) % 2) === 0;
+      default: return false;
+    }
+  }
+
+  // ---- Penalty scoring (simplified but spec-compliant) ----
+  function penalty(m){
+    const n=m.length;
+    let p=0;
+    // Rule 1: rows + cols
+    for (let y=0;y<n;y++){
+      let run=1;
+      for (let x=1;x<n;x++){
+        if (m[y][x]===m[y][x-1]) run++; else { if (run>=5) p+=3+(run-5); run=1; }
+      }
+      if (run>=5) p+=3+(run-5);
+    }
+    for (let x=0;x<n;x++){
+      let run=1;
+      for (let y=1;y<n;y++){
+        if (m[y][x]===m[y-1][x]) run++; else { if (run>=5) p+=3+(run-5); run=1; }
+      }
+      if (run>=5) p+=3+(run-5);
+    }
+    // Rule 2: 2x2 blocks
+    for (let y=0;y<n-1;y++)
+      for (let x=0;x<n-1;x++)
+        if (m[y][x]===m[y][x+1] && m[y][x]===m[y+1][x] && m[y][x]===m[y+1][x+1]) p+=3;
+    // Rule 3: finder-like patterns
+    const patA = [1,0,1,1,1,0,1,0,0,0,0];
+    const patB = [0,0,0,0,1,0,1,1,1,0,1];
+    function hasPattern(arr, idx, line){
+      for (let k=0;k<11;k++) if (line[idx+k]!==arr[k]) return false;
+      return true;
+    }
+    for (let y=0;y<n;y++){
+      const row = m[y];
+      for (let x=0;x<=n-11;x++){
+        if (hasPattern(patA,x,row) || hasPattern(patB,x,row)) p+=40;
+      }
+    }
+    for (let x=0;x<n;x++){
+      const col = new Array(n);
+      for (let y=0;y<n;y++) col[y]=m[y][x];
+      for (let y=0;y<=n-11;y++){
+        if (hasPattern(patA,y,col) || hasPattern(patB,y,col)) p+=40;
+      }
+    }
+    // Rule 4: dark ratio
+    let dark=0;
+    for (let y=0;y<n;y++) for (let x=0;x<n;x++) if (m[y][x]) dark++;
+    const percent = (dark * 100) / (n*n);
+    const k = Math.abs(percent - 50) / 5;
+    p += Math.floor(k) * 10;
+    return p;
+  }
+
+  // ---- Format info write ----
+  function writeFormat(m, fmt15){
+    const n=m.length;
+    // into the two strips around TL finder
+    for (let i=0;i<6;i++) m[i][8] = (fmt15 >> i) & 1;
+    m[7][8] = (fmt15 >> 6) & 1;
+    m[8][8] = (fmt15 >> 7) & 1;
+    m[8][7] = (fmt15 >> 8) & 1;
+    for (let i=9;i<15;i++) m[8][14-i] = (fmt15 >> i) & 1;
+
+    // and the other copy
+    for (let i=0;i<8;i++) m[n-1-i][8] = (fmt15 >> i) & 1;
+    for (let i=0;i<7;i++) m[8][n-1-i] = (fmt15 >> (14-i)) & 1;
+  }
+
+  // ---- Encode (byte mode, ECC M, version auto≤10) ----
+  function encodeBytes(bytes){
+    // try versions 1..10; require bits <= dataCapacityBits(ver)
+    for (let ver=1; ver<=10; ver++){
+      const cap = dataCapacityBits(ver);
+      const cciBits = (ver<=9) ? 8 : 16;
+      const needed = 4 + cciBits + bytes.length*8 + 4; // mode+len+data+terminator(≤4)
+      if (needed <= cap) {
+        // build bit stream
+        const bb = new BitBuf();
+        bb.put(0b0100,4); // byte mode
+        bb.put(bytes.length, cciBits);
+        bb.putBytes(bytes);
+        // terminator up to 4 bits
+        const toTerm = Math.min(4, cap - bb.length);
+        bb.put(0, toTerm);
+        // pad to byte
+        bb.padToBytes();
+        // pad bytes 0xEC, 0x11
+        const needBytes = (cap/8|0) - (bb.length/8|0);
+        const pads = new Uint8Array(needBytes);
+        for (let i=0;i<needBytes;i++) pads[i] = (i%2) ? 0x11 : 0xEC;
+        // final data codewords
+        const dataBytes = new Uint8Array(bb.toBytes().length + pads.length);
+        dataBytes.set(bb.toBytes(), 0); dataBytes.set(pads, bb.toBytes().length);
+        return { ver, dataBytes };
+      }
+    }
+    throw new Error('QR: text too long for version ≤ 10 @ ECC M');
+  }
+
+  // ---- Public: draw to canvas ----
+  function drawQRCode(canvas, text, {margin=2, scale=4} = {}){
+    const bytes = (new TextEncoder()).encode(text);
+    const { ver, dataBytes } = encodeBytes(bytes);
+    // structure final message (interleave w/ ECC) for ECC M
+    const finalCW = makeBlocks_M(ver, dataBytes);
+
+    // Build base matrix with function patterns & reserves
+    const n = sizeFor(ver);
+    let bestMask = 0, bestMatrix = null, bestScore = Infinity;
+
+    // data bits array (MSB-first per byte)
+    const dataBits = new Array(finalCW.length*8);
+    for (let i=0;i<finalCW.length;i++){
+      const b = finalCW[i];
+      for (let k=0;k<8;k++) dataBits[i*8 + (7-k)] = (b>>k)&1;
+    }
+    // (remainder bits are implicitly filled by unassigned modules; versions 1..10: see table)
+
+    for (let maskId=0; maskId<8; maskId++){
+      const m = emptyMatrix(n);
+      // function patterns
+      placeFinder(m,0,0); placeFinder(m,n-7,0); placeFinder(m,0,n-7);
+      placeTiming(m); placeAlign(m, ver); reserveFormatAreas(m); placeVersionInfo(m, ver);
+      // fill data with mask applied
+      fillData(m, dataBits, maskId);
+      // write format info for ECC M + maskId
+      writeFormat(m, FMT_M[maskId]);
+      const score = penalty(m);
+      if (score < bestScore){ bestScore=score; bestMask=maskId; bestMatrix=m; }
+    }
+
+    // Draw
+    const m = bestMatrix;
+    const px = Math.max(1, scale|0);
+    const quiet = Math.max(0, margin|0);
+    const dim = (n + quiet*2) * px;
+    canvas.width = dim; canvas.height = dim;
+    const ctx = canvas.getContext('2d', { willReadFrequently:false });
+    ctx.fillStyle = '#fff'; ctx.fillRect(0,0,dim,dim);
+    ctx.fillStyle = '#000';
+    for (let y=0;y<n;y++){
+      for (let x=0;x<n;x++){
+        if (m[y][x]) ctx.fillRect((x+quiet)*px, (y+quiet)*px, px, px);
+      }
+    }
+  }
+
+  // expose
+  window.drawQRCode = drawQRCode;
+})();

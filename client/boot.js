@@ -4,10 +4,16 @@ fetch('./manifest.json')
     window.APP_VERSION = manifest.version;
     const mv = document.getElementById('menuVersion');
     if (mv) mv.textContent = `v${window.APP_VERSION}`;
-    const script = document.createElement('script');
-    script.type = 'module';
-    script.src = `./messenger.js?v=${window.APP_VERSION}`;
-    document.body.appendChild(script);
+
+    const qr = document.createElement('script');
+    qr.src = `./qr.js?v=${window.APP_VERSION}`;
+    qr.onload = () => {
+      const app = document.createElement('script');
+      app.type = 'module';
+      app.src = `./messenger.js?v=${window.APP_VERSION}`;
+      document.body.appendChild(app);
+    };
+    document.body.appendChild(qr);
   })
   .catch(err => console.error('Failed to load manifest:', err));
 
