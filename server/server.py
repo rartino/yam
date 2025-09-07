@@ -179,9 +179,6 @@ ROOM_PEERS = {}
 _RATE = {}  # key -> (reset_epoch_ms, count)
 _RATE_SOFT_LIMIT = int(os.environ.get("RATE_SOFT_LIMIT", "5000"))
 
-# ws -> (room_id, peer_id) for identity binding (prevents profile spoof)
-PEER_BY_WS = {}
-
 # ---------- Helpers ----------
 def broadcast(room_id, payload, exclude=None):
     """Fanout to all authed subscribers of room_id"""
@@ -424,7 +421,6 @@ def ws_handler(ws):
                 pid = m.get('peer_id')
                 if isinstance(pid, str) and pid:
                     ROOM_PEERS.setdefault(room_id, {})[pid] = ws
-                    PEER_BY_WS[ws] = (room_id, pid)
                     LOG("announce", "room=", room_id, "peer=", pid[:6] + "…")
                 continue
 
@@ -434,12 +430,6 @@ def ws_handler(ws):
 
                 if not (isinstance(sender_id, str) and isinstance(ct_b64, str)):
                     ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_profile_args'}))
-                    continue
-
-                # Bind profile updates to the announcing identity on this socket
-                rid_pid = PEER_BY_WS.get(ws)
-                if not rid_pid or rid_pid[0] != room_id or rid_pid[1] != sender_id:
-                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'peer_mismatch'}))
                     continue
 
                 try:
@@ -668,7 +658,6 @@ def ws_handler(ws):
         # remove pending challenges for this ws
         for key in [k for k in PENDING_CHALLENGES.keys() if k[0] is ws]:
             PENDING_CHALLENGES.pop(key, None)
-        PEER_BY_WS.pop(ws, None)
         LOG("WS close", "ip=", ip)
         try:
             ws.close()
