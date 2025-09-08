@@ -1,27 +1,24 @@
 // --- Tiny QR renderer (no deps). Public API: window.drawQRCode(canvas, text, opts) ---
 (() => {
   // ---- Tables (cut to versions 1..10, ECC M only) ----
-  // Per version: [ecwPerBlock, g1Blocks, g1Data, g2Blocks, g2Data]
   const EC_M = {
     1:[10,1,16,0,0], 2:[16,1,28,0,0], 3:[26,1,44,0,0], 4:[18,2,32,0,0], 5:[24,2,43,0,0],
     6:[16,4,27,0,0], 7:[18,2,31,2,32], 8:[22,2,38,2,39], 9:[22,4,36,0,0], 10:[26,2,43,2,44]
-  }; // from QR spec tables (Thonky) :contentReference[oaicite:0]{index=0}
-  const REM_BITS = {1:0,2:7,3:7,4:7,5:7,6:7,7:0,8:0,9:0,10:0}; // remainder bits per version (1..10) :contentReference[oaicite:1]{index=1}
+  };
+  const REM_BITS = {1:0,2:7,3:7,4:7,5:7,6:7,7:0,8:0,9:0,10:0};
   const ALIGN = {
     1:[],2:[6,18],3:[6,22],4:[6,26],5:[6,30],6:[6,34],7:[6,22,38],8:[6,24,42],9:[6,26,46],10:[6,28,50]
-  }; // alignment pattern centers :contentReference[oaicite:2]{index=2}
-  // Format info bits (masked) for ECC M by mask 0..7 (15 bits)
+  };
   const FMT_M = [
     0b101010000010010, 0b101000100100101, 0b101111001111100, 0b101101101001011,
     0b100010111111001, 0b100000011001110, 0b100111110010111, 0b100101010100000
-  ]; // :contentReference[oaicite:3]{index=3}
-  // Version info (bits) for v>=7 (18 bits). We only need 7..10.
+  ];
   const VER_INFO = {
     7:  0b000111110010010100, 8:  0b001000010110111100,
     9:  0b001001101010011001, 10: 0b001010010011010011
-  }; // :contentReference[oaicite:4]{index=4}
+  };
 
-  // ---- GF(256) for Reed–Solomon (QR uses primitive poly 0x11D) ----
+  // ---- GF(256) for Reed–Solomon ----
   const GF_EXP = new Uint8Array(512);
   const GF_LOG = new Uint8Array(256);
   (function initGF(){
@@ -31,14 +28,11 @@
   })();
   function gfMul(a,b){ if (a===0||b===0) return 0; return GF_EXP[GF_LOG[a]+GF_LOG[b]]; }
   function rsGenPoly(deg){
-    // Build generator polynomial (x-α^0)(x-α^1)...(x-α^(deg-1))
     let poly = new Uint8Array(deg+1); poly[0]=1;
     for (let d=0; d<deg; d++){
       const nxt = new Uint8Array(deg+1);
       for (let i=0;i<=d;i++){
-        // multiply by x
         nxt[i+1] ^= poly[i];
-        // add α^d * poly
         nxt[i]   ^= gfMul(poly[i], GF_EXP[d]);
       }
       poly = nxt;
@@ -50,7 +44,6 @@
     const res = new Uint8Array(ecw);
     for (let i=0;i<data.length;i++){
       const factor = data[i] ^ res[0];
-      // shift left
       res.copyWithin(0,1); res[res.length-1]=0;
       if (factor!==0){
         for (let j=0;j<gen.length;j++){
@@ -84,10 +77,10 @@
     }
   }
 
-  // ---- Capacity & structure helpers for ECC M (versions 1..10) ----
+  // ---- Capacity & structure helpers ----
   function dataCapacityBits(ver){
     const cfg = EC_M[ver];
-    const k = cfg[1]*cfg[2] + cfg[3]*cfg[4]; // total data codewords
+    const k = cfg[1]*cfg[2] + cfg[3]*cfg[4];
     return k * 8;
   }
   function makeBlocks_M(ver, dataBytes){
@@ -96,9 +89,7 @@
     const blocks = [];
     for (let i=0;i<g1n;i++){ blocks.push({data: dataBytes.slice(off, off+g1k), ec: null}); off+=g1k; }
     for (let i=0;i<g2n;i++){ blocks.push({data: dataBytes.slice(off, off+g2k), ec: null}); off+=g2k; }
-    // compute ecc for each
     for (const b of blocks){ b.ec = rsComputeECC(b.data, ecw); }
-    // interleave
     const maxK = Math.max(g1k, g2k);
     const out = [];
     for (let i=0;i<maxK;i++){
@@ -121,7 +112,7 @@
         if (xx<0||yy<0||yy>=m.length||xx>=m.length) continue;
         const on = (dx>=0&&dx<=6 && dy>=0&&dy<=6 &&
                    (dx===0||dx===6||dy===0||dy===6 || (dx>=2&&dx<=4 && dy>=2&&dy<=4)));
-        m[yy][xx] = on ? 1 : 0; // include separator (0) around
+        m[yy][xx] = on ? 1 : 0;
       }
     }
   }
@@ -137,7 +128,6 @@
     if (centers.length===0) return;
     for (let cy of centers){
       for (let cx of centers){
-        // skip the three finder zones overlaps
         if ((cx===6 && cy===6)||(cx===m.length-7 && cy===6)||(cx===6 && cy===m.length-7)) continue;
         for (let dy=-2;dy<=2;dy++){
           for (let dx=-2;dx<=2;dx++){
@@ -154,7 +144,7 @@
       if (i!==6){ m[8][i]=0; m[i][8]=0; }
     }
     for (let i=0;i<8;i++){ m[n-1-i][8]=0; m[8][n-1-i]=0; }
-    m[n-8][8]=1; // dark module (fixed)
+    m[n-8][8]=1;
   }
   function placeVersionInfo(m, ver){
     if (ver<7) return;
@@ -162,26 +152,23 @@
     for (let i=0;i<18;i++){
       const b = (bits >> i) & 1;
       const r = Math.floor(i/3), c = i%3;
-      // top-right below finder
       m[r][n-11+c] = b;
-      // left-bottom to the left of finder
       m[n-11+c][r] = b;
     }
   }
 
   function fillData(m, dataBits, maskId){
     const n=m.length;
-    let i = dataBits.length-1;
+    let i = 0; // FIXED: Start from beginning
     let dirUp = true;
     for (let x = n-1; x>=0; x-=2){
-      if (x===6) x--; // skip timing column
+      if (x===6) x--;
       for (let yInner=0; yInner<n; yInner++){
         const y = dirUp ? (n-1-yInner) : yInner;
         for (let dx=0; dx<2; dx++){
           const xx = x-dx, yy=y;
           if (m[yy][xx] !== null) continue;
-          let bit = (i>=0) ? dataBits[i--] : 0;
-          // apply mask
+          let bit = (i<dataBits.length) ? dataBits[i++] : 0; // FIXED: Forward direction
           if (mask(maskId, xx, yy)) bit ^= 1;
           m[yy][xx] = bit;
         }
@@ -204,7 +191,7 @@
     }
   }
 
-  // ---- Penalty scoring (simplified but spec-compliant) ----
+  // ---- Penalty scoring ----
   function penalty(m){
     const n=m.length;
     let p=0;
@@ -259,41 +246,33 @@
   // ---- Format info write ----
   function writeFormat(m, fmt15){
     const n=m.length;
-    // into the two strips around TL finder
     for (let i=0;i<6;i++) m[i][8] = (fmt15 >> i) & 1;
     m[7][8] = (fmt15 >> 6) & 1;
     m[8][8] = (fmt15 >> 7) & 1;
     m[8][7] = (fmt15 >> 8) & 1;
     for (let i=9;i<15;i++) m[8][14-i] = (fmt15 >> i) & 1;
 
-    // and the other copy
     for (let i=0;i<8;i++) m[n-1-i][8] = (fmt15 >> i) & 1;
     for (let i=0;i<7;i++) m[8][n-1-i] = (fmt15 >> (14-i)) & 1;
   }
 
-  // ---- Encode (byte mode, ECC M, version auto≤10) ----
+  // ---- Encode ----
   function encodeBytes(bytes){
-    // try versions 1..10; require bits <= dataCapacityBits(ver)
     for (let ver=1; ver<=10; ver++){
       const cap = dataCapacityBits(ver);
       const cciBits = (ver<=9) ? 8 : 16;
-      const needed = 4 + cciBits + bytes.length*8 + 4; // mode+len+data+terminator(≤4)
+      const needed = 4 + cciBits + bytes.length*8 + 4;
       if (needed <= cap) {
-        // build bit stream
         const bb = new BitBuf();
-        bb.put(0b0100,4); // byte mode
+        bb.put(0b0100,4);
         bb.put(bytes.length, cciBits);
         bb.putBytes(bytes);
-        // terminator up to 4 bits
         const toTerm = Math.min(4, cap - bb.length);
         bb.put(0, toTerm);
-        // pad to byte
         bb.padToBytes();
-        // pad bytes 0xEC, 0x11
         const needBytes = (cap/8|0) - (bb.length/8|0);
         const pads = new Uint8Array(needBytes);
         for (let i=0;i<needBytes;i++) pads[i] = (i%2) ? 0x11 : 0xEC;
-        // final data codewords
         const dataBytes = new Uint8Array(bb.toBytes().length + pads.length);
         dataBytes.set(bb.toBytes(), 0); dataBytes.set(pads, bb.toBytes().length);
         return { ver, dataBytes };
@@ -306,35 +285,32 @@
   function drawQRCode(canvas, text, {margin=2, scale=4} = {}){
     const bytes = (new TextEncoder()).encode(text);
     const { ver, dataBytes } = encodeBytes(bytes);
-    // structure final message (interleave w/ ECC) for ECC M
     const finalCW = makeBlocks_M(ver, dataBytes);
 
-    // Build base matrix with function patterns & reserves
     const n = sizeFor(ver);
     let bestMask = 0, bestMatrix = null, bestScore = Infinity;
 
-    // data bits array (MSB-first per byte)
-    const dataBits = new Array(finalCW.length*8);
+    // FIXED: Correct MSB-first bit order
+    const dataBits = new Array(finalCW.length*8 + REM_BITS[ver]);
     for (let i=0;i<finalCW.length;i++){
       const b = finalCW[i];
-      for (let k=0;k<8;k++) dataBits[i*8 + (7-k)] = (b>>k)&1;
+      for (let k=0;k<8;k++) dataBits[i*8 + k] = (b>>(7-k))&1; // FIXED
     }
-    // (remainder bits are implicitly filled by unassigned modules; versions 1..10: see table)
+    // Add remainder bits (always 0)
+    for (let i=finalCW.length*8; i<dataBits.length; i++){
+      dataBits[i] = 0;
+    }
 
     for (let maskId=0; maskId<8; maskId++){
       const m = emptyMatrix(n);
-      // function patterns
       placeFinder(m,0,0); placeFinder(m,n-7,0); placeFinder(m,0,n-7);
       placeTiming(m); placeAlign(m, ver); reserveFormatAreas(m); placeVersionInfo(m, ver);
-      // fill data with mask applied
       fillData(m, dataBits, maskId);
-      // write format info for ECC M + maskId
       writeFormat(m, FMT_M[maskId]);
       const score = penalty(m);
       if (score < bestScore){ bestScore=score; bestMask=maskId; bestMatrix=m; }
     }
 
-    // Draw
     const m = bestMatrix;
     const px = Math.max(1, scale|0);
     const quiet = Math.max(0, margin|0);
@@ -350,6 +326,5 @@
     }
   }
 
-  // expose
   window.drawQRCode = drawQRCode;
 })();
