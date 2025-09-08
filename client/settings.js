@@ -1,4 +1,4 @@
-let SETTINGS = { username: '', requirePass: false, roomSkB64: '' };
+let SETTINGS = { username: '', profilecolor: '#2b6cb0', requirePass: false };
 const SETTINGS_KEY = 'secmsg_settings_v1';
 
 export function loadSettings() {

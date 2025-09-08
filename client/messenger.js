@@ -1,4 +1,4 @@
-import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId} from './utils.js';
+import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId, sanitizeColorHex, pickTextColorOn} from './utils.js';
 import {loadSettings, saveSettings} from './settings.js';
 
 async function ensureSodium() { await sodium.ready; }
@@ -64,6 +64,7 @@ const prof = {
   btnAvatarUpload: document.getElementById('btnAvatarUpload'),
   btnAvatarClear: document.getElementById('btnAvatarClear'),
   requirePass: document.getElementById('profRequirePass'),
+  profileColor: document.getElementById('profileColor'),
 };
 
 // Invite (sender)
@@ -804,6 +805,7 @@ async function profileMetaPut(serverUrl, roomId, senderId, meta) {
 
 async function buildMyProfilePayload() {
   const name = (SETTINGS.username || '').trim();
+  const color = (sanitizeColorHex(SETTINGS.profilecolor) || '').trim();
   const avatar = await profileGet('avatar');  // the 192×192 PNG
   let ah = null, ab = null;
   if (avatar) {
@@ -812,7 +814,7 @@ async function buildMyProfilePayload() {
     ah = hash;
     ab = await blobToB64u(avatar);
   }
-  return { v: 1, name, ah, ab, ts: nowMs() };
+  return { v: 1, name, color, ah, ab, ts: nowMs() };
 }
 
 async function sendMyProfile(serverUrl, roomId) {
@@ -843,6 +845,7 @@ async function applyProfileCipher(serverUrl, roomId, senderId, ctB64) {
     return; // ignore malformed
   }
   const name = (obj.name || '').trim();
+  const color = (sanitizeColorHex(obj.color) || '').trim();
   let avatarHash = obj.ah || null;
 
   // If bytes are included, store them and trust their hash
@@ -856,7 +859,7 @@ async function applyProfileCipher(serverUrl, roomId, senderId, ctB64) {
     } catch {}
   }
 
-  await profileMetaPut(serverUrl, roomId, senderId, { name, avatarHash });
+  await profileMetaPut(serverUrl, roomId, senderId, { name, color, avatarHash });
   updateMessagesForSender(serverUrl, roomId, senderId);
 }
 
@@ -934,6 +937,7 @@ async function refreshAvatarPreview() {
 async function openProfile() {
   await ensureIdentity();
   prof.name.value = (SETTINGS.username || '').trim();
+  prof.profileColor.value = (sanitizeColorHex(SETTINGS.profilecolor) || '').trim();
   prof.pubKey.value = myPeerId || (myIdPk ? b64u(myIdPk) : '');
   prof.requirePass.checked = !!SETTINGS.requirePass;   // <-- add this
   await refreshAvatarPreview();
@@ -944,7 +948,8 @@ function closeProfile() { prof.dlg.close(); }
 
 async function saveProfile() {
   SETTINGS.username = (prof.name.value || '').trim();
-
+  SETTINGS.profilecolor = (sanitizeColorHex(prof.profileColor.value) || '').trim();
+    
   const prev = !!SETTINGS.requirePass;
   const next = !!prof.requirePass.checked;
 
@@ -1208,7 +1213,7 @@ function renderTextMessage({ text, ts, senderId, verified }, { prepend=false } =
   // Name label (uses profile; fallback to short id or 'room')
   const label = document.createElement('div'); label.className = 'name-label';
   const whoFallback = senderId ? shortId(senderId) : 'room';
-  label.textContent = `${whoFallback} • ${new Date(ts || nowMs()).toLocaleString()}${verified === false ? ' • ⚠︎ unverified' : ''}`;
+  label.textContent = `${whoFallback}${verified === false ? ' ⚠︎ unverified' : ''}`; //`${whoFallback} • ${new Date(ts || nowMs()).toLocaleString()}${verified === false ? ' • ⚠︎ unverified' : ''}`;
   wrap.appendChild(label);
 
   // Bubble
@@ -1224,21 +1229,59 @@ function renderTextMessage({ text, ts, senderId, verified }, { prepend=false } =
   const active = { serverUrl: VL?.serverUrl, roomId: VL?.roomId };
   if (senderId && active.serverUrl && active.roomId) {
     requestProfileIfMissing(active.serverUrl, active.roomId, senderId);
-    fillAvatarAndName(avatar, label, active.serverUrl, active.roomId, senderId, ts);
+    fillProfile(avatar, label, bubble, active.serverUrl, active.roomId, senderId, ts);
   }
   return row;
 }
 
 function fileBubbleSkeleton({ meta, ts, nickname, senderId, verified }, { prepend=false } = {}) {
   const row = document.createElement('div');
+  if (senderId) row.dataset.senderId = senderId;
   const isMe = senderId && myPeerId && senderId === myPeerId;
   row.className = 'row ' + (isMe ? 'me' : 'other');
 
   const wrap = document.createElement('div'); wrap.className = 'wrap';
+
+  // Avatar chip
+  const avatar = document.createElement('div'); avatar.className = 'msg-avatar';
+  wrap.appendChild(avatar);
+
+  // Name label (uses profile; fallback to short id or 'room')
+  const label = document.createElement('div'); label.className = 'name-label';
+  const whoFallback = senderId ? shortId(senderId) : 'room';
+  label.textContent = `${whoFallback}${verified === false ? ' ⚠︎ unverified' : ''}`; //`${whoFallback} • ${new Date(ts || nowMs()).toLocaleString()}${verified === false ? ' • ⚠︎ unverified' : ''}`;
+  wrap.appendChild(label);
+
+  // Bubble
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+  bubble.dataset.hash = meta.hash;
+  if (meta.mime && meta.mime.startsWith('image/')) bubble.textContent = 'Image pending…';
+  else {
+    const p = document.createElement('div');
+    p.textContent = `${meta.name || 'file'} (${meta.size || '?'} bytes)`;
+    bubble.appendChild(p);
+  }
+  wrap.appendChild(bubble);
+
+  row.appendChild(wrap);
+  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
+  else ui.messages.appendChild(row);
+
+  // Try to fill profile bits asynchronously
+  const active = { serverUrl: VL?.serverUrl, roomId: VL?.roomId };
+  if (senderId && active.serverUrl && active.roomId) {
+    requestProfileIfMissing(active.serverUrl, active.roomId, senderId);
+    fillProfile(avatar, label, bubble, active.serverUrl, active.roomId, senderId, ts);
+  }
+  return bubble;
+    
+/*    
+  const wrap = document.createElement('div'); wrap.className = 'wrap';
+  const avatar = document.createElement('div'); avatar.className = 'msg-avatar'; 
   const label = document.createElement('div'); label.className = 'name-label';
   const who = nickname || (senderId ? shortId(senderId) : 'room');
   const when = new Date(ts || nowMs()).toLocaleString();
-  label.textContent = `${who} • ${when}${verified === false ? ' • ⚠︎ unverified' : ''}`;
+  label.textContent = `${who}${verified === false ? ' ⚠︎ unverified' : ''}`; //`${who} • ${when}${verified === false ? ' • ⚠︎ unverified' : ''}`;
 
   const bubble = document.createElement('div'); bubble.className = 'bubble';
   bubble.dataset.hash = meta.hash;
@@ -1249,10 +1292,13 @@ function fileBubbleSkeleton({ meta, ts, nickname, senderId, verified }, { prepen
     bubble.appendChild(p);
   }
 
-  wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+  wrap.appendChild(avatar); wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
   if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
   else ui.messages.appendChild(row);
+  const active = { serverUrl: VL?.serverUrl, roomId: VL?.roomId };
+  fillProfile?.(avatar, label, bubble, active.serverUrl, active.roomId, senderId, ts);  
   return bubble;
+  */
 }
 
 async function renderFileIfAvailable(bubbleEl, meta) {
@@ -1329,13 +1375,18 @@ function pruneBottomIfNeeded() {
   while (el.children.length > MAX_DOM_MESSAGES) el.removeChild(el.lastChild);
 }
 
-async function fillAvatarAndName(avatarEl, labelEl, serverUrl, roomId, senderId, ts) {
+async function fillProfile(avatarEl, labelEl, bubbleEl, serverUrl, roomId, senderId, ts) {
   const meta = await profileMetaGet(serverUrl, roomId, senderId);
   // Update name if present
   if (meta?.name) {
-    const base = `${meta.name} • ${new Date(ts || nowMs()).toLocaleString()}`;
+    const base = `${meta.name}` // • ${new Date(ts || nowMs()).toLocaleString()}`;
     labelEl.textContent = base;
   }
+  // update color if present
+  if (meta?.color) {
+    bubbleEl.style.backgroundColor = sanitizeColorHex(meta.color);
+    bubbleEl.style.color = pickTextColorOn(meta.color);  
+  }    
   // Update avatar if present
   if (meta?.avatarHash) {
     const blob = await idbGet(meta.avatarHash);
@@ -1361,9 +1412,10 @@ async function updateMessagesForSender(serverUrl, roomId, senderId) {
     const wrap = row.querySelector('.wrap');
     const avatarEl = wrap?.querySelector('.msg-avatar');
     const labelEl  = wrap?.querySelector('.name-label');
+    const bubbleEl  = wrap?.querySelector('.bubble');
     if (avatarEl && labelEl) {
       const ts = (labelEl.textContent.match(/• (.*)$/) ? Date.parse(RegExp.$1) : nowMs());
-      fillAvatarAndName(avatarEl, labelEl, serverUrl, roomId, senderId, ts);
+      fillProfile(avatarEl, labelEl, bubbleEl, serverUrl, roomId, senderId, ts);
     }
   }
 }
@@ -1404,7 +1456,8 @@ function buildRowFromRecord(rec) {
   const label = document.createElement('div'); label.className = 'name-label';
   const who = rec.nickname || (rec.senderId ? shortId(rec.senderId) : 'room');
   const when = new Date(rec.ts || nowMs()).toLocaleString();
-  label.textContent = `${who} • ${when}${rec.verified === false ? ' • ⚠︎ unverified' : ''}`;
+  const color = rec.color || '2b6cb0'
+  label.textContent = `${who}${rec.verified === false ? ' ⚠︎ unverified' : ''}`; // `${who} • ${when}${rec.verified === false ? ' • ⚠︎ unverified' : ''}`;
   wrap.appendChild(label);
 
   // Bubble
@@ -1437,7 +1490,7 @@ function buildRowFromRecord(rec) {
     setTimeout(() => requestProfileIfMissing(serverUrl, roomId, rec.senderId), 250);
 
     // 2) Immediate best-effort fill from cache; it will re-fill again on notify/retrieve
-    fillAvatarAndName?.(avatar, label, serverUrl, roomId, rec.senderId, rec.ts);
+    fillProfile?.(avatar, label, bubble, serverUrl, roomId, rec.senderId, rec.ts);
   }
 
   return { node: row, bubble: (rec.kind === 'file') ? bubble : null, meta: fileMeta };
@@ -1604,9 +1657,10 @@ function appendLiveRecord(rec) {
   // ↓ ensure live messages also trigger a profile fetch/fill
   if (rec.senderId && VL?.serverUrl && VL?.roomId) {
     setTimeout(() => requestProfileIfMissing(VL.serverUrl, VL.roomId, rec.senderId), 250);
-    fillAvatarAndName?.(
+    fillProfile?.(
       built.node.querySelector('.msg-avatar'),
       built.node.querySelector('.name-label'),
+      built.node.querySelector('.bubble'),	
       VL.serverUrl, VL.roomId, rec.senderId, rec.ts
     );
   }
