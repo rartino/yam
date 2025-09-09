@@ -31,7 +31,7 @@ main{
 .me .bubble { background:var(--bubble-me); color:white; border-top-right-radius:6px; }
 .other { justify-content:flex-start; }
 .other .bubble { background:var(--bubble-other); color:#eaeaea; border-top-left-radius:6px; }
-.bubble img { max-width: 68vw; height: auto; display:block; border-radius:12px; }
+.bubble img { width: 100%; height: auto; display:block; border-radius:12px; }
 .file-link { color:#cdd; text-decoration: underline; word-break: break-all; }
 
 .composer{
