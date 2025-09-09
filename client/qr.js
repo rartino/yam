@@ -156,10 +156,17 @@
       m[n-11+c][r] = b;
     }
   }
-  function fillData(m, dataBits, maskId){
-    const n=m.length;
-    let i = 0; // FIXED: Start from beginning
+  function placeDarkModule(m, ver) {
+    if (ver >= 2) { // Dark module exists for all versions except 1
+      const n = m.length;
+      m[4 * ver + 9][8] = 1; // Standard position for dark module
+    }
+  }
+  function fillData(m, dataBits, maskId) {
+    const n = m.length;
+    let i = 0;
     let dirUp = true;
+    
     for (let x = n-1; x>=0; x-=2){
       if (x===6) x--;
       for (let yInner=0; yInner<n; yInner++){
@@ -167,7 +174,9 @@
         for (let dx=0; dx<2; dx++){
           const xx = x-dx, yy=y;
           if (m[yy][xx] !== null) continue;
-          let bit = (i<dataBits.length) ? dataBits[i++] : 0; // FIXED: Forward direction
+          
+          let bit = (i<dataBits.length) ? dataBits[i++] : 0;
+          // Apply mask ONLY to data cells (not reserved areas)
           if (mask(maskId, xx, yy)) bit ^= 1;
           m[yy][xx] = bit;
         }
@@ -192,75 +201,116 @@
 
   // ---- Penalty scoring ----
   function penalty(m){
-    const n=m.length;
-    let p=0;
-    // Rule 1: rows + cols
-    for (let y=0;y<n;y++){
-      let run=1;
-      for (let x=1;x<n;x++){
-        if (m[y][x]===m[y][x-1]) run++; else { if (run>=5) p+=3+(run-5); run=1; }
+    const n = m.length;
+    let p = 0;
+    
+    // Rule 1: 5+ same modules in row/column
+    for (let y = 0; y < n; y++) {
+      let run = 1;
+      for (let x = 1; x < n; x++) {
+        if (m[y][x] === m[y][x-1]) {
+          run++;
+        } else {
+          if (run >= 5) p += 3 + (run - 5);
+          run = 1;
+        }
       }
-      if (run>=5) p+=3+(run-5);
+      if (run >= 5) p += 3 + (run - 5);
     }
-    for (let x=0;x<n;x++){
-      let run=1;
-      for (let y=1;y<n;y++){
-        if (m[y][x]===m[y-1][x]) run++; else { if (run>=5) p+=3+(run-5); run=1; }
+  
+    for (let x = 0; x < n; x++) {
+      let run = 1;
+      for (let y = 1; y < n; y++) {
+        if (m[y][x] === m[y-1][x]) {
+          run++;
+        } else {
+          if (run >= 5) p += 3 + (run - 5);
+          run = 1;
+        }
       }
-      if (run>=5) p+=3+(run-5);
+      if (run >= 5) p += 3 + (run - 5);
     }
-    // Rule 2: 2x2 blocks
-    for (let y=0;y<n-1;y++)
-      for (let x=0;x<n-1;x++)
-        if (m[y][x]===m[y][x+1] && m[y][x]===m[y+1][x] && m[y][x]===m[y+1][x+1]) p+=3;
-    // Rule 3: finder-like patterns
-    const patA = [1,0,1,1,1,0,1,0,0,0,0];
-    const patB = [0,0,0,0,1,0,1,1,1,0,1];
-    function hasPattern(arr, idx, line){
-      for (let k=0;k<11;k++) if (line[idx+k]!==arr[k]) return false;
+  
+    // Rule 2: 2x2 blocks of same color
+    for (let y = 0; y < n-1; y++) {
+      for (let x = 0; x < n-1; x++) {
+        if (m[y][x] === m[y][x+1] && 
+            m[y][x] === m[y+1][x] && 
+            m[y][x] === m[y+1][x+1]) {
+          p += 3;
+        }
+      }
+    }
+  
+    // Rule 3: finder-like patterns (10111010000 and 00001011101)
+    const pat1 = [1,0,1,1,1,0,1,0,0,0,0]; // 10111010000
+    const pat2 = [0,0,0,0,1,0,1,1,1,0,1]; // 00001011101
+    
+    function checkPattern(arr, start, line) {
+      for (let k = 0; k < 11; k++) {
+        if (line[start + k] !== arr[k]) return false;
+      }
       return true;
     }
-    for (let y=0;y<n;y++){
+  
+    // Check rows
+    for (let y = 0; y < n; y++) {
       const row = m[y];
-      for (let x=0;x<=n-11;x++){
-        if (hasPattern(patA,x,row) || hasPattern(patB,x,row)) p+=40;
+      for (let x = 0; x <= n-11; x++) {
+        if (checkPattern(pat1, x, row) || checkPattern(pat2, x, row)) {
+          p += 40;
+        }
       }
     }
-    for (let x=0;x<n;x++){
+  
+    // Check columns
+    for (let x = 0; x < n; x++) {
       const col = new Array(n);
-      for (let y=0;y<n;y++) col[y]=m[y][x];
-      for (let y=0;y<=n-11;y++){
-        if (hasPattern(patA,y,col) || hasPattern(patB,y,col)) p+=40;
+      for (let y = 0; y < n; y++) col[y] = m[y][x];
+      for (let y = 0; y <= n-11; y++) {
+        if (checkPattern(pat1, y, col) || checkPattern(pat2, y, col)) {
+          p += 40;
+        }
       }
     }
-    // Rule 4: dark ratio
-    let dark=0;
-    for (let y=0;y<n;y++) for (let x=0;x<n;x++) if (m[y][x]) dark++;
-    const percent = (dark * 100) / (n*n);
-    const k = Math.abs(percent - 50) / 5;
-    p += Math.floor(k) * 10;
+  
+    // Rule 4: dark module ratio
+    let darkCount = 0;
+    for (let y = 0; y < n; y++) {
+      for (let x = 0; x < n; x++) {
+        if (m[y][x] === 1) darkCount++;
+      }
+    }
+    
+    const ratio = (darkCount * 100) / (n * n);
+    const deviation = Math.abs(ratio - 50);
+    p += Math.floor(deviation / 5) * 10;
+  
     return p;
   }
-
-  // ---- Format info write ----
-  function writeFormat(m, fmt15){
+  function writeFormat(m, fmt15) {
     const n = m.length;
     
-    // Top-left block around the (8,*) and (*,8) cross
-    for (let i=0;i<6;i++) m[i][8] = (fmt15 >> i) & 1;
-    m[7][8] = (fmt15 >> 6) & 1;
-    m[8][8] = (fmt15 >> 7) & 1;
-    m[8][7] = (fmt15 >> 8) & 1;
-    for (let i=9;i<15;i++) m[8][14 - i] = (fmt15 >> i) & 1;
-
-    // Top-right row (leftwards) – this was already correct
-    for (let i=0;i<8;i++) m[8][n-1 - i] = (fmt15 >> i) & 1;
-
-    // Bottom-left column (upwards) – **fixed order**
-    // Write bits 14..8 to y = n-1..n-7 respectively
-    for (let k=0;k<7;k++){
-      const bit = (fmt15 >> (14 - k)) & 1;   // 14,13,...,8
-      m[n-1 - k][8] = bit;                   // y = n-1, n-2, ..., n-7
+    // Top-left format area (around finder pattern)
+    for (let i = 0; i < 8; i++) {
+      m[8][i < 6 ? i : i + 1] = (fmt15 >> (14 - i)) & 1;
+    }
+    m[8][7] = (fmt15 >> 7) & 1;
+    m[8][8] = (fmt15 >> 8) & 1;
+    m[7][8] = (fmt15 >> 9) & 1;
+    
+    for (let i = 10; i < 15; i++) {
+      m[14 - i][8] = (fmt15 >> (14 - i)) & 1;
+    }
+    
+    // Top-right format area
+    for (let i = 0; i < 7; i++) {
+      m[i][8] = (fmt15 >> i) & 1;
+    }
+    
+    // Bottom-left format area
+    for (let i = 0; i < 7; i++) {
+      m[8][n - 1 - i] = (fmt15 >> i) & 1;
     }
   }
 
@@ -310,9 +360,11 @@
     }
 
     for (let maskId=0; maskId<8; maskId++){
-      const m = emptyMatrix(n);
+const m = emptyMatrix(n);
       placeFinder(m,0,0); placeFinder(m,n-7,0); placeFinder(m,0,n-7);
-      placeTiming(m); placeAlign(m, ver); reserveFormatAreas(m); placeVersionInfo(m, ver);
+      placeTiming(m); placeAlign(m, ver); reserveFormatAreas(m); 
+      placeVersionInfo(m, ver);
+      placeDarkModule(m, ver);
       fillData(m, dataBits, maskId);
       writeFormat(m, FMT_M[maskId]);
       const score = penalty(m);
