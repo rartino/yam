@@ -156,12 +156,12 @@
 
       <div class="settings-stack">
 	<div class="field">
-	  <label for="joinServer" class="muted">Server hosting the room</label>
+	  <label for="joinServer" class="muted">Server hosting the room you want to be invited to</label>
 	  <input id="joinServer" placeholder="https://rartino.pythonanywhere.com" />
 	</div>
 
 	<div class="field">
-	  <label class="muted">Your identity code (send to inviter to get invited)</label>
+	  <label class="muted">Your identity code (send this to the inviter)</label>
 	  <textarea id="joinCode" class="codearea" readonly rows="3" spellcheck="false"></textarea>
 	  <div class="row-buttons row-buttons--auto2">
 	    <button type="button" id="btnCopyJoinCode">Copy</button>
@@ -170,8 +170,8 @@
 	</div>
 
 	<div class="field">
-	  <label class="muted">... or ask inviter to scan this QR code</label>
-	  <canvas id="joinQrCanvas" width="0" height="0" class="qr-canvas"></canvas>
+	  <label class="muted">... or have the inviter scan this QR code</label>
+  	  <div id="joinQrCode"></div>
 	</div>
       </div>
     </form>
@@ -182,14 +182,16 @@
     <button id="btnCloseInvite" class="dialog-close" aria-label="Close">×</button>
     <form method="dialog">
       <h3 class="modal-title">Invite to the current room</h3>
-
+      <p class="muted help">
+	Note: it is not possible to remove people from a room once invited.
+      </p>
       <div class="settings-stack">
 	<div class="field">
-	  <label class="muted">Identity to invite</label>
-	  <textarea id="inviteCodeInput" class="codearea" rows="3" placeholder="yam-v1:relay.example.com:AbCd…" spellcheck="false"></textarea>
+	  <label class="muted">Identity code to send invite</label>
+	  <textarea id="inviteCodeInput" class="codearea" rows="3" placeholder="... paste invite identity code here or scan a QR code ..." spellcheck="false"></textarea>
 	  <div class="row-buttons row-buttons--auto2">
-	    <button type="button" id="btnScanInviteQr">Scan QR</button>
 	    <button type="button" id="btnPasteInviteCode">Paste</button>
+	    <button type="button" id="btnScanInviteQr">Scan QR</button>
 	  </div>
 	</div>
 
@@ -267,6 +269,7 @@
   </div>
 
   <script src="vendor/sodium/sodium.js"></script>
+  <script src="vendor/qrcodejs/qrcode.js"></script>
   <script type="module" src="boot.js"></script>
 
 </body>

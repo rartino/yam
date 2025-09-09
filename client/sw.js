@@ -11,17 +11,17 @@ fetch('./manifest.json')
       './manifest.json',
       './site.webmanifest',
       './sw.js',
-      './qr.js',
-      './utils.js',
-      './settings.js',		
-      './yam.css',
-      './boot.js',
       `./messenger.js?v=${APP_VERSION}`,
+      './utils.js?v=${APP_VERSION}',
+      './settings.js?v=${APP_VERSION}',		
+      './yam.css?v=${APP_VERSION}',
+      './boot.js?v=${APP_VERSION}',
       './offline.html',
       './android-chrome-192x192.png',
       './android-chrome-512x512.png',
       './apple-touch-icon.png',	
       './logo.svg',
+      './vendor/qrcodejs/qrcode.js',
       './vendor/sodium/sodium.js'
     ];
 

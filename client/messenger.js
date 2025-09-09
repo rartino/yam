@@ -85,7 +85,7 @@ const join = {
   dlg: document.getElementById('joinModal'),
   server: document.getElementById('joinServer'),
   codeTA: document.getElementById('joinCode'),
-  qrCanvas: document.getElementById('joinQrCanvas'),
+  qrCode: document.getElementById('joinQrCode'),
   qrHint: document.getElementById('joinQrHint'),
   btnCopyCode: document.getElementById('btnCopyJoinCode'),
   btnRefresh: document.getElementById('btnRefreshJoinCode'),
@@ -2467,17 +2467,18 @@ function openInviteDialog(){
 
 let _joinWait = { ws:null, curvePk:null, curveSk:null, hash:null, host:null };
 
-async function drawInviteQr(text){
+//async function drawInviteQr(text){
   // If you already have a QR lib, call it here; otherwise draw a simple fallback box
-  const c = join.qrCanvas;
-  if (!c) return;
-  if (typeof window.drawQRCode === 'function') {
-    window.drawQRCode(c, text);  // hook for your preferred QR lib
-    return;
-  }
+  //const c = join.qrCanvas;
+  //if (!c) return;
+  //new QRCode(join.qrCanvas, text);
+  //if (typeof window.drawQRCode === 'function') {
+  //  window.drawQRCode(c, text);  // hook for your preferred QR lib
+  //  return;
+  //}
   // Fallback placeholder (no QR lib): show nothing, keep hint
-  c.width = c.height = 0;
-}
+  //c.width = c.height = 0;
+//}
 
 async function openJoinDialog(){
   await ensureSodium();
@@ -2494,7 +2495,9 @@ async function openJoinDialog(){
 
   const code = encodeInviteCode(_joinWait.host, b64u(_joinWait.curvePk));
   join.codeTA.value = code;
-  await drawInviteQr(code);
+  join.qrCode.innerHTML = "";  
+  new QRCode(join.qrCode, { text: code, width: 192, height: 192, colorDark: "#000000", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.M } );
+  //await drawInviteQr(code);
 
   // Open waiting WS to this server, register invite-open
   if (_joinWait.ws) { try { _joinWait.ws.close(); } catch{} }
