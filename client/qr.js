@@ -9,10 +9,6 @@
   const ALIGN = {
     1:[],2:[6,18],3:[6,22],4:[6,26],5:[6,30],6:[6,34],7:[6,22,38],8:[6,24,42],9:[6,26,46],10:[6,28,50]
   };
-  const FMT_M = [
-    0b101010000010010, 0b101000100100101, 0b101111001111100, 0b101101101001011,
-    0b100010111111001, 0b100000011001110, 0b100111110010111, 0b100101010100000
-  ];
   const VER_INFO = {
     7:  0b000111110010010100, 8:  0b001000010110111100,
     9:  0b001001101010011001, 10: 0b001010010011010011
@@ -53,7 +49,22 @@
     }
     return res;
   }
-
+  function bchDigit(v){ let d=0; for (; v; v>>=1) d++; return d; }
+  
+  function makeFormatBits_M(maskId){
+    const EC_M_CODE = 0b00;              // EC level M (same as the working lib)
+    const data = (EC_M_CODE << 3) | maskId;
+  
+    const G15      = 0b10100110111;      // generator (0x537)
+    const G15_MASK = 0b101010000010010;  // XOR mask (0x5412)
+  
+    let d = data << 10;                  // append 10 zero bits
+    while (bchDigit(d) - bchDigit(G15) >= 0) {
+      d ^= G15 << (bchDigit(d) - bchDigit(G15));
+    }
+    const bch = (data << 10) | d;        // 15 bits before mask
+    return bch ^ G15_MASK;               // masked 15 bits
+  }
   // ---- Bit buffer helper ----
   class BitBuf {
     constructor(){ this.bits=[]; }
@@ -124,15 +135,23 @@
     }
   }
   function placeAlign(m, ver){
-    const centers = ALIGN[ver]||[];
-    if (centers.length===0) return;
+    const centers = ALIGN[ver] || [];
+    if (centers.length === 0) return;
+  
     for (let cy of centers){
       for (let cx of centers){
-        if ((cx===6 && cy===6)||(cx===m.length-7 && cy===6)||(cx===6 && cy===m.length-7)) continue;
-        for (let dy=-2;dy<=2;dy++){
-          for (let dx=-2;dx<=2;dx++){
-            const xx=cx+dx, yy=cy+dy;
-            m[yy][xx] = (Math.max(Math.abs(dx),Math.abs(dy))===2) ? 1 : (dx===0&&dy===0 ? 1 : 0);
+        // Skip the three finder-overlap cases
+        if ((cx===6 && cy===6) || (cx===m.length-7 && cy===6) || (cx===6 && cy===m.length-7)) continue;
+  
+        // **Do not draw if something is already placed (timing, finder, etc.)**
+        if (m[cy][cx] !== null) continue;
+  
+        for (let dy=-2; dy<=2; dy++){
+          for (let dx=-2; dx<=2; dx++){
+            const xx = cx + dx, yy = cy + dy;
+            if (xx<0 || yy<0 || xx>=m.length || yy>=m.length) continue;
+            const ring = Math.max(Math.abs(dx), Math.abs(dy)) === 2;
+            m[yy][xx] = ring ? 1 : (dx===0 && dy===0 ? 1 : 0);
           }
         }
       }
@@ -314,7 +333,7 @@
       placeFinder(m,0,0); placeFinder(m,n-7,0); placeFinder(m,0,n-7);
       placeTiming(m); placeAlign(m, ver); reserveFormatAreas(m); placeVersionInfo(m, ver);
       fillData(m, dataBits, maskId);
-      writeFormat(m, FMT_M[maskId]);
+      writeFormat(m, makeFormatBits_M(maskId));
       const score = penalty(m);
       if (score < bestScore){ bestScore=score; bestMask=maskId; bestMatrix=m; }
     }
