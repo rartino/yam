@@ -11,5 +11,5 @@
     { "src": "android-chrome-512x512.png", "sizes": "512x512", "type": "image/png" },
     { "src": "apple-touch-icon.png", "sizes": "180x180", "type": "image/png", "purpose":"any" }
   ],
-  "version": "0.9.0"
+  "version": "0.10.0"
 }
