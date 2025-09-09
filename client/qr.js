@@ -3,7 +3,7 @@
   // ---- Tables (cut to versions 1..10, ECC M only) ----
   const EC_M = {
     1:[10,1,16,0,0], 2:[16,1,28,0,0], 3:[26,1,44,0,0], 4:[18,2,32,0,0], 5:[24,2,43,0,0],
-    6:[16,4,27,0,0], 7:[18,4,31,0,0], 8:[22,2,38,2,39], 9:[22,3,36,2,37], 10:[26,4,43,1,44]        
+    6:[16,4,27,0,0], 7:[18,4,31,0,0], 8:[22,2,38,2,39], 9:[22,3,36,2,37], 10:[26,4,43,1,44],        
   };
   const REM_BITS = {1:0,2:7,3:7,4:7,5:7,6:7,7:0,8:0,9:0,10:0};
   const ALIGN = {
@@ -246,14 +246,16 @@
   // ---- Format info write ----
   function writeFormat(m, fmt15){
     const n=m.length;
+    // Top-left copy
     for (let i=0;i<6;i++) m[i][8] = (fmt15 >> i) & 1;
     m[7][8] = (fmt15 >> 6) & 1;
     m[8][8] = (fmt15 >> 7) & 1;
     m[8][7] = (fmt15 >> 8) & 1;
     for (let i=9;i<15;i++) m[8][14-i] = (fmt15 >> i) & 1;
 
-    for (let i=0;i<8;i++) m[n-1-i][8] = (fmt15 >> i) & 1;
-    for (let i=0;i<7;i++) m[8][n-1-i] = (fmt15 >> (14-i)) & 1;
+    // Mirrored copy (exactly as in the spec/Nayuki)
+    for (let i=0;i<8;i++)  m[8][n-1-i]        = (fmt15 >> i) & 1;   // y=8, x from n-1 down to n-8
+    for (let i=8;i<15;i++) m[n-15 + i][8]     = (fmt15 >> i) & 1;   // x=8, y from n-7 up to n-1
   }
 
   // ---- Encode ----
