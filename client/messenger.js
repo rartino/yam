@@ -1100,6 +1100,499 @@ async function idbPut(hash, blob) {
 // RENDER
 ///////////////////////
 
+function flashBtn(btn, glyph='✓', ms=900) {
+  if (!btn) return;
+  const old = btn.textContent;
+  btn.textContent = glyph;
+  btn.disabled = true;
+  setTimeout(() => { btn.textContent = old; btn.disabled = false; }, ms);
+}
+
+async function copyTextToClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text || '');
+    return true;
+  } catch {
+    // Fallback (works in many older browsers)
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text || '';
+      ta.style.position = 'fixed';
+      ta.style.opacity = '0';
+      document.body.appendChild(ta);
+      ta.focus();
+      ta.select();
+      const ok = document.execCommand('copy');
+      document.body.removeChild(ta);
+      return ok;
+    } catch {
+      return false;
+    }
+  }
+}
+
+async function copyBlobToClipboard(blob) {
+  if (!navigator.clipboard || !('write' in navigator.clipboard) || !window.ClipboardItem) return false;
+  try {
+    const item = new ClipboardItem({ [blob.type || 'application/octet-stream']: blob });
+    await navigator.clipboard.write([item]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function fileLabel(meta = {}) {
+  const name = meta.name || 'file';
+  const size = (meta.size != null) ? `${meta.size} bytes` : '?';
+  return `[file] ${name} (${size})`;
+}
+
+async function copyMessageToClipboard(rec, btn) {
+
+  console.log('copyMessageToClipboard', rec);
+    
+  if (rec.kind === 'text') {
+    const ok = await copyTextToClipboard(rec.text || '');
+    flashBtn(btn, ok ? '✓' : '⚠︎');
+    return;
+  }
+
+  if (rec.kind === 'file') {
+    const hash = rec.meta?.hash;
+    let ok = false;
+
+    // Try copying the actual blob (best effort; images work in most modern browsers)
+    if (hash) {
+      try {
+        const blob = await idbGet(hash);
+        if (blob) ok = await copyBlobToClipboard(blob);
+      } catch { /* ignore */ }
+    }
+
+    // Fallback to text label if blob copy isn't possible
+    if (!ok) ok = await copyTextToClipboard(fileLabel(rec.meta));
+    flashBtn(btn, ok ? '✓' : '⚠︎');
+    return;
+  }
+
+  if (rec.kind === 'gap') {
+    const count = rec.count ?? Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0));
+    const ok = await copyTextToClipboard(`[${count} messages missing]`);
+    flashBtn(btn, ok ? '✓' : '⚠︎');
+  }
+}
+
+function toQuoteBlock(str) {
+  const body = (str || '').replace(/\r?\n/g, '\n> ');
+  return `> ${body}\n\n`;
+}
+
+function getMessageTextForQuote(rec) {
+  if (rec.kind === 'text') return rec.text || '';
+  if (rec.kind === 'file') {
+    const m = rec.meta || {};
+    const label = m.name || 'file';
+    const size  = (m.size != null) ? `${m.size} bytes` : '?';
+    return `[file] ${label} (${size})`;
+  }
+  if (rec.kind === 'gap') {
+    const count = rec.count ?? Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0));
+    return `[${count} messages missing]`;
+  }
+  return '';
+}
+
+function isSelf(senderId) {
+  return !!(senderId && myPeerId && senderId === myPeerId);
+}
+
+function setAvatar(avatarEl, blob) {
+  avatarEl.innerHTML = '';
+  if (!blob) { avatarEl.textContent = ''; return; }
+  const url = URL.createObjectURL(blob);
+  const img = document.createElement('img');
+  img.onload = () => URL.revokeObjectURL(url);
+  img.src = url;
+  avatarEl.appendChild(img);
+}
+
+/**
+ * One-path profile styler:
+ *  - Applies immediate hints (self SETTINGS or cached peer meta)
+ *  - Kicks off async fetch (local DB / server) to complete avatar/color/name
+ * Safe to call repeatedly.
+ */
+function styleBubbleProfile(avatarEl, nameEl, bubbleEl, { serverUrl, roomId, senderId, fallbackName }) {
+  // 1) Immediate hints
+  if (isSelf(senderId)) {
+    // self: SETTINGS are instant
+    const name = (SETTINGS?.username || '').trim();
+    if (name) nameEl.textContent = name;
+
+    const col = sanitizeColorHex(SETTINGS?.profilecolor);
+    if (col) { bubbleEl.style.backgroundColor = col; bubbleEl.style.color = pickTextColorOn(col); }
+
+    // avatar from local store (async)
+    profileGet('avatar').then(blob => { if (blob) setAvatar(avatarEl, blob); }).catch(() => {});
+    return;
+  }
+
+  // peers: try memory cache
+  const key = profileKeyLocal(serverUrl, roomId, senderId);
+  const cached = profileCache.get(key);
+  if (cached) {
+    if (cached.name)  nameEl.textContent = cached.name;
+    if (cached.color) {
+      const c = sanitizeColorHex(cached.color);
+      if (c) { bubbleEl.style.backgroundColor = c; bubbleEl.style.color = pickTextColorOn(c); }
+    }
+    if (cached.avatarHash) {
+      idbGet(cached.avatarHash).then(blob => { if (blob) setAvatar(avatarEl, blob); });
+    }
+  } else {
+    nameEl.textContent = fallbackName;
+  }
+
+  // 2) Async completion path
+  requestProfileIfMissing(serverUrl, roomId, senderId);
+  profileMetaGet(serverUrl, roomId, senderId).then(meta => {
+    if (!meta) return;
+    if (meta.name) nameEl.textContent = meta.name;
+    if (meta.color) {
+      const c = sanitizeColorHex(meta.color);
+      if (c) { bubbleEl.style.backgroundColor = c; bubbleEl.style.color = pickTextColorOn(c); }
+    }
+    if (meta.avatarHash) {
+      idbGet(meta.avatarHash).then(blob => { if (blob) setAvatar(avatarEl, blob); });
+    }
+  }).catch(() => {});
+}
+
+async function updateMessagesForSender(serverUrl, roomId, senderId) {
+  const children = Array.from(ui.messages.children);
+  for (const row of children) {
+    if (row.dataset.senderId !== senderId) continue;
+    const wrap     = row.querySelector('.wrap');
+    const avatarEl = wrap?.querySelector('.msg-avatar');
+    const nameEl   = wrap?.querySelector('.name-label');
+    const bubbleEl = wrap?.querySelector('.bubble');
+    if (avatarEl && nameEl && bubbleEl) {
+      const ctx = { serverUrl, roomId, senderId, fallbackName: shortId(senderId) };
+      styleBubbleProfile(avatarEl, nameEl, bubbleEl, ctx);
+    }
+  }
+}
+
+function makeActionButton(char, label, onClick) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'action-btn';
+  btn.textContent = char;
+  btn.title = label;
+  btn.setAttribute('aria-label', label);
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation(); // don't clear selection
+    try { onClick && onClick(); } catch {}
+  });
+  return btn;
+}
+
+function makeActionsBar(rec) {
+  const bar = document.createElement('div');
+  bar.className = 'bubble-actions';
+
+  const onReply = () => {
+    const text = getMessageTextForQuote(rec);
+    const quoted = toQuoteBlock(text);
+
+    ui.msgInput.value = quoted + ui.msgInput.value;
+
+    // Focus and place caret at end so user can continue typing
+    try {
+      ui.msgInput.focus();
+      const end = ui.msgInput.value.length;
+      ui.msgInput.setSelectionRange(end, end);
+    } catch {}
+
+    // Optionally scroll composer into view
+    try { ui.msgInput.scrollIntoView({ block: 'nearest' }); } catch {}
+  };
+
+  const onDelete = () => console.log('delete clicked', rec);
+  const onReact  = () => console.log('react clicked', rec);
+
+  const replyBtn = makeActionButton('↩', 'Reply',  onReply);
+
+  let copyBtn; // declare first so the handler can capture it
+  const onCopy = () => { copyMessageToClipboard(rec, copyBtn); };
+  copyBtn = makeActionButton('🗐', 'Copy', onCopy);
+
+  const delBtn   = makeActionButton('🗑', 'Delete', onDelete);
+  const reactBtn = makeActionButton('✹', 'React',  onReact);
+
+  bar.appendChild(replyBtn);
+  bar.appendChild(copyBtn);
+  bar.appendChild(delBtn);
+  bar.appendChild(reactBtn);
+
+  bar.addEventListener('click', (e) => e.stopPropagation());
+  return bar;
+}
+    
+function bubbleContentOf(bubbleEl) {
+  return bubbleEl.querySelector('.bubble-content') || bubbleEl;
+}
+
+// --- Selection state ---
+let _selected = null; // { row, bubble, timeEl }
+
+function fmtFullTs(ts) {
+  try {
+    return new Date(Number(ts) || Date.now()).toLocaleString(undefined, {
+      year:'numeric', month:'long', day:'2-digit',
+      hour:'2-digit', minute:'2-digit', second:'2-digit',
+      hour12:false
+    });
+  } catch { return new Date().toLocaleString(); }
+}
+
+function clearSelection() {
+  if (!_selected) return;
+  _selected.bubble.classList.remove('--selected');
+  _selected.row.classList.remove('--lift');
+  if (_selected.timeEl) _selected.timeEl.textContent = '';
+  _selected = null;
+}
+
+function selectBubble(row, bubble, timeEl) {
+  if (_selected && _selected.bubble === bubble) { clearSelection(); return; }
+  clearSelection();
+  _selected = { row, bubble, timeEl };
+  row.classList.add('--lift');
+  bubble.classList.add('--selected');
+  const ts = row.dataset.ts || Date.now();
+  timeEl.textContent = fmtFullTs(ts);
+}
+
+// click outside / Esc clears
+document.addEventListener('click', (e) => {
+  if (!_selected) return;
+  if (!_selected.bubble.contains(e.target)) clearSelection();
+});
+document.addEventListener('keydown', (e) => { if (e.key === 'Escape') clearSelection(); });
+
+// ========== UNIFIED RENDERING PIPELINE ==========
+
+// Normalized record shape expected by renderer:
+// {
+//   id: string,                    // stable id (roomKey|sha256(ciphertext)) or any unique
+//   roomId: string,
+//   serverUrl: string,
+//   kind: 'text'|'file'|'gap',
+//   ts: number,                    // ms
+//   seq?: number|null,             // integer if present
+//   senderId?: string|null,        // base64url of device pk
+//   nickname?: string|null,
+//   verified?: boolean|undefined,
+//   // for text:
+///  text?: string,
+//   // for file:
+///  meta?: { hash, name, mime, size }
+//   // for gap:
+///  fromSeq?: number, toSeq?: number, count?: number
+// }
+
+function renderBubble(rec) {
+  if (!VL || VL.serverUrl !== rec.serverUrl || VL.roomId !== rec.roomId) return null;
+
+  const row = document.createElement('div');
+  const mine = isSelf(rec.senderId);
+  row.className = 'row ' + (mine ? 'me' : 'other');
+  if (rec.id) row.dataset.msgId = rec.id;
+  if (rec.senderId) row.dataset.senderId = rec.senderId;
+  row.dataset.ts = String(rec.ts || nowMs());
+
+  const wrap   = document.createElement('div'); wrap.className = 'wrap';
+  const avatar = document.createElement('div'); avatar.className = 'msg-avatar';
+  const nameEl = document.createElement('div'); nameEl.className = 'name-label';
+  const bubble = document.createElement('div'); bubble.className = 'bubble _pre';
+
+  const whoFallback = rec.senderId ? shortId(rec.senderId) : (rec.nickname || 'room');
+  nameEl.textContent = `${whoFallback}${rec.verified === false ? ' ⚠︎ unverified' : ''}`;
+
+ // Content container
+  const content = document.createElement('div');
+  content.className = 'bubble-content';
+  bubble.appendChild(content);
+
+  // Body content goes into `content`
+  if (rec.kind === 'gap') {
+    const count = rec.count ?? Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0));
+    content.textContent = `${count} messages missing`;
+  } else if (rec.kind === 'text') {
+    content.textContent = rec.text || '';
+  } else if (rec.kind === 'file') {
+    bubble.dataset.hash = rec.meta.hash;
+    if (rec.meta.mime && rec.meta.mime.startsWith('image/')) {
+      content.textContent = 'Image pending…';
+    } else {
+      const p = document.createElement('div');
+      p.textContent = `${rec.meta.name || 'file'} (${rec.meta.size ?? '?' } bytes)`;
+      content.appendChild(p);
+    }
+    renderFileIfAvailable(bubble, rec.meta).then(ok => {
+      if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(rec.roomId, rec.meta.hash); }
+    });
+  }
+
+  // Timestamp label (stays after content)
+  const timeEl = document.createElement('div');
+  timeEl.className = 'time-label';
+  bubble.appendChild(timeEl);
+
+  // Actions bar (stays after content)
+  const actionsBar = makeActionsBar(rec);
+  bubble.appendChild(actionsBar);
+
+  // Unified profile styling
+  const ctx = { serverUrl: rec.serverUrl, roomId: rec.roomId, senderId: rec.senderId, fallbackName: whoFallback };
+  styleBubbleProfile(avatar, nameEl, bubble, ctx);
+
+  requestAnimationFrame(() => bubble.classList.remove('_pre'));
+  setTimeout(() => { if (bubble.classList.contains('_pre')) bubble.classList.remove('_pre'); }, 140);
+
+  bubble.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    selectBubble(row, bubble, timeEl);
+  });
+
+  wrap.appendChild(avatar);
+  wrap.appendChild(nameEl);
+  wrap.appendChild(bubble);
+  row.appendChild(wrap);
+  return row;
+}
+
+/**
+ * Renders a contiguous segment of records, with optional gap detection.
+ * @param {Array} records - normalized records (see shape above). Should be for one room/server.
+ * @param {Object} opts
+ *  - placement: 'append' | 'prepend' | 'replace'  (default 'append')
+ *  - computeGaps: boolean (default true) — detect seq gaps within the segment and vs lastSeqSeen
+ *  - persistGaps: boolean (default true) — also persist a gap record via putGapRecord(...)
+ *  - dedupe: boolean (default true)    — skip items already seen in VL.seenIds
+ */
+function renderSegment(records, { placement = 'append', computeGaps = true, persistGaps = true, dedupe = true } = {}) {
+  if (!records || !records.length) return;
+
+  // All records should share same context; take from first
+  const serverUrl = records[0].serverUrl;
+  const roomId    = records[0].roomId;
+  if (!VL || VL.serverUrl !== serverUrl || VL.roomId !== roomId) return; // render only for active view
+
+  // Sort ascending by (seq if present) else ts
+  records = [...records].sort((a, b) => {
+    const sa = (typeof a.seq === 'number'), sb = (typeof b.seq === 'number');
+    if (sa && sb) return a.seq - b.seq || a.ts - b.ts;
+    if (sa && !sb) return -1;
+    if (!sa && sb) return  1;
+    return a.ts - b.ts;
+  });
+
+  const el = ui.messages;
+  const frag = document.createDocumentFragment();
+
+  // Dedupe and compute local gaps
+  let prevSeq = null;
+  let prevSeenSeq = null;
+  const rk = roomKey(serverUrl, roomId);
+
+  if (computeGaps) {
+    // For live append, reconcile with last seen (kept across batches)
+    prevSeenSeq = lastSeqSeen.has(rk) ? lastSeqSeen.get(rk) : null;
+  }
+
+  // Maintain scroll position on prepend/load-older
+  const trackingPrepend = (placement === 'prepend');
+  const prevHeight = trackingPrepend ? el.scrollHeight : 0;
+
+  for (const rec of records) {
+    // make sure shape is sane
+    if (!rec || rec.roomId !== roomId || rec.serverUrl !== serverUrl) continue;
+
+    // segment-level dedupe
+    if (dedupe && VL.seenIds && rec.id && VL.seenIds.has(rec.id) && rec.kind !== 'gap') continue;
+
+    // GAP DETECTION
+    if (computeGaps) {
+      const s = (typeof rec.seq === 'number') ? rec.seq : null;
+
+      // gap vs *segment* previous
+      if (prevSeq !== null && s !== null && s > prevSeq + 1) {
+        const gapCount = s - prevSeq - 1;
+        const gapRec = {
+          id: `${rk}|gap|${prevSeq + 1}-${s}`, // stable
+          roomId, serverUrl, kind: 'gap',
+          ts: rec.ts, fromSeq: prevSeq, toSeq: s, count: gapCount
+        };
+        const gapNode = renderBubble(gapRec);
+        if (gapNode) frag.appendChild(gapNode);
+        if (persistGaps) { try { putGapRecord({ serverUrl, roomId, ts: rec.ts, fromSeq: prevSeq, toSeq: s }); } catch {} }
+      }
+
+      // gap vs *global last seen* (live)
+      if (prevSeenSeq !== null && s !== null && s > prevSeenSeq + 1) {
+        const gapCount = s - prevSeenSeq - 1;
+        const gapRec = {
+          id: `${rk}|gap-live|${prevSeenSeq + 1}-${s}`,
+          roomId, serverUrl, kind: 'gap',
+          ts: rec.ts, fromSeq: prevSeenSeq, toSeq: s, count: gapCount
+        };
+        const gapNode = renderBubble(gapRec);
+        if (gapNode) frag.appendChild(gapNode);
+        if (persistGaps) { try { putGapRecord({ serverUrl, roomId, ts: rec.ts, fromSeq: prevSeenSeq, toSeq: s }); } catch {} }
+      }
+
+      if (s !== null) {
+        prevSeq = s;
+        lastSeqSeen.set(rk, s);
+      }
+    }
+
+    // Bubble
+    const node = renderBubble(rec);
+    if (!node) continue;
+    frag.appendChild(node);
+
+    // Housekeeping (VL tracking)
+    if (VL.seenIds && rec.id && rec.kind !== 'gap') VL.seenIds.add(rec.id);
+    if (rec.ts) {
+      VL.oldestTs = Math.min(VL.oldestTs, rec.ts|0);
+      VL.newestTs = Math.max(VL.newestTs, rec.ts|0);
+    }
+  }
+
+  // Write to DOM
+  if (placement === 'replace') {
+    el.innerHTML = '';
+    el.appendChild(frag);
+    attachVirtualScroll(); // re-attach scroll listener if needed
+    requestAnimationFrame(scrollToEnd);
+  } else if (placement === 'prepend') {
+    el.insertBefore(frag, el.firstChild);
+    // keep scroll anchored
+    const newHeight = el.scrollHeight;
+    el.scrollTop += (newHeight - prevHeight);
+    pruneBottomIfNeeded();
+  } else {
+    const autoscroll = nearBottom();
+    el.appendChild(frag);
+    pruneTopIfNeeded();
+    if (autoscroll) requestAnimationFrame(scrollToEnd);
+  }
+}
+
 async function msgPageByRoom(serverUrl, roomId, { beforeTs = Number.MAX_SAFE_INTEGER, limit = PAGE_SIZE } = {}) {
   const key = roomKey(serverUrl, roomId);
   const db = await openMsgDB();
@@ -1161,20 +1654,6 @@ async function msgListByRoom(serverUrl, roomId){
   });
 }
 
-function renderGapBubble(count, { prepend=false } = {}) {
-  const row = document.createElement('div');
-  row.className = 'row other';
-  const wrap = document.createElement('div'); wrap.className = 'wrap';
-  const label = document.createElement('div'); label.className = 'name-label';
-  label.textContent = ''; // neutral
-  const bubble = document.createElement('div'); bubble.className = 'bubble';
-  bubble.textContent = `${count} messages missing`;
-  wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
-  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
-  else ui.messages.appendChild(row);
-  return row;
-}
-
 async function putGapRecord({ serverUrl, roomId, ts, fromSeq, toSeq }) {
   const rKey = roomKey(serverUrl, roomId);
   const id = `${rKey}|gap|${fromSeq + 1}-${toSeq}`; // stable id
@@ -1198,115 +1677,12 @@ function scrollToEnd() {
 }
 function clearMessagesUI() { ui.messages.innerHTML = ''; }
 
-function renderTextMessage({ text, ts, senderId, verified }, { prepend=false } = {}) {
-  const row = document.createElement('div');
-  const isMe = senderId && myPeerId && senderId === myPeerId;
-  row.className = 'row ' + (isMe ? 'me' : 'other');
-  row.dataset.senderId = senderId || '';
-
-  const wrap = document.createElement('div'); wrap.className = 'wrap';
-
-  // Avatar chip
-  const avatar = document.createElement('div'); avatar.className = 'msg-avatar';
-  wrap.appendChild(avatar);
-
-  // Name label (uses profile; fallback to short id or 'room')
-  const label = document.createElement('div'); label.className = 'name-label';
-  const whoFallback = senderId ? shortId(senderId) : 'room';
-  label.textContent = `${whoFallback}${verified === false ? ' ⚠︎ unverified' : ''}`; //`${whoFallback} • ${new Date(ts || nowMs()).toLocaleString()}${verified === false ? ' • ⚠︎ unverified' : ''}`;
-  wrap.appendChild(label);
-
-  // Bubble
-  const bubble = document.createElement('div'); bubble.className = 'bubble';
-  bubble.textContent = text;
-  wrap.appendChild(bubble);
-
-  row.appendChild(wrap);
-  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
-  else ui.messages.appendChild(row);
-
-  // Try to fill profile bits asynchronously
-  const active = { serverUrl: VL?.serverUrl, roomId: VL?.roomId };
-  if (senderId && active.serverUrl && active.roomId) {
-    requestProfileIfMissing(active.serverUrl, active.roomId, senderId);
-    fillProfile(avatar, label, bubble, active.serverUrl, active.roomId, senderId, ts);
-  }
-  return row;
-}
-
-function fileBubbleSkeleton({ meta, ts, nickname, senderId, verified }, { prepend=false } = {}) {
-  const row = document.createElement('div');
-  if (senderId) row.dataset.senderId = senderId;
-  const isMe = senderId && myPeerId && senderId === myPeerId;
-  row.className = 'row ' + (isMe ? 'me' : 'other');
-
-  const wrap = document.createElement('div'); wrap.className = 'wrap';
-
-  // Avatar chip
-  const avatar = document.createElement('div'); avatar.className = 'msg-avatar';
-  wrap.appendChild(avatar);
-
-  // Name label (uses profile; fallback to short id or 'room')
-  const label = document.createElement('div'); label.className = 'name-label';
-  const whoFallback = senderId ? shortId(senderId) : 'room';
-  label.textContent = `${whoFallback}${verified === false ? ' ⚠︎ unverified' : ''}`; //`${whoFallback} • ${new Date(ts || nowMs()).toLocaleString()}${verified === false ? ' • ⚠︎ unverified' : ''}`;
-  wrap.appendChild(label);
-
-  // Bubble
-  const bubble = document.createElement('div'); bubble.className = 'bubble';
-  bubble.dataset.hash = meta.hash;
-  if (meta.mime && meta.mime.startsWith('image/')) bubble.textContent = 'Image pending…';
-  else {
-    const p = document.createElement('div');
-    p.textContent = `${meta.name || 'file'} (${meta.size || '?'} bytes)`;
-    bubble.appendChild(p);
-  }
-  wrap.appendChild(bubble);
-
-  row.appendChild(wrap);
-  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
-  else ui.messages.appendChild(row);
-
-  // Try to fill profile bits asynchronously
-  const active = { serverUrl: VL?.serverUrl, roomId: VL?.roomId };
-  if (senderId && active.serverUrl && active.roomId) {
-    requestProfileIfMissing(active.serverUrl, active.roomId, senderId);
-    fillProfile(avatar, label, bubble, active.serverUrl, active.roomId, senderId, ts);
-  }
-  return bubble;
-    
-/*    
-  const wrap = document.createElement('div'); wrap.className = 'wrap';
-  const avatar = document.createElement('div'); avatar.className = 'msg-avatar'; 
-  const label = document.createElement('div'); label.className = 'name-label';
-  const who = nickname || (senderId ? shortId(senderId) : 'room');
-  const when = new Date(ts || nowMs()).toLocaleString();
-  label.textContent = `${who}${verified === false ? ' ⚠︎ unverified' : ''}`; //`${who} • ${when}${verified === false ? ' • ⚠︎ unverified' : ''}`;
-
-  const bubble = document.createElement('div'); bubble.className = 'bubble';
-  bubble.dataset.hash = meta.hash;
-  if (meta.mime && meta.mime.startsWith('image/')) bubble.textContent = 'Image pending…';
-  else {
-    const p = document.createElement('div');
-    p.textContent = `${meta.name || 'file'} (${meta.size || '?'} bytes)`;
-    bubble.appendChild(p);
-  }
-
-  wrap.appendChild(avatar); wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
-  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
-  else ui.messages.appendChild(row);
-  const active = { serverUrl: VL?.serverUrl, roomId: VL?.roomId };
-  fillProfile?.(avatar, label, bubble, active.serverUrl, active.roomId, senderId, ts);  
-  return bubble;
-  */
-}
-
 async function renderFileIfAvailable(bubbleEl, meta) {
-  if (!bubbleEl) return false; // not active room
+  const content = bubbleContentOf(bubbleEl);
   const blob = await idbGet(meta.hash);
   if (!blob) return false;
 
-  bubbleEl.innerHTML = '';
+  content.innerHTML = '';
   const url = URL.createObjectURL(blob);
 
   if (meta.mime && meta.mime.startsWith('image/')) {
@@ -1314,7 +1690,7 @@ async function renderFileIfAvailable(bubbleEl, meta) {
     img.onload = () => URL.revokeObjectURL(url);
     img.src = url;
     img.alt = meta.name || 'image';
-    bubbleEl.appendChild(img);
+    content.appendChild(img);
   } else {
     const link = document.createElement('a');
     link.href = url;
@@ -1324,15 +1700,16 @@ async function renderFileIfAvailable(bubbleEl, meta) {
     link.rel = 'noopener';
     link.download = meta.name || 'file';
     link.addEventListener('click', () => setTimeout(() => URL.revokeObjectURL(url), 0), { once: true });
-    bubbleEl.appendChild(link);
+    content.appendChild(link);
   }
 
   return true;
 }
 
 function showPendingBubble(bubbleEl, meta) {
-  if (!bubbleEl) return;
-  bubbleEl.innerHTML = '';
+  const content = bubbleContentOf(bubbleEl);
+  content.innerHTML = '';
+
   const wrap = document.createElement('div'); wrap.className = 'pending';
   const label = document.createElement('span');
   label.textContent = meta.mime && meta.mime.startsWith('image/') ? 'Image pending…' : 'File pending…';
@@ -1348,7 +1725,7 @@ function showPendingBubble(bubbleEl, meta) {
     if (!ok) requestFile(meta.room_id || currentRoomId, hash);
   });
   wrap.appendChild(label); wrap.appendChild(btn);
-  bubbleEl.appendChild(wrap);
+  content.appendChild(wrap);
 }
 
 const VL = {
@@ -1373,141 +1750,6 @@ function pruneTopIfNeeded() {
 function pruneBottomIfNeeded() {
   const el = ui.messages;
   while (el.children.length > MAX_DOM_MESSAGES) el.removeChild(el.lastChild);
-}
-
-async function fillProfile(avatarEl, labelEl, bubbleEl, serverUrl, roomId, senderId, ts) {
-  const meta = await profileMetaGet(serverUrl, roomId, senderId);
-  // Update name if present
-  if (meta?.name) {
-    const base = `${meta.name}` // • ${new Date(ts || nowMs()).toLocaleString()}`;
-    labelEl.textContent = base;
-  }
-  // update color if present
-  if (meta?.color) {
-    bubbleEl.style.backgroundColor = sanitizeColorHex(meta.color);
-    bubbleEl.style.color = pickTextColorOn(meta.color);  
-  }    
-  // Update avatar if present
-  if (meta?.avatarHash) {
-    const blob = await idbGet(meta.avatarHash);
-    if (blob) {
-      avatarEl.innerHTML = '';
-      const url = URL.createObjectURL(blob);
-      const img = document.createElement('img');
-      img.onload = () => URL.revokeObjectURL(url);
-      img.src = url;
-      avatarEl.appendChild(img);
-      return;
-    }
-  }
-  // Fallback: keep gray circle (optional initial)
-  avatarEl.textContent = '';
-}
-
-async function updateMessagesForSender(serverUrl, roomId, senderId) {
-  const meta = await profileMetaGet(serverUrl, roomId, senderId);
-  const children = Array.from(ui.messages.children);
-  for (const row of children) {
-    if (row.dataset.senderId !== senderId) continue;
-    const wrap = row.querySelector('.wrap');
-    const avatarEl = wrap?.querySelector('.msg-avatar');
-    const labelEl  = wrap?.querySelector('.name-label');
-    const bubbleEl  = wrap?.querySelector('.bubble');
-    if (avatarEl && labelEl) {
-      const ts = (labelEl.textContent.match(/• (.*)$/) ? Date.parse(RegExp.$1) : nowMs());
-      fillProfile(avatarEl, labelEl, bubbleEl, serverUrl, roomId, senderId, ts);
-    }
-  }
-}
-
-function buildRowFromRecord(rec) {
-  // ---- GAP ROW (unchanged, except class names kept consistent) ----
-  if (rec.kind === 'gap') {
-    const row = document.createElement('div');
-    row.className = 'row other';
-
-    const wrap  = document.createElement('div'); wrap.className = 'wrap';
-    const label = document.createElement('div'); label.className = 'name-label';
-    label.textContent = '';
-
-    const bubble = document.createElement('div'); bubble.className = 'bubble';
-    const count = Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0));
-    bubble.textContent = `${count} messages missing`;
-
-    wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
-    return { node: row, bubble: null, meta: null };
-  }
-
-  // ---- NORMAL ROW (text/file) ----
-  const row = document.createElement('div');
-  const isMe = rec.senderId && myPeerId && rec.senderId === myPeerId;
-  row.className = 'row ' + (isMe ? 'me' : 'other');
-  if (rec.id) row.dataset.msgId = rec.id;
-  if (rec.senderId) row.dataset.senderId = rec.senderId;
-
-  const wrap  = document.createElement('div'); wrap.className = 'wrap';
-
-  // Avatar holder (will be filled by profile later)
-  const avatar = document.createElement('div');
-  avatar.className = 'msg-avatar';           // style optional; safe if missing
-  wrap.appendChild(avatar);
-
-  // Name/when label (fallback text now; will be replaced on profile fill)
-  const label = document.createElement('div'); label.className = 'name-label';
-  const who = rec.nickname || (rec.senderId ? shortId(rec.senderId) : 'room');
-  const when = new Date(rec.ts || nowMs()).toLocaleString();
-  const color = rec.color || '2b6cb0'
-  label.textContent = `${who}${rec.verified === false ? ' ⚠︎ unverified' : ''}`; // `${who} • ${when}${rec.verified === false ? ' • ⚠︎ unverified' : ''}`;
-  wrap.appendChild(label);
-
-  // Bubble
-  const bubble = document.createElement('div'); bubble.className = 'bubble';
-
-  let fileMeta = null;
-  if (rec.kind === 'text') {
-    bubble.textContent = rec.text;
-  } else {
-    // file
-    fileMeta = rec.meta;
-    bubble.dataset.hash = fileMeta.hash;
-    if (fileMeta.mime && fileMeta.mime.startsWith('image/')) {
-      bubble.textContent = 'Image pending…';
-    } else {
-      const p = document.createElement('div');
-      p.textContent = `${fileMeta.name || 'file'} (${fileMeta.size || '?'} bytes)`;
-      bubble.appendChild(p);
-    }
-  }
-
-  wrap.appendChild(bubble);
-  row.appendChild(wrap);
-
-  // ---- Profile hooks (fills avatar + name when available) ----
-  // 1) Ask for a profile after a tiny delay (reduces “none” races on fast peers)
-  if (rec.senderId && VL?.serverUrl && VL?.roomId) {
-    const serverUrl = VL.serverUrl;
-    const roomId    = VL.roomId;
-    setTimeout(() => requestProfileIfMissing(serverUrl, roomId, rec.senderId), 250);
-
-    // 2) Immediate best-effort fill from cache; it will re-fill again on notify/retrieve
-    fillProfile?.(avatar, label, bubble, serverUrl, roomId, rec.senderId, rec.ts);
-  }
-
-  return { node: row, bubble: (rec.kind === 'file') ? bubble : null, meta: fileMeta };
-}
-
-function renderRecord(rec, { prepend=false } = {}) {
-  if (rec.kind === 'text') {
-    renderTextMessage({ text: rec.text, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified }, { prepend });
-  } else if (rec.kind === 'file') {
-    const bubble = fileBubbleSkeleton({ meta: rec.meta, ts: rec.ts, nickname: rec.nickname, senderId: rec.senderId, verified: rec.verified }, { prepend });
-    renderFileIfAvailable(bubble, rec.meta).then(ok => {
-      if (!ok) { showPendingBubble(bubble, rec.meta); requestFile(VL.roomId, rec.meta.hash); }
-    });
-  } else if (rec.kind === 'gap') {
-      renderGapBubble(Math.max(0, (rec.toSeq ?? rec.fromSeq) - (rec.fromSeq ?? 0)), { prepend });
-      return;
-  }
 }
 
 async function loadOlderPage() {
@@ -1537,37 +1779,9 @@ async function loadOlderPage() {
   VL.oldestTs  = Math.min(VL.oldestTs, page[0].ts);
   VL.oldestKey = { ts: page[0].ts, id: page[0].id };
   VL.hasMoreOlder = (page.length === PAGE_SIZE);
-
-  const frag = document.createDocumentFragment();
-  const pendingFiles = [];
-
-  for (const rec of page) {
-    // extra safety: skip any cross-room stragglers
-    if ((rec.roomId && rec.roomId !== VL.roomId) ||
-        (rec.serverUrl && rec.serverUrl !== VL.serverUrl)) continue;
-    if (VL.seenIds.has(rec.id)) continue;
-    VL.seenIds.add(rec.id);
-
-    const built = buildRowFromRecord(rec);
-    frag.appendChild(built.node);
-    if (built.bubble) pendingFiles.push(built);
-  }
-
-  // re-check before touching the DOM
-  if (gen !== VL.viewGen) { VL.loadingOlder = false; return; }
-
-  el.insertBefore(frag, el.firstChild);
-
-  const newH = el.scrollHeight;
-  el.scrollTop += (newH - prevH);
-
-  for (const { bubble, meta } of pendingFiles) {
-    renderFileIfAvailable(bubble, meta).then(ok => {
-      if (!ok) { showPendingBubble(bubble, meta); requestFile(VL.roomId, meta.hash); }
-    });
-  }
-
-  pruneBottomIfNeeded();
+    
+  renderSegment(page, { placement: 'prepend', computeGaps: true, persistGaps: false });
+    
   VL.loadingOlder = false;
 }
 
@@ -1610,68 +1824,18 @@ async function initVirtualRoomView(serverUrl, roomId) {
   // If the user switched rooms while we were fetching, abort
   if (gen !== VL.viewGen) return;
 
-  if (first.length) {
-    VL.oldestTs  = first[0].ts;
-    VL.newestTs  = first[first.length - 1].ts;
-    VL.oldestKey = { ts: first[0].ts, id: first[0].id };
-    VL.hasMoreOlder = (first.length === PAGE_SIZE);
 
-    const frag = document.createDocumentFragment();
-    const pendingFiles = [];
-
-    for (const rec of first) {
-      // extra safety: skip any cross-room stragglers
-      if ((rec.roomId && rec.roomId !== VL.roomId) ||
-          (rec.serverUrl && rec.serverUrl !== VL.serverUrl)) continue;
-      if (VL.seenIds.has(rec.id)) continue;
-      VL.seenIds.add(rec.id);
-
-      const built = buildRowFromRecord(rec);
-      frag.appendChild(built.node);
-      if (built.bubble) pendingFiles.push(built);
+    if (first.length) {
+      VL.oldestTs  = first[0].ts;
+      VL.newestTs  = first[first.length - 1].ts;
+      VL.oldestKey = { ts: first[0].ts, id: first[0].id };
+      VL.hasMoreOlder = (first.length === PAGE_SIZE);
+      renderSegment(first, { placement: 'replace', computeGaps: true, persistGaps: false });
+    } else {
+      VL.hasMoreOlder = false;
     }
-
-    // re-check token just before DOM write
-    if (gen !== VL.viewGen) return;
-    ui.messages.appendChild(frag);
-
-    for (const { bubble, meta } of pendingFiles) {
-      renderFileIfAvailable(bubble, meta).then(ok => {
-        if (!ok) { showPendingBubble(bubble, meta); requestFile(roomId, meta.hash); }
-      });
-    }
-  } else {
-    VL.hasMoreOlder = false;
-  }
-
-  attachVirtualScroll();
-  requestAnimationFrame(scrollToEnd);
-}
-
-// Append a new live record at bottom (keep window size, autoscroll if near bottom)
-function appendLiveRecord(rec) {
-  const autoscroll = nearBottom();
-  const built = buildRowFromRecord(rec);
-  ui.messages.appendChild(built.node);
-
-  // ↓ ensure live messages also trigger a profile fetch/fill
-  if (rec.senderId && VL?.serverUrl && VL?.roomId) {
-    setTimeout(() => requestProfileIfMissing(VL.serverUrl, VL.roomId, rec.senderId), 250);
-    fillProfile?.(
-      built.node.querySelector('.msg-avatar'),
-      built.node.querySelector('.name-label'),
-      built.node.querySelector('.bubble'),	
-      VL.serverUrl, VL.roomId, rec.senderId, rec.ts
-    );
-  }
-
-  if (built.bubble) {
-    renderFileIfAvailable(built.bubble, built.meta).then(ok => {
-      if (!ok) { showPendingBubble(built.bubble, built.meta); requestFile(VL.roomId, built.meta.hash); }
-    });
-  }
-  pruneTopIfNeeded();
-  if (autoscroll) requestAnimationFrame(scrollToEnd);
+    attachVirtualScroll();
+    requestAnimationFrame(scrollToEnd);
 }
 
 ////////////////////////
@@ -1892,49 +2056,13 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
     });
   }
 
-  // Gap detection for live stream
-  if (!fromHistory && seqVal !== null) {
-    const rk = roomKey(serverUrl, roomId);
-    const prev = lastSeqSeen.has(rk) ? lastSeqSeen.get(rk) : await msgGetLastSeq(serverUrl, roomId);
-    if (prev >= -1 && seqVal > prev + 1) {
-      await putGapRecord({ serverUrl, roomId, ts: tsVal, fromSeq: prev, toSeq: seqVal });
-      if (VL && VL.serverUrl === serverUrl && VL.roomId === roomId) {
-	renderGapBubble(seqVal - prev - 1);
-      }
-    }
-    lastSeqSeen.set(rk, seqVal);
-  }
-
-  // Only render if this message is for the *currently visible* room and not from history
-  const isActive = (VL && VL.serverUrl === serverUrl && VL.roomId === roomId);
-  if (!isActive || fromHistory) return;
-
-  // Runtime replay guard: if we've already rendered this id in the live view, skip
-  if (VL.seenIds && VL.seenIds.has(id)) return;
-  if (VL.seenIds) VL.seenIds.add(id);
-
   // Render
-  if (isFile) {
-    const bubble = fileBubbleSkeleton(
-      { meta, ts: tsVal, nickname: m.nickname, senderId: m.sender_id, verified }
-    );
-    renderFileIfAvailable(bubble, meta).then(ok => {
-      if (!ok) {
-        showPendingBubble(bubble, meta);
-        requestFile(roomId, meta.hash);
-      } else {
-        scrollToEnd();
-      }
-    });
-  } else {
-    appendLiveRecord({
-      kind: 'text',
-      ts: tsVal,
-      nickname: m.nickname,
-      senderId: m.sender_id,
-      verified,
-      text: pt
-    });
+  const rec = (isFile)
+  ? { id, roomId, serverUrl, kind:'file', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, meta }
+  : { id, roomId, serverUrl, kind:'text', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, text: pt };
+
+  if (VL && VL.serverUrl === serverUrl && VL.roomId === roomId) {
+    renderSegment([rec], { placement:'append', computeGaps:true, persistGaps:true });
   }
 }
 
