@@ -147,16 +147,15 @@
     m[n-8][8]=1;
   }
   function placeVersionInfo(m, ver){
-    if (ver<7) return;
-    const n=m.length, bits = VER_INFO[ver];
+    if (ver < 7) return;
+    const n = m.length, bits = VER_INFO[ver];  // MSB-first constant
     for (let i=0;i<18;i++){
-      const b = (bits >> i) & 1;
+      const b = (bits >> (17 - i)) & 1;        // write MSB→LSB
       const r = Math.floor(i/3), c = i%3;
       m[r][n-11+c] = b;
       m[n-11+c][r] = b;
     }
   }
-
   function fillData(m, dataBits, maskId){
     const n=m.length;
     let i = 0; // FIXED: Start from beginning
@@ -245,17 +244,24 @@
 
   // ---- Format info write ----
   function writeFormat(m, fmt15){
-    const n=m.length;
-    // Top-left copy
+    const n = m.length;
+    
+    // Top-left block around the (8,*) and (*,8) cross
     for (let i=0;i<6;i++) m[i][8] = (fmt15 >> i) & 1;
     m[7][8] = (fmt15 >> 6) & 1;
     m[8][8] = (fmt15 >> 7) & 1;
     m[8][7] = (fmt15 >> 8) & 1;
-    for (let i=9;i<15;i++) m[8][14-i] = (fmt15 >> i) & 1;
+    for (let i=9;i<15;i++) m[8][14 - i] = (fmt15 >> i) & 1;
 
-    // Mirrored copy (exactly as in the spec/Nayuki)
-    for (let i=0;i<8;i++)  m[8][n-1-i]        = (fmt15 >> i) & 1;   // y=8, x from n-1 down to n-8
-    for (let i=8;i<15;i++) m[n-15 + i][8]     = (fmt15 >> i) & 1;   // x=8, y from n-7 up to n-1
+    // Top-right row (leftwards) – this was already correct
+    for (let i=0;i<8;i++) m[8][n-1 - i] = (fmt15 >> i) & 1;
+
+    // Bottom-left column (upwards) – **fixed order**
+    // Write bits 14..8 to y = n-1..n-7 respectively
+    for (let k=0;k<7;k++){
+      const bit = (fmt15 >> (14 - k)) & 1;   // 14,13,...,8
+      m[n-1 - k][8] = bit;                   // y = n-1, n-2, ..., n-7
+    }
   }
 
   // ---- Encode ----
