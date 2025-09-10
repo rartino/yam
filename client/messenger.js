@@ -949,7 +949,7 @@ function closeProfile() { prof.dlg.close(); }
 async function saveProfile() {
   SETTINGS.username = (prof.name.value || '').trim();
   SETTINGS.profilecolor = (sanitizeColorHex(prof.profileColor.value) || '').trim();
-    
+
   const prev = !!SETTINGS.requirePass;
   const next = !!prof.requirePass.checked;
 
@@ -1231,7 +1231,7 @@ function fileLabel(meta = {}) {
 async function copyMessageToClipboard(rec, btn) {
 
   console.log('copyMessageToClipboard', rec);
-    
+
   if (rec.kind === 'text') {
     const ok = await copyTextToClipboard(rec.text || '');
     flashBtn(btn, ok ? '✓' : '⚠︎');
@@ -1405,7 +1405,7 @@ function makeActionsBar(rec) {
     const onDelete = () => requestDeleteMessage(rec);
     delBtn = makeActionButton('🗑', 'Delete', onDelete);
   }
-    
+
   const onReact  = () => console.log('react clicked', rec);
 
   const replyBtn = makeActionButton('↩', 'Reply',  onReply);
@@ -1414,7 +1414,7 @@ function makeActionsBar(rec) {
   const onCopy = () => { copyMessageToClipboard(rec, copyBtn); };
   copyBtn = makeActionButton('🗐', 'Copy', onCopy);
 
-  const reactBtn = makeActionButton('✹', 'React',  onReact);
+  const reactBtn = makeActionButton('😐︎', 'React',  onReact);
 
   bar.appendChild(replyBtn);
   bar.appendChild(copyBtn);
@@ -1424,7 +1424,7 @@ function makeActionsBar(rec) {
   bar.addEventListener('click', (e) => e.stopPropagation());
   return bar;
 }
-    
+
 function bubbleContentOf(bubbleEl) {
   return bubbleEl.querySelector('.bubble-content') || bubbleEl;
 }
@@ -1491,7 +1491,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') clearSelec
 function renderBubble(rec) {
   if (!VL || VL.serverUrl !== rec.serverUrl || VL.roomId !== rec.roomId) return null;
   if (rec.kind === 'deleted') { return null; }
-    
+
   const row = document.createElement('div');
   const mine = isSelf(rec.senderId);
   row.className = 'row ' + (mine ? 'me' : 'other');
@@ -1865,9 +1865,9 @@ async function loadOlderPage() {
   VL.oldestTs  = Math.min(VL.oldestTs, page[0].ts);
   VL.oldestKey = { ts: page[0].ts, id: page[0].id };
   VL.hasMoreOlder = (page.length === PAGE_SIZE);
-    
+
   renderSegment(page, { placement: 'prepend', computeGaps: true, persistGaps: false });
-    
+
   VL.loadingOlder = false;
 }
 
@@ -2629,12 +2629,12 @@ function connect(sc) {
 
     } else if (m.type === 'profile-notify') {
       await applyProfileCipher(sc.url, m.room_id, m.sender_id, m.ciphertext);
-      clearProfileRetry(sc.url, m.room_id, m.sender_id);	
+      clearProfileRetry(sc.url, m.room_id, m.sender_id);
 
     } else if (m.type === 'profile-retrieve') {
       await applyProfileCipher(sc.url, m.room_id, m.sender_id, m.ciphertext);
       clearProfileRetry(sc.url, m.room_id, m.sender_id);
-	
+
     } else if (m.type === 'profile-none') {
       // no profile available; you could cache a sentinel if you like
       scheduleProfileRetry(sc.url, m.room_id, m.sender_id);
@@ -2653,7 +2653,7 @@ function connect(sc) {
 	await initVirtualRoomView(serverUrl, rid);
 	setStatus(statuses.connected);
       }
-	
+
     } else if (m.type === 'message') {
       handleIncoming(sc.url, m);
 
@@ -2762,7 +2762,7 @@ async function openJoinDialog(){
 
   const code = encodeInviteCode(_joinWait.host, b64u(_joinWait.curvePk));
   join.codeTA.value = code;
-  join.qrCode.innerHTML = "";  
+  join.qrCode.innerHTML = "";
   new QRCode(join.qrCode, { text: code, width: 192, height: 192, colorDark: "#000000", colorLight: "#ffffff", correctLevel: QRCode.CorrectLevel.M } );
   //await drawInviteQr(code);
 
