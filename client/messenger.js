@@ -1100,6 +1100,86 @@ async function idbPut(hash, blob) {
 // RENDER
 ///////////////////////
 
+function canonDeleteBytes(roomId, seq) {
+  return new TextEncoder().encode(`delete|${roomId}|seq:${seq}`);
+}
+
+async function msgGetBySeq(serverUrl, roomId, seq) {
+  const key = roomKey(serverUrl, roomId);
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(MSG_STORE, 'readonly');
+    const idx = tx.objectStore(MSG_STORE).index('byRoomSeq');
+    const req = idx.openCursor(IDBKeyRange.only([key, seq]));
+    req.onsuccess = (e) => res(e.target.result ? e.target.result.value : null);
+    req.onerror = () => rej(req.error);
+  });
+}
+
+async function msgDeleteById(id) {
+  const db = await openMsgDB();
+  return new Promise((res, rej) => {
+    const tx = db.transaction(MSG_STORE, 'readwrite');
+    tx.objectStore(MSG_STORE).delete(id);
+    tx.oncomplete = () => res(true);
+    tx.onerror = () => rej(tx.error);
+  });
+}
+
+function removeDomRowBySeq(seq) {
+  const n = ui.messages.querySelector(`.row[data-seq="${String(seq)}"]`);
+  if (n && n.parentNode) n.parentNode.removeChild(n);
+}
+
+async function requestDeleteMessage(rec) {
+  // Only allow deleting your own messages that have a sequence number
+  if (!rec || !isSelf(rec.senderId) || typeof rec.seq !== 'number') return;
+
+  const serverUrl = rec.serverUrl || VL?.serverUrl;
+  const roomId    = rec.roomId    || VL?.roomId;
+  const sc = servers.get(normServer(serverUrl));
+  if (!sc || !sc.ws || sc.ws.readyState !== WebSocket.OPEN || !sc.authed?.has(roomId)) {
+    alert('Not connected');
+    return;
+  }
+
+  try {
+    // Build TWO sealed payloads:
+    //  A) tombstone to overwrite the original row (same seq on server)
+    //  B) control "delete" record (new seq) to log/broadcast the action
+    const targetSeq = rec.seq;
+
+    const tombstoneJson = JSON.stringify({ kind: 'deleted', target_seq: targetSeq });
+    const controlJson   = JSON.stringify({ kind: 'delete',  target_seq: targetSeq });
+
+    // Encrypt to room public key (sealed box); returns base64url
+    const tombCtB64 = await encryptStringForRoom(roomId, tombstoneJson);
+    const ctrlCtB64 = await encryptStringForRoom(roomId, controlJson);
+
+    // Sign each ciphertext with our device identity (detached)
+    const tombSigB64 = signCiphertextB64(tombCtB64);
+    const ctrlSigB64 = signCiphertextB64(ctrlCtB64);
+
+    const payload = {
+      type: 'delete',
+      room_id: roomId,
+      ref_seq: targetSeq,                     // server must see this outside the ciphertext
+      tombstone_ciphertext: tombCtB64,        // sealed {"kind":"deleted","target_seq":...}
+      tombstone_sig: tombSigB64,              // detached sig over tombstone_ciphertext
+      delete_ciphertext: ctrlCtB64,           // sealed {"kind":"delete","target_seq":...}
+      delete_sig: ctrlSigB64,                 // detached sig over delete_ciphertext
+      sender_id: myPeerId,                    // our device pk (b64url)
+      ts_client: nowMs()
+    };
+
+    if (DEBUG_SIG) dbg('SIG/TX', 'delete', { room: roomId, ref_seq: targetSeq });
+    sc.ws.send(JSON.stringify(payload));
+  } catch (e) {
+    console.error('requestDeleteMessage failed', e);
+    alert('Delete failed to prepare or send.');
+  }
+}
+
 function flashBtn(btn, glyph='✓', ms=900) {
   if (!btn) return;
   const old = btn.textContent;
@@ -1319,7 +1399,13 @@ function makeActionsBar(rec) {
     try { ui.msgInput.scrollIntoView({ block: 'nearest' }); } catch {}
   };
 
-  const onDelete = () => console.log('delete clicked', rec);
+  // Delete only for my messages
+  let delBtn = null;
+  if (isSelf(rec.senderId)) {
+    const onDelete = () => requestDeleteMessage(rec);
+    delBtn = makeActionButton('🗑', 'Delete', onDelete);
+  }
+    
   const onReact  = () => console.log('react clicked', rec);
 
   const replyBtn = makeActionButton('↩', 'Reply',  onReply);
@@ -1328,12 +1414,11 @@ function makeActionsBar(rec) {
   const onCopy = () => { copyMessageToClipboard(rec, copyBtn); };
   copyBtn = makeActionButton('🗐', 'Copy', onCopy);
 
-  const delBtn   = makeActionButton('🗑', 'Delete', onDelete);
   const reactBtn = makeActionButton('✹', 'React',  onReact);
 
   bar.appendChild(replyBtn);
   bar.appendChild(copyBtn);
-  bar.appendChild(delBtn);
+  if(delBtn) bar.appendChild(delBtn);
   bar.appendChild(reactBtn);
 
   bar.addEventListener('click', (e) => e.stopPropagation());
@@ -1405,7 +1490,8 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') clearSelec
 
 function renderBubble(rec) {
   if (!VL || VL.serverUrl !== rec.serverUrl || VL.roomId !== rec.roomId) return null;
-
+  if (rec.kind === 'deleted') { return null; }
+    
   const row = document.createElement('div');
   const mine = isSelf(rec.senderId);
   row.className = 'row ' + (mine ? 'me' : 'other');
@@ -1421,7 +1507,7 @@ function renderBubble(rec) {
   const whoFallback = rec.senderId ? shortId(rec.senderId) : (rec.nickname || 'room');
   nameEl.textContent = `${whoFallback}${rec.verified === false ? ' ⚠︎ unverified' : ''}`;
 
- // Content container
+  // Content container
   const content = document.createElement('div');
   content.className = 'bubble-content';
   bubble.appendChild(content);
@@ -1988,80 +2074,149 @@ async function sendFileMetadata(room, meta) {
   sc.ws.send(JSON.stringify(payload));
 }
 
+async function upsertTombstone(serverUrl, roomId, seq, extra = {}) {
+  const rec = await msgGetBySeq(serverUrl, roomId, seq);
+  const rKey = roomKey(serverUrl, roomId);
+  const tombId = rec?.id || `${rKey}|tomb|${seq}`;
+
+  // (Optional) verify the sig against original author if you have it here
+  // When called from `kind:"delete"` flow you may have m.sig/m.signer_id; if rec exists,
+  // verify over canonDeleteBytes(roomId, seq) with rec.senderId’s key.
+
+  const tomb = {
+    id: tombId,
+    roomKey: rKey,
+    roomId, serverUrl,
+    ts: rec?.ts ?? (extra.ts || nowMs()),
+    seq,
+    senderId: rec?.senderId ?? extra.signer_id ?? null,
+    nickname: rec?.nickname ?? undefined,
+    verified: rec?.verified ?? undefined,
+    kind: 'deleted'
+  };
+  await msgPut(tomb);
+
+  // Remove any rendered node
+  removeDomRowBySeq(seq);
+  if (_selected?.row?.dataset?.seq === String(seq)) clearSelection();
+}
+
+// helper to fetch previous once per room if needed
+async function getPrevSeq(serverUrl, roomId) {
+  const rk = roomKey(serverUrl, roomId);
+  if (lastSeqSeen.has(rk)) return lastSeqSeen.get(rk);
+  const prev = await msgGetLastSeq(serverUrl, roomId); // -1 if none
+  lastSeqSeen.set(rk, prev);
+  return prev;
+}
+
 async function handleIncoming(serverUrl, m, fromHistory = false) {
-    
-  // Figure out which room this belongs to
   const roomId = m.room_id;
-  if (!roomId) return; 
+  if (!roomId) return;
+
   const pt = await decryptToStringForRoom(roomId, m.ciphertext);
-  const rKey   = roomKey(serverUrl, roomId);
-    
-  // Stable message id: roomKey + sha256(ciphertext)
+  const rKey = roomKey(serverUrl, roomId);
+
+  // Stable id by ciphertext
   const idHash = await sha256_b64u_string(m.ciphertext);
   const id     = `${rKey}|${idHash}`;
 
-  // Optional signature verification (over the ciphertext)
-  let verified = undefined;
+  // Signature check over ciphertext
+  let verified;
   if (m.sender_id && m.sig) {
     try {
-      const senderPk   = fromB64u(m.sender_id);
-      const sigBytes   = fromB64u(m.sig);
-      const cipherBytes= fromB64u(m.ciphertext);
+      const senderPk    = fromB64u(m.sender_id);
+      const sigBytes    = fromB64u(m.sig);
+      const cipherBytes = fromB64u(m.ciphertext);
       verified = sodium.crypto_sign_verify_detached(sigBytes, cipherBytes, senderPk);
     } catch { verified = false; }
+  } else {
+    verified = undefined; // no signature provided
   }
 
-  const tsVal = m.ts || nowMs();
+  // Only drop if verification explicitly FAILS
+  if (verified === false) {
+    if (DEBUG_SIG) dbg('handleIncoming: signature failed; dropping');
+    return;
+  }
+
+  const tsVal  = m.ts ?? nowMs();
   const seqVal = (typeof m.seq === 'number') ? m.seq : null;
 
-  // Try to interpret payload as a file-metadata message
-  let isFile = false, meta = null;
-  try {
-    const obj = JSON.parse(pt);
-    if (obj && obj.kind === 'file' && obj.hash) {
-      isFile = true;
-      // carry room for convenience in requestFile()
-      meta = { ...obj, room_id: roomId };
+  // ---- Gap detection centralized here ----
+  if (seqVal !== null) {
+    const prev = await getPrevSeq(serverUrl, roomId);
+    if (prev >= -1 && seqVal > prev + 1) {
+      await putGapRecord({ serverUrl, roomId, ts: tsVal, fromSeq: prev, toSeq: seqVal });
+      const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
+      if (isActive) renderGapBubble(seqVal - prev - 1);
     }
-  } catch { /* not JSON → plain text */ }
-
-  // Persist first (IDB dedupe is by primary key 'id')
-  if (isFile) {
-    await msgPut({
-      id,
-      roomKey: rKey,
-      roomId,
-      serverUrl,
-      ts: tsVal,
-      seq: seqVal,	
-      nickname: m.nickname,
-      senderId: m.sender_id,
-      verified,
-      kind: 'file',
-      meta
-    });
-  } else {
-    await msgPut({
-      id,
-      roomKey: rKey,
-      roomId,
-      serverUrl,
-      ts: tsVal,
-      seq: seqVal,
-      nickname: m.nickname,
-      senderId: m.sender_id,
-      verified,
-      kind: 'text',
-      text: pt
-    });
+    lastSeqSeen.set(rKey, seqVal);
   }
 
-  // Render
-  const rec = (isFile)
-  ? { id, roomId, serverUrl, kind:'file', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, meta }
-  : { id, roomId, serverUrl, kind:'text', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, text: pt };
+  // Try to parse control/file messages
+  try {
+    const obj = JSON.parse(pt);
 
-  if (VL && VL.serverUrl === serverUrl && VL.roomId === roomId) {
+    // FILE META
+    if (obj && obj.kind === 'file' && obj.hash) {
+      const meta = { ...obj, room_id: roomId };
+      await msgPut({
+        id, roomKey: rKey, roomId, serverUrl,
+        ts: tsVal, seq: seqVal, nickname: m.nickname,
+        senderId: m.sender_id, verified, kind: 'file', meta
+      });
+      const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
+      if (isActive) {
+        const rec = { id, roomId, serverUrl, kind:'file', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, meta };
+        renderSegment([rec], { placement:'append', computeGaps:true, persistGaps:true });
+      }
+      return;
+    }
+
+    // IN-BAND DELETE EVENT (control record that points to a target seq)
+    if (obj && obj.kind === 'delete') {
+      const targetSeq = Number(obj.target_seq);
+      if (Number.isFinite(targetSeq)) {
+        await upsertTombstone(serverUrl, roomId, targetSeq, { ts: m.ts, signer_id: m.signer_id, sig: m.sig });
+      }
+      // also store the delete control itself so it occupies its seq slot
+      await msgPut({
+        id: `${rKey}|ctrl|del|${m.seq}`,
+        roomKey: rKey, roomId, serverUrl,
+        ts: tsVal, seq: m.seq,
+        kind: 'delete', targetSeq
+      });
+      return;
+    }
+
+    // IN-BAND TOMBSTONE ROW
+    if (obj && obj.kind === 'deleted') {
+      const targetSeq = Number.isFinite(obj.target_seq) ? Number(obj.target_seq) : Number(m.seq);
+      await upsertTombstone(serverUrl, roomId, targetSeq, { ts: m.ts, signer_id: m.signer_id, sig: m.sig });
+      // also store the tombstone row so its seq is occupied
+      await msgPut({
+        id: `${rKey}|tomb|row|${m.seq}`,
+        roomKey: rKey, roomId, serverUrl,
+        ts: tsVal, seq: m.seq,
+        kind: 'deleted-row', targetSeq
+      });
+      return;
+    }
+
+  } catch { /* plaintext text message */ }
+
+  // TEXT
+  await msgPut({
+    id, roomKey: rKey, roomId, serverUrl,
+    ts: tsVal, seq: seqVal,
+    nickname: m.nickname, senderId: m.sender_id,
+    verified, kind: 'text', text: pt
+  });
+
+  const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
+  if (isActive) {
+    const rec = { id, roomId, serverUrl, kind:'text', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, text: pt };
     renderSegment([rec], { placement:'append', computeGaps:true, persistGaps:true });
   }
 }
@@ -2487,34 +2642,18 @@ function connect(sc) {
     } else if (m.type === 'history') {
       const serverUrl = sc.url;
       const rid = m.room_id;
-      const rKey = roomKey(serverUrl, rid);
-      // Start from whatever we already had persisted
-      let prev = await msgGetLastSeq(serverUrl, rid); // -1 if none
+
       for (const item of (m.messages || [])) {
-	const s = typeof item.seq === 'number' ? item.seq : null;
-	if (s === null) continue; // malformed, but you're wiping anyway
-	if (prev >= -1 && s > prev + 1) {
-	  await putGapRecord({ serverUrl, roomId: rid, ts: item.ts, fromSeq: prev, toSeq: s });
-	  // If this is the active room, render immediately
-	  if (VL && VL.serverUrl === serverUrl && VL.roomId === rid) {
-	    renderGapBubble(s - prev - 1);
-	  }
-	}
-	// store the message itself (handleIncoming true=fromHistory so it won't double-render)
+	// No DOM writes here; fromHistory=true
 	await handleIncoming(serverUrl, item, true);
-	prev = s;
-	lastSeqSeen.set(rKey, prev);
-      }
-      // If active room, (re)draw initial view if needed
-      if (m.room_id === currentRoomId) {
-	if (!ui.messages.firstChild || !VL?.oldestKey) {
-	  await initVirtualRoomView(serverUrl, rid);
-	  setStatus(statuses.connected);
-	} else if (ui.status && ui.status.textContent !== 'Connected') {
-	  setStatus(statuses.connected);
-	}
       }
 
+      // If this is the active room, draw (from IDB) using your normal init
+      if (rid === currentRoomId) {
+	await initVirtualRoomView(serverUrl, rid);
+	setStatus(statuses.connected);
+      }
+	
     } else if (m.type === 'message') {
       handleIncoming(sc.url, m);
 
@@ -2550,9 +2689,9 @@ function connect(sc) {
 
     } else if (m.type === 'error') {
       // optionally display when active room matches
-      if (m.room_id === currentRoomId) {
-        renderTextMessage({ text: `Server error: ${m.error}`, ts: nowMs(), nickname: 'server', senderId: null });
-      }
+      //if (m.room_id === currentRoomId) {
+        console.log({ text: `Server error: ${m.error}`, ts: nowMs(), nickname: 'server', senderId: null });
+      //}
     }
   };
 }

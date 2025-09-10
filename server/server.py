@@ -115,7 +115,7 @@ def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, cip
         RETURNING seq
         """
         try:
-            CONN.execute(sql, (room_id, ts, nickname, sender_id, sig, ciphertext))
+            cur = CONN.execute(sql, (room_id, ts, nickname, sender_id, sig, ciphertext))
             row = cur.fetchone()
             return int(row["seq"])
         except sqlite3.IntegrityError as e:
@@ -406,7 +406,8 @@ def ws_handler(ws):
 
             # ---------- Everything below requires room_id + authorization ----------
             room_id = m.get('room_id')
-            if t not in ('history', 'send', 'announce', 'profile-change','profile-retrieve', 'webrtc-request', 'webrtc-response', 'webrtc-ice', 'webrtc-taken'):
+            if t not in ('history', 'send', 'delete', 'announce', 'profile-change','profile-retrieve', 'webrtc-request',
+                         'webrtc-response', 'webrtc-ice', 'webrtc-taken'):
                 ws.send(json.dumps({'type': 'error', 'error': f'unknown type: {t}'}))
                 continue
             if not isinstance(room_id, str) or not room_id:
@@ -579,6 +580,120 @@ def ws_handler(ws):
                 fanout = broadcast(room_id, payload)
                 LOG("send", "room=", room_id, "bytes=", len(ciphertext_b64u), "fanout=", fanout)
                 continue
+
+            elif t == 'delete':
+                # Rate-limit
+                if _too_many('delete', ip, room_id, limit=120):
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'rate_limited'}))
+                    continue
+
+                # Read fields
+                try:
+                    ref_seq = int(m.get('ref_seq'))
+                except Exception:
+                    ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_ref_seq'}))
+                    continue
+
+                tomb_ct_b64 = m.get('tombstone_ciphertext')
+                del_ct_b64  = m.get('delete_ciphertext')
+                tomb_sig_b64 = m.get('tombstone_sig')
+                del_sig_b64  = m.get('delete_sig')
+                sender_id_b64 = m.get('sender_id')
+                ts_client = m.get('ts_client')
+
+                if not (isinstance(tomb_ct_b64, str) and isinstance(del_ct_b64, str)
+                        and isinstance(tomb_sig_b64, str) and isinstance(del_sig_b64, str)
+                        and isinstance(sender_id_b64, str)):
+                    ws.send(json.dumps({'type':'error','room_id':room_id,'error':'missing_delete_fields'}))
+                    continue
+
+                # Decode
+                try:
+                    tomb_ct  = _from_b64u(tomb_ct_b64)
+                    del_ct   = _from_b64u(del_ct_b64)
+                    tomb_sig = _from_b64u(tomb_sig_b64)
+                    del_sig  = _from_b64u(del_sig_b64)
+                    sender_id = _from_b64u(sender_id_b64)
+                except Exception:
+                    ws.send(json.dumps({'type':'error','room_id':room_id,'error':'bad_encoding'}))
+                    continue
+
+                # Size checks
+                if len(tomb_ct) > MAX_PAYLOAD_SIZE or len(del_ct) > MAX_PAYLOAD_SIZE:
+                    ws.send(json.dumps({'type':'error','room_id':room_id,'error':'payload_too_large'}))
+                    continue
+
+                # Verify signatures over respective ciphertexts
+                try:
+                    import nacl.signing, nacl.exceptions
+                    nacl.signing.VerifyKey(sender_id).verify(tomb_ct, tomb_sig)
+                    nacl.signing.VerifyKey(sender_id).verify(del_ct,  del_sig)
+                except nacl.exceptions.BadSignatureError:
+                    ws.send(json.dumps({'type':'error','room_id':room_id,'error':'bad_signature'}))
+                    continue
+                except Exception:
+                    ws.send(json.dumps({'type':'error','room_id':room_id,'error':'signature_error'}))
+                    continue
+
+                # Load original owner at ref_seq (must exist and match sender)
+                orig = CONN.execute(
+                    "SELECT sender_id FROM messages WHERE room_id=? AND seq=?",
+                    (room_id, ref_seq)
+                ).fetchone()
+                if not orig:
+                    ws.send(json.dumps({'type':'error','room_id':room_id,'error':'not_found'}))
+                    continue
+
+                orig_sender = bytes(orig['sender_id']) if isinstance(orig['sender_id'], (bytes, bytearray, memoryview)) else orig['sender_id']
+                if not (isinstance(orig_sender, (bytes, bytearray, memoryview)) and bytes(orig_sender) == sender_id):
+                    ws.send(json.dumps({'type':'error','room_id':room_id,'error':'not_authorized'}))
+                    continue
+
+                # Perform both operations atomically:
+                # 1) overwrite original row with tombstone (keep ts; update ciphertext + sig)
+                # 2) insert a control record as a new message (delete_ct)
+                try:
+                    with CONN:
+                        # 1) Replace original row's ciphertext and sig
+                        CONN.execute(
+                            "UPDATE messages SET ciphertext=?, sig=? WHERE room_id=? AND seq=?",
+                            (tomb_ct, tomb_sig, room_id, ref_seq)
+                        )
+
+                        # 2) Insert control row (its own seq)
+                        try:
+                            ts = int(ts_client) if ts_client is not None else now_ms()
+                        except Exception:
+                            ts = now_ms()
+
+                        seq_ctl = insert_message_with_seq(
+                            room_id, ts,
+                            nickname=None,            # optional: you could carry nickname if you want
+                            sender_id=sender_id,
+                            sig=del_sig,
+                            ciphertext=del_ct
+                        )
+                        # If replay (same del_ct seen), seq_ctl can be None; it's okay to just skip broadcast
+                except sqlite3.IntegrityError:
+                    # e.g., unique(ciphertext) collision on control row → treat as replay
+                    seq_ctl = None
+
+                # Broadcast the control message if it inserted
+                if seq_ctl is not None:
+                    payload = {
+                        'type': 'message',
+                        'room_id': room_id,
+                        'seq': seq_ctl,
+                        'ts': ts,
+                        'nickname': None,
+                        'sender_id': sender_id_b64,
+                        'sig': del_sig_b64,
+                        'ciphertext': del_ct_b64
+                    }
+                    fanout = broadcast(room_id, payload)
+                    LOG("delete", "room=", room_id, "ref_seq=", ref_seq, "control_seq=", seq_ctl, "fanout=", fanout)
+                else:
+                    LOG("delete-replay", "room=", room_id, "ref_seq=", ref_seq)
 
             # ---------- WebRTC signaling ----------
             is_signal_rate_limited = _too_many('signal', ip, room_id, limit=800)  # plenty of headroom
