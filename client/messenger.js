@@ -568,14 +568,14 @@ async function getRoomKeys(roomId) {
   return k;
 }
 
-async function msgDeleteRoom(serverUrl, roomId){
+async function msgRoom(serverUrl, roomId){
   const list = await msgListByRoom(serverUrl, roomId);
   if (!list.length) return;
   const db = await openMsgDB();
   await new Promise((res, rej) => {
     const tx = db.transaction(MSG_STORE, 'readwrite');
     const store = tx.objectStore(MSG_STORE);
-    for (const r of list) store.delete(r.id);
+    for (const r of list) store.(r.id);
     tx.oncomplete = () => res(true);
     tx.onerror = () => rej(tx.error);
   });
@@ -591,7 +591,7 @@ async function getRoomPrivateKeyBytes(roomId) {
 async function clearRoomData(serverUrl, roomId){
   const db = await openMsgDB();
   const key = roomKey(serverUrl, roomId);
-  // delete all msgs for room + marker
+  //  all msgs for room + marker
   return new Promise((res, rej) => {
     const tx = db.transaction(MSG_STORE, 'readwrite');
     const store = tx.objectStore(MSG_STORE);
@@ -602,7 +602,7 @@ async function clearRoomData(serverUrl, roomId){
     req.onsuccess = e => {
       const cur = e.target.result;
       if (!cur) return;
-      store.delete(cur.primaryKey);
+      store.(cur.primaryKey);
       cur.continue();
     };
     tx.oncomplete = () => res(true);
@@ -756,7 +756,7 @@ async function profileDel(key) {
   return new Promise((resolve, reject) => {
     const tx = db.transaction(PROFILE_STORE, 'readwrite');
     const store = tx.objectStore(PROFILE_STORE);
-    const req = store.delete(key);
+    const req = store.(key);
     req.onsuccess = () => resolve(true);
     req.onerror = () => reject(req.error);
   });
@@ -775,7 +775,7 @@ function scheduleProfileRetry(serverUrl, roomId, senderId) {
   const delay = [400, 1000, 2000, 4000, 8000][st.tries - 1]; // backoff
   clearTimeout(st.timer);
   st.timer = setTimeout(() => {
-    profileReqInflight.delete(profileKeyLocal(serverUrl, roomId, senderId)); // allow another request
+    profileReqInflight.(profileKeyLocal(serverUrl, roomId, senderId)); // allow another request
     requestProfileIfMissing(serverUrl, roomId, senderId);
   }, delay);
 
@@ -785,7 +785,7 @@ function scheduleProfileRetry(serverUrl, roomId, senderId) {
 function clearProfileRetry(serverUrl, roomId, senderId) {
   const key = profileRetryKey(serverUrl, roomId, senderId);
   const st = profileRetryState.get(key);
-  if (st) { clearTimeout(st.timer); profileRetryState.delete(key); }
+  if (st) { clearTimeout(st.timer); profileRetryState.(key); }
 }
 
 function profileKeyLocal(serverUrl, roomId, senderId) {
@@ -876,7 +876,7 @@ function requestProfileIfMissing(serverUrl, roomId, senderId) {
   profileReqInflight.add(key);
   sc.ws.send(JSON.stringify({ type: 'profile-retrieve', room_id: roomId, sender_id: senderId }));
   // Auto-clear the inflight guard after a short window so retries can fire
-  setTimeout(() => profileReqInflight.delete(key), 1500);
+  setTimeout(() => profileReqInflight.(key), 1500);
 }
 
 function persistIdentity() {
@@ -1100,8 +1100,8 @@ async function idbPut(hash, blob) {
 // RENDER
 ///////////////////////
 
-function canonDeleteBytes(roomId, seq) {
-  return new TextEncoder().encode(`delete|${roomId}|seq:${seq}`);
+function canonBytes(roomId, seq) {
+  return new TextEncoder().encode(`|${roomId}|seq:${seq}`);
 }
 
 async function msgGetBySeq(serverUrl, roomId, seq) {
@@ -1414,7 +1414,7 @@ function makeActionsBar(rec) {
   const onCopy = () => { copyMessageToClipboard(rec, copyBtn); };
   copyBtn = makeActionButton('🗐', 'Copy', onCopy);
 
-  const reactBtn = makeActionButton('✹', 'React',  onReact);
+  const reactBtn = makeActionButton('😐︎', 'React',  onReact);
 
   bar.appendChild(replyBtn);
   bar.appendChild(copyBtn);
