@@ -1491,6 +1491,7 @@ document.addEventListener('keydown', (e) => { if (e.key === 'Escape') clearSelec
 function renderBubble(rec) {
   if (!VL || VL.serverUrl !== rec.serverUrl || VL.roomId !== rec.roomId) return null;
   if (rec.kind === 'deleted') { return null; }
+  if (rec.kind === 'delete') { return null; }
 
   const row = document.createElement('div');
   const mine = isSelf(rec.senderId);
@@ -1498,6 +1499,7 @@ function renderBubble(rec) {
   if (rec.id) row.dataset.msgId = rec.id;
   if (rec.senderId) row.dataset.senderId = rec.senderId;
   row.dataset.ts = String(rec.ts || nowMs());
+  row.dataset.seq = String(rec.seq);
 
   const wrap   = document.createElement('div'); wrap.className = 'wrap';
   const avatar = document.createElement('div'); avatar.className = 'msg-avatar';
@@ -2114,6 +2116,8 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
   const roomId = m.room_id;
   if (!roomId) return;
 
+  dbg('DEBUG/handleIncoming', m);
+
   const pt = await decryptToStringForRoom(roomId, m.ciphertext);
   const rKey = roomKey(serverUrl, roomId);
 
@@ -2196,10 +2200,10 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
       await upsertTombstone(serverUrl, roomId, targetSeq, { ts: m.ts, signer_id: m.signer_id, sig: m.sig });
       // also store the tombstone row so its seq is occupied
       await msgPut({
-        id: `${rKey}|tomb|row|${m.seq}`,
+        id: `${rKey}|tomb|${m.seq}`,
         roomKey: rKey, roomId, serverUrl,
         ts: tsVal, seq: m.seq,
-        kind: 'deleted-row', targetSeq
+        kind: 'deleted', targetSeq
       });
       return;
     }

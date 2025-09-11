@@ -71,6 +71,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS messages (
           room_id   TEXT    NOT NULL,
           seq       INTEGER NOT NULL,
+          ref_seq   INTEGER,
           ts        INTEGER NOT NULL,
           nickname  TEXT,
           sender_id BLOB,
@@ -94,7 +95,7 @@ def _sqlite_supports_returning() -> bool:
 
 SQLITE_HAS_RETURNING = _sqlite_supports_returning()
 
-def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, ciphertext: bytes):
+def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, ciphertext: bytes, ref_seq=None):
     """
     Atomically bump per-room counter and insert a message.
     Returns (seq) on success; returns None if ciphertext replay (unique violation).
@@ -109,13 +110,13 @@ def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, cip
             SET next = room_counters.next + 1
           RETURNING room_id, (next - 1) AS seq
         )
-        INSERT INTO messages (room_id, seq, ts, nickname, sender_id, sig, ciphertext)
-        SELECT room_id, seq, ?, ?, ?, ?, ?
+        INSERT INTO messages (room_id, seq, ref_seq, ts, nickname, sender_id, sig, ciphertext)
+        SELECT room_id, seq, ?, ?, ?, ?, ?, ?
         FROM next
         RETURNING seq
         """
         try:
-            cur = CONN.execute(sql, (room_id, ts, nickname, sender_id, sig, ciphertext))
+            cur = CONN.execute(sql, (room_id, ref_seq, ts, nickname, sender_id, sig, ciphertext))
             row = cur.fetchone()
             return int(row["seq"])
         except sqlite3.IntegrityError as e:
@@ -137,9 +138,9 @@ def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, cip
                 seq = int(row["seq"])
                 # Insert message at that seq
                 CONN.execute("""
-                    INSERT INTO messages(room_id, seq, ts, nickname, sender_id, sig, ciphertext)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                """, (room_id, seq, ts, nickname, sender_id, sig, ciphertext))
+                    INSERT INTO messages(room_id, seq, ref_seq, ts, nickname, sender_id, sig, ciphertext)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (room_id, seq, ref_seq, ts, nickname, sender_id, sig, ciphertext))
                 # with-block commits here
                 return seq
         except sqlite3.IntegrityError:
@@ -481,7 +482,7 @@ def ws_handler(ws):
                         'ciphertext': _b64u(row['ciphertext'])
                     }))
                 continue
-            
+
 
             # ---------- History ----------
             if t == 'history':
@@ -490,7 +491,7 @@ def ws_handler(ws):
                 except Exception:
                     since = 0
                 cur = CONN.execute(
-                    "SELECT seq, ts, nickname, sender_id, sig, ciphertext FROM messages "
+                    "SELECT seq, ref_seq, ts, nickname, sender_id, sig, ciphertext FROM messages "
                     "WHERE room_id=? AND ts>=? ORDER BY seq ASC",
                     (room_id, since)
                 )
@@ -499,6 +500,7 @@ def ws_handler(ws):
                     'type': 'message',
                     'room_id': room_id,
                     'seq': r['seq'],
+                    'ref_seq': r['ref_seq'],
                     'ts': r['ts'],
                     'nickname': r['nickname'],
                     # ensure strings for JSON:
@@ -671,12 +673,14 @@ def ws_handler(ws):
                             nickname=None,            # optional: you could carry nickname if you want
                             sender_id=sender_id,
                             sig=del_sig,
-                            ciphertext=del_ct
+                            ciphertext=del_ct,
+                            ref_seq=ref_seq,
                         )
                         # If replay (same del_ct seen), seq_ctl can be None; it's okay to just skip broadcast
                 except sqlite3.IntegrityError:
                     # e.g., unique(ciphertext) collision on control row → treat as replay
                     seq_ctl = None
+                    continue
 
                 # Broadcast the control message if it inserted
                 if seq_ctl is not None:
@@ -684,6 +688,7 @@ def ws_handler(ws):
                         'type': 'message',
                         'room_id': room_id,
                         'seq': seq_ctl,
+                        'ref_seq': ref_seq,
                         'ts': ts,
                         'nickname': None,
                         'sender_id': sender_id_b64,
