@@ -358,91 +358,102 @@ dialog::backdrop{ background:rgba(0,0,0,.6); }
     display: inline-block;
 }
 
-.bubble { transition: opacity 120ms ease; }
-.bubble._pre { opacity: 0; }
+/* ===== BUBBLES + OVERLAYS (minimal, de-duplicated) ===== */
 
-/* Selected ring */
-.bubble.--selected {
-  box-shadow: 0 0 0 2px #fff;
+/* Stacking contexts */
+.messages { position: relative; isolation: isolate; overflow-x: hidden; }
+.row { position: relative; z-index: 0; }
+.row.--lift { z-index: 1000; }          /* lift selected row above neighbors */
+.msg-avatar { position: relative; z-index: 0; }
+
+/* Bubble base */
+.bubble {
+  position: relative;
+  overflow: visible;                    /* allow bars to hang outside */
+  transition: opacity 120ms ease, box-shadow 120ms ease;
 }
+.bubble._pre { opacity: 0; }
+.bubble.--selected { box-shadow: 0 0 0 2px #fff; }
+
+/* Timestamp inside bubble */
 .bubble .time-label {
   display: block;
   margin-top: 6px;
   font-size: 11px;
+  color: #c9c9c9;
   opacity: 0;
   transition: opacity 120ms ease;
-  color: #c9c9c9; /* readable on both light/dark bubbles */
+  pointer-events: none;
 }
-.bubble.--selected .time-label {
-  opacity: 1;
-}
+.bubble.--selected .time-label { opacity: 1; }
 
-/* Existing */
-.bubble { transition: opacity 120ms ease, box-shadow 120ms ease; position: relative; }
-.bubble._pre { opacity: 0; }
-.bubble.--selected { box-shadow: 0 0 0 2px #fff; }
-
-/* Action bar "hanging" under the bubble */
-.bubble .bubble-actions {
+/* Shared overlay bars */
+.bubble .bubble-actions,
+.bubble .reactions-bar {
   position: absolute;
-  left: 50%;
-  bottom: -28px;               /* hangs below bubble */
-  transform: translateX(-50%) translateY(6px);
   display: flex;
+  flex-wrap: nowrap;                    /* single row if it fits */
+  white-space: nowrap;
   gap: 8px;
   opacity: 0;
-  pointer-events: none;
+  pointer-events: none;                 /* off until selected */
   transition: opacity 120ms ease, transform 120ms ease;
-  z-index: 10;
 }
-
-/* Reveal actions when selected */
-.bubble.--selected .bubble-actions {
+.bubble.--selected .bubble-actions,
+.bubble.--selected .reactions-bar {
   opacity: 1;
   pointer-events: auto;
-  transform: translateX(-50%) translateY(0);
-  z-index: 10;  
 }
 
-/* Circular buttons */
-.bubble .bubble-actions .action-btn {
-  width: 36px;
-  height: 36px;
-  border-radius: 50%;
-  border: none;
-  background: #fff;
-  color: #111;
+/* Z-order: actions above reactions */
+.bubble .bubble-actions { z-index: 20; }
+.bubble .reactions-bar { z-index: 20; }
+
+/* --- Placement: ACTIONS ABOVE (anchored to inside edge) --- */
+.row.other .bubble .bubble-actions {
+  top: -28px; left: 12px;
+  transform: translateY(-6px);
+  justify-content: flex-start;          /* grow rightward */
+}
+.row.me .bubble .bubble-actions {
+  top: -28px; right: 12px;
+  transform: translateY(-6px);
+  justify-content: flex-end;            /* grow leftward */
+}
+.row.other .bubble.--selected .bubble-actions,
+.row.me .bubble.--selected .bubble-actions {
+  transform: translateY(0);
+}
+
+/* --- Placement: REACTIONS BELOW (anchored to inside edge) --- */
+.row.other .bubble .reactions-bar {
+  bottom: -28px; left: 12px;
+  transform: translateY(6px);
+  justify-content: flex-start;          /* grow rightward */
+}
+.row.me .bubble .reactions-bar {
+  bottom: -28px; right: 12px;
+  transform: translateY(6px);
+  justify-content: flex-end;            /* grow leftward */
+}
+.row.other .bubble.--selected .reactions-bar,
+.row.me .bubble.--selected .reactions-bar {
+  transform: translateY(0);
+}
+
+/* Circular buttons (actions + reactions) */
+.bubble .action-btn,
+.bubble .reaction-btn {
+  flex: 0 0 var(--btn-size, 36px);
+  inline-size: var(--btn-size, 36px);
+  block-size: var(--btn-size, 36px);
+  border-radius: 9999px;
+  border: none; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: #fff; color: #111;
   box-shadow: 0 4px 12px rgba(0,0,0,.35);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  cursor: pointer;
-  font-size: 18px;
-  line-height: 1;
+  cursor: pointer; line-height: 1; font-size: 18px;
+  -webkit-appearance: none; appearance: none;
 }
-
-/* Optional: subtle press */
-.bubble .bubble-actions .action-btn:active {
-  transform: scale(0.96);
-}
-
-/* Make messages its own stacking context (optional but helpful) */
-.messages { position: relative; isolation: isolate; }
-
-/* Rows need to be positioned to accept z-index */
-.row { position: relative; z-index: 0; }
-
-/* When a bubble in this row is selected, lift the whole row above neighbors */
-.row.--lift { z-index: 999; }
-
-/* Keep your existing bubble styles */
-.bubble { position: relative; }
-.bubble._pre { opacity: 0; }
-.bubble.--selected { box-shadow: 0 0 0 2px #fff; }
-
-/* Optional: normalize avatar z-index to avoid surprises */
-.msg-avatar { position: relative; z-index: auto; }
-
-/* Ensure bubble is a positioning context; content is a block */
-.bubble { position: relative; }
-.bubble-content { display: block; }
+.bubble .action-btn:active,
+.bubble .reaction-btn:active { transform: scale(0.96); }

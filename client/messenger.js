@@ -1100,6 +1100,20 @@ async function idbPut(hash, blob) {
 // RENDER
 ///////////////////////
 
+function renderGapBubble(count, { prepend=false } = {}) {
+  const row = document.createElement('div');
+  row.className = 'row other';
+  const wrap = document.createElement('div'); wrap.className = 'wrap';
+  const label = document.createElement('div'); label.className = 'name-label';
+  label.textContent = ''; // neutral
+  const bubble = document.createElement('div'); bubble.className = 'bubble';
+  bubble.textContent = `${count} messages missing`;
+  wrap.appendChild(label); wrap.appendChild(bubble); row.appendChild(wrap);
+  if (prepend) ui.messages.insertBefore(row, ui.messages.firstChild);
+  else ui.messages.appendChild(row);
+  return row;
+}
+
 function canonDeleteBytes(roomId, seq) {
   return new TextEncoder().encode(`delete|${roomId}|seq:${seq}`);
 }
@@ -1372,7 +1386,7 @@ function makeActionButton(char, label, onClick) {
   btn.title = label;
   btn.setAttribute('aria-label', label);
   btn.addEventListener('click', (e) => {
-    e.stopPropagation(); // don't clear selection
+    e.stopPropagation();
     try { onClick && onClick(); } catch {}
   });
   return btn;
@@ -1414,12 +1428,48 @@ function makeActionsBar(rec) {
   const onCopy = () => { copyMessageToClipboard(rec, copyBtn); };
   copyBtn = makeActionButton('🗐', 'Copy', onCopy);
 
-  const reactBtn = makeActionButton('😐︎', 'React',  onReact);
-
   bar.appendChild(replyBtn);
   bar.appendChild(copyBtn);
   if(delBtn) bar.appendChild(delBtn);
-  bar.appendChild(reactBtn);
+
+  bar.addEventListener('click', (e) => e.stopPropagation());
+  return bar;
+}
+
+function makeReactionButton(emoji, label, onClick) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'reaction-btn';
+  btn.textContent = emoji;
+  btn.title = label || emoji;
+  btn.setAttribute('aria-label', label || emoji);
+  btn.addEventListener('click', (e) => {
+    e.stopPropagation();
+    try { onClick && onClick(); } catch {}
+  });
+  return btn;
+}
+
+function openReactionPickerStub(rec) {
+  // Placeholder — wire real picker later
+  console.log('open reactions dialog', rec);
+  alert('Reaction picker (stub) — coming soon!');
+}
+
+
+function makeReactionsBar(rec) {
+  const bar = document.createElement('div');
+  bar.className = 'reactions-bar';
+
+  const emojis = ['🙂','😆','☹️','😡','🚀','👍'];
+  emojis.forEach(em => {
+    bar.appendChild(makeReactionButton(em, `React ${em}`, () => {
+      console.log('react', em, rec);
+      // TODO: wire reaction logic
+    }));
+  });
+  // ➕ opens picker dialog (stub)
+  bar.appendChild(makeReactionButton('➕', 'More…', () => openReactionPickerStub(rec)));
 
   bar.addEventListener('click', (e) => e.stopPropagation());
   return bar;
@@ -1539,7 +1589,11 @@ function renderBubble(rec) {
   timeEl.className = 'time-label';
   bubble.appendChild(timeEl);
 
-  // Actions bar (stays after content)
+  // Reaction palette below bubble
+  const reactionsBar = makeReactionsBar(rec);
+  bubble.appendChild(reactionsBar);
+
+  // Actions bar above bubble
   const actionsBar = makeActionsBar(rec);
   bubble.appendChild(actionsBar);
 
