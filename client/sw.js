@@ -1,68 +1,149 @@
-// Versioned cache via manifest.json
-fetch('./manifest.json')
-  .then(r => r.json())
-  .then(manifest => {
-    const APP_VERSION = manifest.version || 'dev';
-    const CACHE_NAME = `messenger-cache-v${APP_VERSION}`;
+// --- Version-aware caching that *bypasses* cached manifest and updates eagerly ---
+const META_CACHE = 'messenger-meta';
 
-    const urlsToCache = [
-      './',
-      './index.html',
-      './manifest.json',
-      './site.webmanifest',
-      './sw.js',
-      `./messenger.js?v=${APP_VERSION}`,
-      './utils.js?v=${APP_VERSION}',
-      './settings.js?v=${APP_VERSION}',
-      './yam.css?v=${APP_VERSION}',
-      './boot.js?v=${APP_VERSION}',
-      './offline.html',
-      './android-chrome-192x192.png',
-      './android-chrome-512x512.png',
-      './apple-touch-icon.png',
-      './logo.svg',
-      './vendor/qrcodejs/qrcode.js',
-      './vendor/sodium/sodium.js'
-    ];
+async function fetchManifestFresh() {
+  // Always bypass caches for the manifest to detect new versions
+  const res = await fetch('./manifest.json', { cache: 'no-store' });
+  return res.json();
+}
 
-    self.addEventListener('install', event => {
-      event.waitUntil(caches.open(CACHE_NAME).then(cache => cache.addAll(urlsToCache)));
-      self.skipWaiting();
-    });
+async function getStoredVersion() {
+  const cache = await caches.open(META_CACHE);
+  const res = await cache.match('/__app_version__');
+  return res ? (await res.text()) : null;
+}
 
-    self.addEventListener('activate', event => {
-      event.waitUntil(
-        caches.keys().then(names => Promise.all(names.map(n => n !== CACHE_NAME && caches.delete(n))))
-      );
-      self.clients.claim();
-    });
+async function setStoredVersion(v) {
+  const cache = await caches.open(META_CACHE);
+  await cache.put('/__app_version__', new Response(v, { headers: { 'content-type': 'text/plain' } }));
+}
 
-    // Stale-while-revalidate for static assets; offline fallback for navigations
-    self.addEventListener('fetch', event => {
-      const req = event.request;
-      if (req.method !== 'GET') return; // don't touch mutating requests
+function urlsToCacheFor(version) {
+  return [
+    './',
+    './index.html',
+    // DO NOT cache manifest or sw.js themselves (we fetch them network-first)
+    //'./manifest.json',
+    //'./sw.js',
+    './site.webmanifest',
+    `./messenger.js?v=${version}`,
+    `./utils.js?v=${version}`,
+    `./settings.js?v=${version}`,
+    `./yam.css?v=${version}`,
+    `./boot.js?v=${version}`,
+    './offline.html',
+    './android-chrome-192x192.png',
+    './android-chrome-512x512.png',
+    './apple-touch-icon.png',
+    './logo.svg',
+    './vendor/qrcodejs/qrcode.js',
+    './vendor/sodium/sodium.js'
+  ];
+}
 
-      // HTML navigations → offline fallback
-      if (req.mode === 'navigate') {
-        event.respondWith(
-          fetch(req).catch(() => caches.match('./offline.html'))
-        );
-        return;
+// Versioned cache name is computed dynamically in handlers using stored version
+async function warmCache(version) {
+  const CACHE_NAME = `messenger-cache-v${version}`;
+  const cache = await caches.open(CACHE_NAME);
+  await cache.addAll(urlsToCacheFor(version));
+  // Remove all other versioned caches, keep META
+  const names = await caches.keys();
+  await Promise.all(
+    names
+      .filter(n => n !== CACHE_NAME && n !== META_CACHE)
+      .map(n => caches.delete(n))
+  );
+  return CACHE_NAME;
+}
+
+async function checkAndUpdate() {
+  try {
+    const manifest = await fetchManifestFresh();               // no-store
+    const newVersion = manifest.version || 'dev';
+    const current = await getStoredVersion();
+    if (current !== newVersion) {
+      await warmCache(newVersion);
+      await setStoredVersion(newVersion);
+      await self.clients.claim();
+      // tell pages an update is ready (they may choose to reload)
+      const clis = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      clis.forEach(c => c.postMessage({ type: 'sw:update-ready', version: newVersion }));
+    }
+  } catch (e) {
+    // network problems? stay quiet and keep current caches
+  }
+}
+
+// Kick off initial check on install
+self.addEventListener('install', event => {
+  event.waitUntil((async () => {
+    const manifest = await fetchManifestFresh();               // no-store
+    const version = manifest.version || 'dev';
+    await warmCache(version);
+    await setStoredVersion(version);
+  })());
+  self.skipWaiting();
+});
+
+// Claim and do a background version check when activating
+self.addEventListener('activate', event => {
+  event.waitUntil(checkAndUpdate());
+  self.clients.claim();
+});
+
+// Network-first for navigations + background version check
+self.addEventListener('fetch', event => {
+  const req = event.request;
+  if (req.method !== 'GET') return;
+
+  const url = new URL(req.url);
+  const sameOrigin = url.origin === location.origin;
+
+  // Ensure manifest and sw.js are always fetched fresh
+  if (sameOrigin && (url.pathname.endsWith('/manifest.json') || url.pathname.endsWith('/sw.js'))) {
+    event.respondWith(fetch(new Request(url, { cache: 'no-store' })));
+    return;
+  }
+
+  if (req.mode === 'navigate') {
+    event.respondWith(fetch(req).catch(() => caches.match('./offline.html')));
+    // In the background, check if a newer version exists and warm it
+    event.waitUntil(checkAndUpdate());
+    return;
+  }
+
+  event.respondWith((async () => {
+    const cached = await caches.match(req);
+    try {
+      const net = await fetch(req);
+      // Only cache small, same-origin, basic (non-opaque) responses
+      if (sameOrigin && net.ok && net.type === 'basic') {
+        const len = Number(net.headers.get('content-length') || '0');
+        if (len === 0 || len <= 3_000_000) {
+          const clone = net.clone();
+          const version = (await getStoredVersion()) || 'dev';
+          const cache = await caches.open(`messenger-cache-v${version}`);
+          cache.put(req, clone);
+        }
       }
+      return cached || net;
+    } catch {
+      return cached;
+    }
+  })());
+});
 
-      event.respondWith(
-        caches.match(req).then(cached => {
-          const fetchPromise = fetch(req).then(networkRes => {
-            const resClone = networkRes.clone();
-            caches.open(CACHE_NAME).then(cache => cache.put(req, resClone));
-            return networkRes;
-          }).catch(() => cached);
-          return cached || fetchPromise;
-        })
-      );
-    });
-  })
-  .catch(err => console.error('Failed to init SW via manifest:', err));
+// Allow the page to force a refresh (clear old, warm new, then notify)
+self.addEventListener('message', event => {
+  const data = event.data || {};
+  if (data.type === 'sw:force-refresh') {
+    event.waitUntil((async () => {
+      await checkAndUpdate();
+      const clis = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+      clis.forEach(c => c.postMessage({ type: 'sw:refresh-complete' }));
+    })());
+  }
+});
 
 // === PUSH: show notifications when app isn't visible ===
 self.addEventListener('push', event => {

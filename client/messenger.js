@@ -40,6 +40,7 @@ const ui = {
   menuProfile: document.getElementById('menuProfile'),
   menuRoomOpts: document.getElementById('menuRoomOpts'),
   menuInvite: document.getElementById('menuInvite'),
+  btnRefresh: document.getElementById('btnRefresh'),
 };
 
 // Gear -> configure room
@@ -434,6 +435,39 @@ async function continueBootAfterUnlock() {
     if (el) el.textContent = 'No room';
   }
 }
+
+// --- Force-refresh workflow ---
+async function forceRefresh() {
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const sw = navigator.serviceWorker.controller || reg.active;
+    if (!sw) { location.reload(); return; }
+    const done = new Promise(resolve => {
+      const onMsg = (e) => {
+        if (e.data && (e.data.type === 'sw:refresh-complete' || e.data.type === 'sw:update-ready')) {
+          navigator.serviceWorker.removeEventListener('message', onMsg);
+          resolve();
+        }
+      };
+      navigator.serviceWorker.addEventListener('message', onMsg);
+    });
+    sw.postMessage({ type: 'sw:force-refresh' });
+    await done;
+  } catch (_) {
+    // best-effort
+  } finally {
+    // hard reload to pick up fresh index and versioned assets
+    location.reload();
+  }
+}
+
+// Optional: show a toast or auto-reload if SW says an update is ready
+navigator.serviceWorker.addEventListener('message', (e) => {
+  if (e.data && e.data.type === 'sw:update-ready') {
+    // e.g., show a UI hint; or uncomment to auto-reload: location.reload();
+  }
+});
+
 
 /////////////////////////////
 // KEYCHECK
