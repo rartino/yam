@@ -2888,7 +2888,7 @@ async function subscribeToPushForCurrentRoom() {
     });
   }
   // Associate this subscription with the current room
-  LOG(`FETCH: ${normServer(VL.serverUrl)}/subscribe`)
+  dbg(`FETCH: ${normServer(VL.serverUrl)}/subscribe`)
   await fetch(`${normServer(VL.serverUrl)}/subscribe`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ room_id: currentRoomId, subscription: sub })
@@ -2902,7 +2902,7 @@ async function disableNotificationsForCurrentRoom() {
   try {
     if (sub && sub.endpoint) {
       // Remove server mapping for this endpoint (idempotent; current server deletes by endpoint)
-      await fetch(`${normServer(VL.serverUrl)}/push/unsubscribe`, {
+      await fetch(`${normServer(VL.serverUrl)}/unsubscribe`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ endpoint: sub.endpoint })
       });

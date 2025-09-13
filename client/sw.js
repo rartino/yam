@@ -97,7 +97,15 @@ self.addEventListener('fetch', event => {
   if (req.method !== 'GET') return;
 
   const url = new URL(req.url);
-  const sameOrigin = url.origin === location.origin;
+  const sameOrigin = url.origin === self.location.origin;
+  // Do NOT intercept cross-origin requests (prevents accidental rewrites).
+  // If you still want to serve a few third-party assets from cache when offline,
+  // allow-list their hosts here.
+  const XO_ALLOW = new Set([
+    //'cdn.jsdelivr.net',   // libsodium, etc. (optional)
+  ]);
+  const allowXO = !sameOrigin && XO_ALLOW.has(url.hostname);
+  if (!sameOrigin && !allowXO) return;
 
   // Ensure manifest and sw.js are always fetched fresh
   if (sameOrigin && (url.pathname.endsWith('/manifest.json') || url.pathname.endsWith('/sw.js'))) {
@@ -105,7 +113,7 @@ self.addEventListener('fetch', event => {
     return;
   }
 
-  if (req.mode === 'navigate') {
+  if (req.mode === 'navigate' && sameOrigin) {
     event.respondWith(fetch(req).catch(() => caches.match('./offline.html')));
     // In the background, check if a newer version exists and warm it
     event.waitUntil(checkAndUpdate());
@@ -116,7 +124,8 @@ self.addEventListener('fetch', event => {
     const cached = await caches.match(req);
     try {
       const net = await fetch(req);
-      // Only cache small, same-origin, basic (non-opaque) responses
+      // Only cache small, same-origin, basic (non-opaque) responses.
+      // Cross-origin (allow-listed) assets are served from pre-cache when offline.
       if (sameOrigin && net.ok && net.type === 'basic') {
         const len = Number(net.headers.get('content-length') || '0');
         if (len === 0 || len <= 3_000_000) {
