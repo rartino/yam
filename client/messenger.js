@@ -1,4 +1,4 @@
-import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId, sanitizeColorHex, pickTextColorOn} from './utils.js';
+import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId, sanitizeColorHex, pickTextColorOn,urlBase64ToUint8Array} from './utils.js';
 import {loadSettings, saveSettings} from './settings.js';
 
 async function ensureSodium() { await sodium.ready; }
@@ -49,6 +49,7 @@ const cfg = {
   btnSave: document.getElementById('btnSaveRoomCfg'),
   btnRemove: document.getElementById('btnRemoveRoom'),
   btnClose: document.getElementById('btnCloseSettings'),
+  btnNotify: document.getElementById('btnNotify'),
 };
 
 const prof = {
@@ -122,6 +123,7 @@ cr.btnCreate.addEventListener('click', async () => {
 
   await openRoom(room.id);
 });
+cfg.btnNotify.addEventListener('click', toggleNotifications);
 
 cfg.btnClose.addEventListener('click', () => cfg.dlg.close());
 cfg.btnSave.addEventListener('click', () => {
@@ -616,6 +618,7 @@ function loadRooms(){
   try { rooms = JSON.parse(localStorage.getItem(ROOMS_KEY) || '[]'); } catch { rooms = []; }
   currentRoomId = localStorage.getItem(CURRENT_ROOM_KEY) || null;
   if (!currentRoomId && rooms.length) currentRoomId = rooms[0].id;
+  refreshNotifyButton();
 }
 function saveRooms(){
   localStorage.setItem(ROOMS_KEY, JSON.stringify(rooms));
@@ -2018,6 +2021,11 @@ let myIdPk = null; // device identity public key (Uint8Array)
 let myIdSk = null; // device identity private key (Uint8Array)
 let myPeerId = null; // base64url of myIdPk
 
+// Local tracking for room-level push enablement (UI toggle)
+const LS_PUSH_ROOMS_KEY = 'secmsg_push_rooms';
+function getPushRooms(){ try { return JSON.parse(localStorage.getItem(LS_PUSH_ROOMS_KEY)) || {}; } catch { return {}; } }
+function setPushRoom(roomId, enabled){ const m=getPushRooms(); if(enabled) m[roomId]=true; else delete m[roomId]; localStorage.setItem(LS_PUSH_ROOMS_KEY, JSON.stringify(m)); }
+
 function derivePubFromSk(sk) {
   if (sodium.crypto_sign_ed25519_sk_to_pk) return sodium.crypto_sign_ed25519_sk_to_pk(sk);
   return sk.slice(32, 64);
@@ -2677,6 +2685,13 @@ function connect(sc) {
       const since = lastTs > 0 ? (lastTs + 1) : sevenDaysAgoMs();
 
       sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since }));
+      refreshNotifyButton(); // update toggle state on connect
+      // Register push for this room if permission is granted
+      try {
+        if (isPushSupported() && Notification.permission === 'granted') {
+          await subscribeToPushForCurrentRoom();
+        }
+      } catch(_) {}
 
       if (room.id === currentRoomId) {
         await ensureSodium();
@@ -2779,6 +2794,89 @@ async function registerRoomIfNeeded(room) {
     });
   } catch {}
 }
+
+////////////////////////////
+// PUSH
+////////////////////////////
+
+function isPushSupported() { return 'serviceWorker' in navigator && 'PushManager' in window; }
+
+async function isSubscribedForCurrentRoom() {
+  if (!currentRoomId || !isPushSupported()) return false;
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  // Consider both UA subscription and our local mapping
+  return !!sub && !!getPushRooms()[currentRoomId];
+}
+
+function refreshNotifyButton() {
+  if (!cfg.btnNotify) return;
+  isSubscribedForCurrentRoom()
+    .then(on => { cfg.btnNotify.textContent = on ? 'Notifications: On (tap to disable)' : 'Notifications: Off'; })
+    .catch(() => { cfg.btnNotify.textContent = 'Notifications'; });
+}
+
+async function toggleNotifications() {
+  if (!currentRoomId) { alert('Join a room first'); return; }
+  if (!isPushSupported()) { alert('Push not supported in this browser'); return; }
+  const on = await isSubscribedForCurrentRoom();
+  if (on) {
+    await disableNotificationsForCurrentRoom();
+  } else {
+    const perm = await Notification.requestPermission();
+    if (perm !== 'granted') { alert('Notifications not enabled'); return; }
+    await subscribeToPushForCurrentRoom();
+  }
+  refreshNotifyButton();
+}
+
+async function subscribeToPushForCurrentRoom() {
+  const reg = await navigator.serviceWorker.ready;
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub) {
+    // Ask server for its VAPID public key
+    const res = await fetch(`${normServer(VL.serverUrl)}/vapid-public-key`);
+    if (!res.ok) { console.warn('Push server not configured (no VAPID keys)'); return; }
+    const vapidKey = await res.text();
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlBase64ToUint8Array(vapidKey)
+    });
+  }
+  // Associate this subscription with the current room
+  await fetch(`${normServer(VL.serverUrl)}/subscribe`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ room_id: currentRoomId, subscription: sub })
+  });
+  setPushRoom(currentRoomId, true);
+}
+
+async function disableNotificationsForCurrentRoom() {
+  const reg = await navigator.serviceWorker.ready;
+  const sub = await reg.pushManager.getSubscription();
+  try {
+    // Remove server-side mapping (and subscription if server treats endpoint unique)
+    if (sub && sub.endpoint) {
+      await fetch(`${normServer(VL.serverUrl)}/unsubscribe`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ endpoint: sub.endpoint })
+      });
+    }
+  } catch (_) {}
+  try {
+    // Also unsubscribe from the browser's push service (global to scope)
+    if (sub) await sub.unsubscribe();
+  } catch (_) {}
+  setPushRoom(currentRoomId, false);
+}
+
+// Receive messages from SW (e.g., to navigate after clicking a notification)
+navigator.serviceWorker.addEventListener('message', (event) => {
+  const data = event.data || {};
+  if (data.type === 'navigate-room' && data.room_id && currentRoomId !== data.room_id) {
+    // (Optional) UI hook: highlight/jump to that room if you maintain multiple rooms.
+  }
+});
 
 ////////////////////////////
 // INVITATIONS

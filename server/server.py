@@ -6,6 +6,9 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sock import Sock
 from urllib.parse import urlparse
+from pywebpush import webpush, WebPushException
+from cryptography.hazmat.primitives.asymmetric import ec
+from cryptography.hazmat.primitives import serialization
 
 DB_PATH = os.environ.get("WS_DB_PATH", "messages.db")
 ALLOWED_ORIGINS = set(
@@ -24,6 +27,9 @@ CORS(
         r"/ws": {"origins": ALLOWED_ORIGINS},
         r"/health": {"origins": ALLOWED_ORIGINS},
         r"/rooms": {"origins": ALLOWED_ORIGINS},
+        r"/subscribe": {"origins": ALLOWED_ORIGINS},
+        r"/unsubscribe": {"origins": ALLOWED_ORIGINS},
+        r"/vapid-public-key": {"origins": ALLOWED_ORIGINS},
     },
     methods=["GET", "POST", "OPTIONS"],
     allow_headers=["Content-Type"],
@@ -80,10 +86,25 @@ def init_db():
           PRIMARY KEY (room_id, seq)
       ) WITHOUT ROWID
       """)
+      CONN.execute("""
+        CREATE TABLE IF NOT EXISTS push_subscriptions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_id TEXT NOT NULL,
+        endpoint TEXT NOT NULL UNIQUE,
+        subscription_json TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+        )
+      """)
+      CONN.execute("""
+        CREATE TABLE IF NOT EXISTS vapid_keys (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        public_key_b64u TEXT NOT NULL,
+        private_key_pem TEXT NOT NULL,
+        subject TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+        )""")
       CONN.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_room_cipher ON messages(room_id, ciphertext)")
       CONN.execute("CREATE INDEX IF NOT EXISTS idx_messages_room_ts ON messages(room_id, ts)")
-
-init_db()
 
 def _sqlite_supports_returning() -> bool:
     try:
@@ -147,6 +168,83 @@ def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, cip
             # Either ciphertext replay or (rare) PK collision; treat as replay/ignore.
             return None
 
+def trigger_push(room_id: str, ts: int, nickname: str | None):
+    """Send a lightweight push to all subscribers of room_id."""
+    if not (VAPID_PUBLIC_KEY_B64U and VAPID_PRIVATE_KEY_PEM):
+        return
+    rows = CONN.execute(
+        "SELECT endpoint, subscription_json FROM push_subscriptions WHERE room_id=?",
+        (room_id,)
+    ).fetchall()
+    payload = json.dumps({
+        'type': 'message',
+        'room_id': room_id,
+        'ts': ts,
+        'nickname': nickname
+    })
+    for r in rows:
+        subscription_info = json.loads(r['subscription_json'])
+        try:
+            webpush(
+                subscription_info=subscription_info,
+                data=payload,
+                vapid_private_key=VAPID_PRIVATE_KEY_PEM,
+                vapid_public_key=VAPID_PUBLIC_KEY_B64U,
+                vapid_claims={"sub": VAPID_SUBJECT},
+                ttl=60
+            )
+        except WebPushException as ex:
+            # Clean up expired/invalid subscriptions
+            if ex.response and ex.response.status_code in (404, 410):
+                with CONN:
+                    CONN.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (subscription_info.get('endpoint'),))
+
+# --- VAPID key management (stored in SQLite) ---
+VAPID_PUBLIC_KEY_B64U = None  # exported public key (base64url of uncompressed point)
+VAPID_PRIVATE_KEY_PEM = None  # PEM-encoded private key for pywebpush
+VAPID_SUBJECT = None          # e.g., "mailto:admin@example.com"
+
+def _ensure_vapid_keys():
+    """
+    Ensure a single VAPID keypair exists in SQLite. If missing, generate and store it.
+    - public_key_b64u: URL-safe base64 of uncompressed P-256 point (0x04 || X || Y), 65 bytes.
+    - private_key_pem: PKCS8 PEM, suitable for pywebpush.
+    """
+    global VAPID_PUBLIC_KEY_B64U, VAPID_PRIVATE_KEY_PEM, VAPID_SUBJECT
+    row = CONN.execute("SELECT public_key_b64u, private_key_pem, subject FROM vapid_keys WHERE id=1").fetchone()
+    if row is None:
+        # Generate new P-256 keypair
+        priv = ec.generate_private_key(ec.SECP256R1())
+        pub = priv.public_key()
+
+        # Export private key as PEM (PKCS8, no encryption)
+        priv_pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode("ascii")
+
+        # Export public key as uncompressed point (04 || X || Y), then base64url(without padding)
+        numbers = pub.public_numbers()
+        x = numbers.x.to_bytes(32, "big")
+        y = numbers.y.to_bytes(32, "big")
+        uncompressed = b"\x04" + x + y
+        import base64
+        pub_b64u = base64.urlsafe_b64encode(uncompressed).rstrip(b"=").decode("ascii")
+
+        subject = os.environ.get("VAPID_SUBJECT", "mailto:admin@example.com")
+        with CONN:
+            CONN.execute(
+                "INSERT INTO vapid_keys(id, public_key_b64u, private_key_pem, subject, created_at) VALUES (1, ?, ?, ?, ?)",
+                (pub_b64u, priv_pem, subject, now_ms())
+            )
+        VAPID_PUBLIC_KEY_B64U = pub_b64u
+        VAPID_PRIVATE_KEY_PEM = priv_pem
+        VAPID_SUBJECT = subject
+    else:
+        VAPID_PUBLIC_KEY_B64U = row["public_key_b64u"]
+        VAPID_PRIVATE_KEY_PEM = row["private_key_pem"]
+        VAPID_SUBJECT = row["subject"]
 
 @app.after_request
 def _sec_headers(resp):
@@ -163,6 +261,45 @@ def rooms_post():
         return jsonify({"ok": False, "error": "room_id required"}), 400
     # no-op: we trust room_id to be an Ed25519 pk b64url
     return jsonify({"ok": True})
+
+@app.get('/vapid-public-key')
+def vapid_pk():
+    if not (VAPID_PUBLIC_KEY_B64U and VAPID_PRIVATE_KEY_PEM):
+        return ("", 503)
+    return VAPID_PUBLIC_KEY_B64U
+
+@app.post('/subscribe')
+def push_subscribe():
+    if not (VAPID_PUBLIC_KEY_B64U and VAPID_PRIVATE_KEY_PEM):
+        return jsonify({"error": "push not configured"}), 503
+    data = request.get_json(force=True)
+    room_id = data.get('room_id')
+    subscription = data.get('subscription')
+    if not room_id or not subscription or not subscription.get('endpoint'):
+        return jsonify({"error": "room_id and valid subscription required"}), 400
+    with CONN:
+        CONN.execute("INSERT OR REPLACE INTO push_subscriptions(room_id, endpoint, subscription_json, created_at) VALUES (?, ?, ?, ?)",
+                     (room_id, subscription['endpoint'], json.dumps(subscription), now_ms()))
+    return jsonify({"ok": True})
+
+@app.post('/unsubscribe')
+def push_unsubscribe():
+    """Remove a stored push subscription by endpoint.
+    Accepts either {"endpoint": "..."} or {"subscription": {"endpoint": "..."}}. Idempotent."""
+    try:
+        data = request.get_json(force=True)
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    endpoint = data.get('endpoint')
+    if not endpoint and isinstance(data.get('subscription'), dict):
+        endpoint = data['subscription'].get('endpoint')
+    if not endpoint:
+        return jsonify({"error": "endpoint required"}), 400
+
+    with CONN:
+        cur = CONN.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (endpoint,))
+    return jsonify({"ok": True, "deleted": cur.rowcount})
 
 # ---------- In-memory WS state (multi-room per socket) ----------
 # For each socket -> set of subscribed room_ids
@@ -581,6 +718,13 @@ def ws_handler(ws):
                 }
                 fanout = broadcast(room_id, payload)
                 LOG("send", "room=", room_id, "bytes=", len(ciphertext_b64u), "fanout=", fanout)
+
+                # Trigger web-push (no plaintext)
+                try:
+                    trigger_push(room_id, ts, nickname)
+                except Exception:
+                    pass
+
                 continue
 
             elif t == 'delete':
@@ -811,6 +955,9 @@ def _as_b64u_or_str(v):
         return _b64u(bytes(v))
     # SQLite can sometimes hand back ints for empty blobs; just stringify
     return str(v)
+
+init_db()
+_ensure_vapid_keys()
 
 if __name__ == "__main__":
     # For local testing; on PythonAnywhere you’ll use WSGI

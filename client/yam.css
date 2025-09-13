@@ -457,3 +457,7 @@ dialog::backdrop{ background:rgba(0,0,0,.6); }
 }
 .bubble .action-btn:active,
 .bubble .reaction-btn:active { transform: scale(0.96); }
+
+#btnNotify {
+    grid-column: 1 / span 2;
+}
