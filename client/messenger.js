@@ -2901,7 +2901,7 @@ async function disableNotificationsForCurrentRoom() {
   try {
     if (sub && sub.endpoint) {
       // Remove server mapping for this endpoint (idempotent; current server deletes by endpoint)
-      await fetch(`${RELAY_HTTP_BASE}/push/unsubscribe`, {
+      await fetch(`${normServer(VL.serverUrl)}/push/unsubscribe`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ endpoint: sub.endpoint })
       });
