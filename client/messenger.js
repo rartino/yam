@@ -2878,7 +2878,9 @@ async function subscribeToPushForCurrentRoom() {
   if (!sub) {
     // Ask server for its VAPID public key
     const res = await fetch(`${normServer(VL.serverUrl)}/vapid-public-key`);
-    if (!res.ok) { console.warn('Push server not configured (no VAPID keys)'); return; }
+    if (!res.ok) {
+      console.warn(`Push server not configured (no VAPID keys) at ${normServer(VL.serverUrl)}/vapid-public-key`); return;
+    }
     const vapidKey = await res.text();
     sub = await reg.pushManager.subscribe({
       userVisibleOnly: true,

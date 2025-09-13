@@ -154,15 +154,15 @@ self.addEventListener('push', event => {
 
   event.waitUntil((async () => {
     // If any client is visible, avoid a disruptive notification (app will render it itself).
-    const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    const hasVisible = clientList.some(c => 'visibilityState' in c && c.visibilityState === 'visible');
-    if (hasVisible) {
-      clientList.forEach(c => c.postMessage({ type: 'push-message', room_id: room, ts }));
-      return;
-    }
-    return self.registration.showNotification('Secure Messenger', {
+    //const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    //const hasVisible = clientList.some(c => 'visibilityState' in c && c.visibilityState === 'visible');
+    //if (hasVisible) {
+    //  clientList.forEach(c => c.postMessage({ type: 'push-message', room_id: room, ts }));
+    //  return;
+    //}
+    return self.registration.showNotification('Yam', {
       body,
-      tag: room || 'secmsg',
+      tag: room || 'Yam',
       data: { url: `/?room=${encodeURIComponent(room||'')}`, room_id: room, ts },
       icon: './android-chrome-192x192.png',
       badge: './android-chrome-192x192.png',
