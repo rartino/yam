@@ -159,22 +159,22 @@ self.addEventListener('push', event => {
   const data = (() => { try { return event.data ? event.data.json() : {}; } catch { return {}; } })();
   const room = data.room_id;
   const ts = data.ts || Date.now();
-  const body = data.body || (data.nickname ? `${data.nickname} sent a message` : 'You have a new message');
+  const body = 'New messages in Yam';
 
   event.waitUntil((async () => {
     // If any client is visible, avoid a disruptive notification (app will render it itself).
-    //const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
-    //const hasVisible = clientList.some(c => 'visibilityState' in c && c.visibilityState === 'visible');
-    //if (hasVisible) {
-    //  clientList.forEach(c => c.postMessage({ type: 'push-message', room_id: room, ts }));
-    //  return;
-    //}
+    const clientList = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    const hasVisible = clientList.some(c => 'visibilityState' in c && c.visibilityState === 'visible');
+    if (hasVisible) {
+      clientList.forEach(c => c.postMessage({ type: 'push-message', room_id: room, ts }));
+      return;
+    }
     return self.registration.showNotification('Yam', {
       body,
       tag: room || 'Yam',
-      data: { url: `?room=${encodeURIComponent(room||'')}`, room_id: room, ts },
-      icon: './android-chrome-192x192.png',
-      badge: './android-chrome-192x192.png',
+      data: { url: `/yam/?room=${encodeURIComponent(room||'')}`, room_id: room, ts },
+      icon: '/yam/android-chrome-192x192.png',
+      badge: '/yam/android-chrome-192x192.png',
       timestamp: ts
     });
   })());

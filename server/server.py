@@ -178,14 +178,32 @@ def trigger_push(room_id: str, ts: int, nickname: str | None):
                 subscription_info=subscription_info,
                 data=payload,
                 vapid_private_key=r['vapid_private_key'],
-                vapid_claims={"sub": "https://github.com/rartino/yam"},
+                vapid_claims={"sub": "mailto:yam-vapid@armiento.net"},
                 ttl=60
             )
         except WebPushException as ex:
+            delete = False
+            resp = getattr(e, "response", None)
+            code = getattr(resp, "status_code", None)
             # Clean up expired/invalid subscriptions
-            if ex.response and ex.response.status_code in (404, 410):
+            LOG("WebPushException on",subscription_info,"::",resp,code,"::",ex)
+            if code in (401, 403, 404, 410): # 410/404: unsubscribed; 401/403 auth issue
+                delete = True
+            elif code == 400: # 400: inspect body
+                body = getattr(resp, "text", "")
+                if any(s in body.lower() for s in ["invalid", "expired", "unregistered"]):
+                    delete = True
+            if delete:
+                LOG("Removing endpoint")
                 with CONN:
                     CONN.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (subscription_info.get('endpoint'),))
+
+        except requests.RequestException as ex:
+            LOG("requests.RequestException on webpush",subscription_info,"::",ex)
+
+        except Exception as ex:
+            LOG("Exception on webpush",subscription_info,"::",ex)
+
 
 @app.after_request
 def _sec_headers(resp):
@@ -625,7 +643,7 @@ def ws_handler(ws):
                 try:
                     trigger_push(room_id, ts, nickname)
                 except Exception as e:
-                    LOG("trigger push exception",e)
+                    LOG("Exception on trigger_push:",type(e),e)
                     pass
 
                 continue
