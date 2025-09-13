@@ -2720,12 +2720,6 @@ function connect(sc) {
 
       sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since }));
       refreshNotifySwitch(); // update toggle state on connect
-      // Register push for this room if permission is granted
-      try {
-        if (isPushSupported() && Notification.permission === 'granted') {
-          await subscribeToPushForCurrentRoom();
-        }
-      } catch(_) {}
 
       if (room.id === currentRoomId) {
         await ensureSodium();
@@ -2733,6 +2727,13 @@ function connect(sc) {
         await initVirtualRoomView(sc.url, room.id);
         setStatus(statuses.connected);
       }
+
+      // Register push for this room if permission is granted
+      try {
+        if (isPushSupported(room.id) && Notification.permission === 'granted') {
+          await subscribeToPush(room.server, room.id);
+        }
+      } catch(_) {}
 
     } else if (m.type === 'profile-notify') {
       await applyProfileCipher(sc.url, m.room_id, m.sender_id, m.ciphertext);
@@ -2856,7 +2857,8 @@ async function refreshNotifySwitch() {
 }
 
 async function toggleNotifications(ev) {
-  if (!currentRoomId) { alert('Join a room first'); await refreshNotifySwitch(); return; }
+  const room = getCurrentRoom();
+  if (!room || !currentRoomId) { alert('Join a room first'); await refreshNotifySwitch(); return; }
   if (!isPushSupported()) { alert('Push not supported in this browser'); await refreshNotifySwitch(); return; }
   // User toggled ON
   if (cfg.notifToggle.checked) {
@@ -2865,19 +2867,19 @@ async function toggleNotifications(ev) {
       cfg.notifToggle.checked = false;
       return;
     }
-    await subscribeToPushForCurrentRoom();
+    await subscribeToPush(room.server, room.id);
   } else {
-    await disableNotificationsForCurrentRoom();
+    await disableNotifications(room.server, room.id);
   }
   await refreshNotifySwitch();
 }
 
-async function subscribeToPushForCurrentRoom() {
+async function subscribeToPush(serverUrl, roomid) {
   const reg = await navigator.serviceWorker.ready;
   let sub = await reg.pushManager.getSubscription();
   if (!sub) {
     // Ask server for its VAPID public key
-    const res = await fetch(`${normServer(VL.serverUrl)}/vapid-public-key`);
+    const res = await fetch(`${serverUrl}/vapid-public-key`);
     if (!res.ok) {
       console.warn(`Push server not configured (no VAPID keys) at ${normServer(VL.serverUrl)}/vapid-public-key`); return;
     }
@@ -2888,31 +2890,31 @@ async function subscribeToPushForCurrentRoom() {
     });
   }
   // Associate this subscription with the current room
-  dbg(`FETCH: ${normServer(VL.serverUrl)}/subscribe`)
-  await fetch(`${normServer(VL.serverUrl)}/subscribe`, {
+  dbg(`FETCH: ${serverUrl}/subscribe`)
+  await fetch(`${serverUrl}/subscribe`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ room_id: currentRoomId, subscription: sub })
+    body: JSON.stringify({ room_id: roomid, subscription: sub })
   });
-  setPushRoom(currentRoomId, true);
+  setPushRoom(roomid, true);
 }
 
-async function disableNotificationsForCurrentRoom() {
+async function disableNotifications(serverUrl, roomid) {
   const reg = await navigator.serviceWorker.ready;
-  const sub = await reg.pushManager.getSubscription();
+  //const sub = await reg.pushManager.getSubscription();
   try {
-    if (sub && sub.endpoint) {
+//    if (sub && sub.endpoint) {
       // Remove server mapping for this endpoint (idempotent; current server deletes by endpoint)
-      await fetch(`${normServer(VL.serverUrl)}/unsubscribe`, {
+      await fetch(`${serverUrl}/unsubscribe`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ endpoint: sub.endpoint })
+        body: JSON.stringify({ room_id: roomid })
       });
-    }
+//    }
   } catch (_) {}
   try {
     // Also unsubscribe the UA push subscription (affects all rooms for this origin)
     if (sub) await sub.unsubscribe();
   } catch (_) {}
-  setPushRoom(currentRoomId, false);
+  setPushRoom(roomid, false);
 }
 
 // Receive messages from SW (e.g., to navigate after clicking a notification)
