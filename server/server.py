@@ -89,7 +89,6 @@ def init_db():
           room_id TEXT NOT NULL,
           endpoint TEXT NOT NULL,
           subscription_json TEXT NOT NULL,
-          vapid_public_key TEXT NOT NULL,
           vapid_private_key TEXT NOT NULL,
           created_at INTEGER NOT NULL,
           UNIQUE(room_id, endpoint)
@@ -162,10 +161,8 @@ def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, cip
 
 def trigger_push(room_id: str, ts: int, nickname: str | None):
     """Send a lightweight push to all subscribers of room_id."""
-    if not (VAPID_PUBLIC_KEY_B64U and VAPID_PRIVATE_KEY_PEM):
-        return
     rows = CONN.execute(
-        "SELECT endpoint, subscription_json, vapid_public_key, vapid_private_key FROM push_subscriptions WHERE room_id=?",
+        "SELECT endpoint, subscription_json, vapid_private_key FROM push_subscriptions WHERE room_id=?",
         (room_id,)
     ).fetchall()
     payload = json.dumps({
@@ -181,8 +178,7 @@ def trigger_push(room_id: str, ts: int, nickname: str | None):
                 subscription_info=subscription_info,
                 data=payload,
                 vapid_private_key=r['vapid_private_key'],
-                vapid_public_key=r['vapid_public_key'],
-                vapid_claims={"sub": VAPID_SUBJECT},
+                vapid_claims={"sub": "https://github.com/rartino/yam"},
                 ttl=60
             )
         except WebPushException as ex:
@@ -628,7 +624,8 @@ def ws_handler(ws):
                 # Trigger web-push (no plaintext)
                 try:
                     trigger_push(room_id, ts, nickname)
-                except Exception:
+                except Exception as e:
+                    LOG("trigger push exception",e)
                     pass
 
                 continue
@@ -754,15 +751,14 @@ def ws_handler(ws):
                 # Client provides its VAPID keys (pub/priv) + PushSubscription JSON
                 sub = m.get('subscription') or {}
                 endpoint = sub.get('endpoint')
-                vapid_pub = m.get('vapid_public_key_b64u')
                 vapid_prv = m.get('vapid_private_key_b64u')
-                if not endpoint or 'keys' not in sub or not vapid_pub or not vapid_prv:
+                if not endpoint or 'keys' not in sub or not vapid_prv:
                     ws.send(json.dumps({"type": "error", "error": "bad subscription payload"}))
                     continue
                 with CONN:
                     CONN.execute(
-                        "INSERT OR REPLACE INTO push_subscriptions(room_id, endpoint, subscription_json, vapid_public_key, vapid_private_key, created_at) VALUES(?, ?, ?, ?, ?, ?)",
-                        (room_id, endpoint, json.dumps(sub), vapid_pub, vapid_prv, now_ms())
+                        "INSERT OR REPLACE INTO push_subscriptions(room_id, endpoint, subscription_json, vapid_private_key, created_at) VALUES(?, ?, ?, ?, ?)",
+                        (room_id, endpoint, json.dumps(sub), vapid_prv, now_ms())
                     )
                 ws.send(json.dumps({"type": "push_subscribed", "endpoint": endpoint}))
 

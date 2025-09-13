@@ -172,7 +172,7 @@ self.addEventListener('push', event => {
     return self.registration.showNotification('Yam', {
       body,
       tag: room || 'Yam',
-      data: { url: `/?room=${encodeURIComponent(room||'')}`, room_id: room, ts },
+      data: { url: `?room=${encodeURIComponent(room||'')}`, room_id: room, ts },
       icon: './android-chrome-192x192.png',
       badge: './android-chrome-192x192.png',
       timestamp: ts
