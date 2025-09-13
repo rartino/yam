@@ -1,4 +1,4 @@
-import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId, sanitizeColorHex, pickTextColorOn,urlBase64ToUint8Array} from './utils.js';
+import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId, sanitizeColorHex, pickTextColorOn,urlBase64ToUint8Array, b64uToBytes, bytesToB64u} from './utils.js';
 import {loadSettings, saveSettings} from './settings.js';
 
 async function ensureSodium() { await sodium.ready; }
@@ -2055,6 +2055,36 @@ let myIdPk = null; // device identity public key (Uint8Array)
 let myIdSk = null; // device identity private key (Uint8Array)
 let myPeerId = null; // base64url of myIdPk
 
+// ---- VAPID (client-generated, single pair per origin) ----
+const VAPID_STORE_KEY = 'secmsg_vapid_jwk'; // stores JWK with x,y,d
+async function ensureVapidKeys() {
+  const existing = localStorage.getItem(VAPID_STORE_KEY);
+  if (existing) return JSON.parse(existing);
+  // Generate ECDSA P-256 keypair and store as JWK
+  const keyPair = await crypto.subtle.generateKey(
+    { name: 'ECDSA', namedCurve: 'P-256' },
+    true,
+    ['sign', 'verify']
+  );
+  const jwkPub = await crypto.subtle.exportKey('jwk', keyPair.publicKey);
+  const jwkPrv = await crypto.subtle.exportKey('jwk', keyPair.privateKey);
+  // Keep minimal JWK (kty, crv, x, y, d)
+  const jwk = { kty: 'EC', crv: 'P-256', x: jwkPub.x, y: jwkPub.y, d: jwkPrv.d };
+  localStorage.setItem(VAPID_STORE_KEY, JSON.stringify(jwk));
+  return jwk;
+}
+
+function vapidPublicKeyRawFromJwk(jwk) {
+  // Compose uncompressed point: 0x04 || X(32) || Y(32)
+  const x = b64uToBytes(jwk.x);
+  const y = b64uToBytes(jwk.y);
+  const raw = new Uint8Array(65);
+  raw[0] = 0x04;
+  raw.set(x, 1);
+  raw.set(y, 33);
+  return raw;
+}
+
 // Local tracking for room-level push enablement (UI toggle)
 const LS_PUSH_ROOMS_KEY = 'secmsg_push_rooms';
 function getPushRooms(){ try { return JSON.parse(localStorage.getItem(LS_PUSH_ROOMS_KEY)) || {}; } catch { return {}; } }
@@ -2731,7 +2761,7 @@ function connect(sc) {
       // Register push for this room if permission is granted
       try {
         if (isPushSupported(room.id) && Notification.permission === 'granted') {
-          await subscribeToPush(room.server, room.id);
+          await subscribeToPush(room);
         }
       } catch(_) {}
 
@@ -2836,11 +2866,20 @@ async function registerRoomIfNeeded(room) {
 
 function isPushSupported() { return 'serviceWorker' in navigator && 'PushManager' in window; }
 
-async function isSubscribedForCurrentRoom() {
-  if (!currentRoomId || !isPushSupported()) return false;
+// Local index: maps subscription endpoint -> [roomIds] (for toggle state)
+const PUSH_INDEX_KEY = 'secmsg_push_index';
+function loadPushIndex() { try { return JSON.parse(localStorage.getItem(PUSH_INDEX_KEY) || '{}'); } catch { return {}; } }
+function savePushIndex(idx) { localStorage.setItem(PUSH_INDEX_KEY, JSON.stringify(idx)); }
+function idxAdd(idx, endpoint, roomId) { const s = new Set(idx[endpoint] || []); s.add(roomId); idx[endpoint] = [...s]; return idx; }
+function idxRemove(idx, endpoint, roomId) { const s = new Set(idx[endpoint] || []); s.delete(roomId); if (s.size) idx[endpoint]=[...s]; else delete idx[endpoint]; return idx; }
+
+export async function isSubscribedForCurrentRoom() {
+  if (!currentRoomId || !isPushSupported() || Notification.permission !== 'granted') return false;
   const reg = await navigator.serviceWorker.ready;
   const sub = await reg.pushManager.getSubscription();
-  return !!sub && !!getPushRooms()[currentRoomId];
+  if (!sub) return false;
+  const idx = loadPushIndex();
+  return new Set(idx[sub.endpoint] || []).has(currentRoomId);
 }
 
 async function refreshNotifySwitch() {
@@ -2867,54 +2906,57 @@ async function toggleNotifications(ev) {
       cfg.notifToggle.checked = false;
       return;
     }
-    await subscribeToPush(room.server, room.id);
+    await subscribeToPush(room);
   } else {
-    await disableNotifications(room.server, room.id);
+    await disableNotifications(room);
   }
   await refreshNotifySwitch();
 }
 
-async function subscribeToPush(serverUrl, roomid) {
+export async function subscribeToPush(room) {
+  const sc = servers.get(normServer(room.server));
   const reg = await navigator.serviceWorker.ready;
+  const jwk = await ensureVapidKeys();
+  const appServerKeyRaw = vapidPublicKeyRawFromJwk(jwk);
   let sub = await reg.pushManager.getSubscription();
   if (!sub) {
-    // Ask server for its VAPID public key
-    const res = await fetch(`${serverUrl}/vapid-public-key`);
-    if (!res.ok) {
-      console.warn(`Push server not configured (no VAPID keys) at ${normServer(VL.serverUrl)}/vapid-public-key`); return;
-    }
-    const vapidKey = await res.text();
     sub = await reg.pushManager.subscribe({
       userVisibleOnly: true,
-      applicationServerKey: urlBase64ToUint8Array(vapidKey)
+      applicationServerKey: appServerKeyRaw
     });
   }
-  // Associate this subscription with the current room
-  dbg(`FETCH: ${serverUrl}/subscribe`)
-  await fetch(`${serverUrl}/subscribe`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ room_id: roomid, subscription: sub })
-  });
-  setPushRoom(roomid, true);
+  // Tell the relay for this room to use *our* VAPID keys for this endpoint
+  if (sc.ws && sc.ws.readyState === WebSocket.OPEN) {
+    sc.ws.send(JSON.stringify({
+      type: 'subscribe_push',
+      room_id: room.id,
+      device_id_b64u: b64u(myIdPk),
+      subscription: sub,
+      vapid_public_key_b64u: bytesToB64u(appServerKeyRaw),
+      // Private key is JWK.d (base64url of 32-byte scalar)
+      vapid_private_key_b64u: jwk.d
+    }));
+  }
+  // Update local index for toggle
+  const idx = loadPushIndex();
+  savePushIndex(idxAdd(idx, sub.endpoint, room.id));
 }
 
-async function disableNotifications(serverUrl, roomid) {
+export async function disableNotifications(room) {
+  const sc = servers.get(normServer(room.server));
   const reg = await navigator.serviceWorker.ready;
-  //const sub = await reg.pushManager.getSubscription();
-  try {
-//    if (sub && sub.endpoint) {
-      // Remove server mapping for this endpoint (idempotent; current server deletes by endpoint)
-      await fetch(`${serverUrl}/unsubscribe`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ room_id: roomid })
-      });
-//    }
-  } catch (_) {}
-  try {
-    // Also unsubscribe the UA push subscription (affects all rooms for this origin)
-    if (sub) await sub.unsubscribe();
-  } catch (_) {}
-  setPushRoom(roomid, false);
+  const sub = await reg.pushManager.getSubscription();
+  if (!sub) return;
+  if (sc.ws && sc.ws.readyState === WebSocket.OPEN) {
+    sc.ws.send(JSON.stringify({ type: 'unsubscribe_push', room_id: room.id, endpoint: sub.endpoint }));
+  }
+  const idx = loadPushIndex();
+  const updated = idxRemove(idx, sub.endpoint, room.id);
+  savePushIndex(updated);
+  // If endpoint no longer used by any room, you *may* unsubscribe fully:
+  if (!updated[sub.endpoint]) {
+    try { await sub.unsubscribe(); } catch {}
+  }
 }
 
 // Receive messages from SW (e.g., to navigate after clicking a notification)
