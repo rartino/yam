@@ -2888,6 +2888,7 @@ async function subscribeToPushForCurrentRoom() {
     });
   }
   // Associate this subscription with the current room
+  LOG(`FETCH: ${normServer(VL.serverUrl)}/subscribe`)
   await fetch(`${normServer(VL.serverUrl)}/subscribe`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ room_id: currentRoomId, subscription: sub })
