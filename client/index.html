@@ -39,7 +39,13 @@
 	  <input id="cfgRoomName" placeholder="Room name" />
 	</div>
       </div>
-      <button id="btnNotify">Notifications: Off</button>
+      <label class="ytog ytog--compact field--switch" for="notifToggle">
+        <span class="ytog__label">Notifications</span>
+        <input id="notifToggle" type="checkbox" class="ytog__input" />
+        <span class="ytog__track" aria-hidden="true">
+          <span class="ytog__thumb"></span>
+        </span>
+      </label>
       <div class="settings-actions settings-actions--split">
 	<button type="button" id="btnRemoveRoom" class="dangerbutton">Remove room</button>
 	<div>

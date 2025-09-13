@@ -49,7 +49,7 @@ const cfg = {
   btnSave: document.getElementById('btnSaveRoomCfg'),
   btnRemove: document.getElementById('btnRemoveRoom'),
   btnClose: document.getElementById('btnCloseSettings'),
-  btnNotify: document.getElementById('btnNotify'),
+  notifToggle: document.getElementById('notifToggle'),
 };
 
 const prof = {
@@ -123,7 +123,7 @@ cr.btnCreate.addEventListener('click', async () => {
 
   await openRoom(room.id);
 });
-cfg.btnNotify.addEventListener('click', toggleNotifications);
+cfg.notifToggle.addEventListener('change', toggleNotifications);
 
 cfg.btnClose.addEventListener('click', () => cfg.dlg.close());
 cfg.btnSave.addEventListener('click', () => {
@@ -618,7 +618,7 @@ function loadRooms(){
   try { rooms = JSON.parse(localStorage.getItem(ROOMS_KEY) || '[]'); } catch { rooms = []; }
   currentRoomId = localStorage.getItem(CURRENT_ROOM_KEY) || null;
   if (!currentRoomId && rooms.length) currentRoomId = rooms[0].id;
-  refreshNotifyButton();
+  refreshNotifySwitch();
 }
 function saveRooms(){
   localStorage.setItem(ROOMS_KEY, JSON.stringify(rooms));
@@ -2685,7 +2685,7 @@ function connect(sc) {
       const since = lastTs > 0 ? (lastTs + 1) : sevenDaysAgoMs();
 
       sc.ws.send(JSON.stringify({ type: 'history', room_id: room.id, since }));
-      refreshNotifyButton(); // update toggle state on connect
+      refreshNotifySwitch(); // update toggle state on connect
       // Register push for this room if permission is granted
       try {
         if (isPushSupported() && Notification.permission === 'granted') {
@@ -2805,29 +2805,37 @@ async function isSubscribedForCurrentRoom() {
   if (!currentRoomId || !isPushSupported()) return false;
   const reg = await navigator.serviceWorker.ready;
   const sub = await reg.pushManager.getSubscription();
-  // Consider both UA subscription and our local mapping
   return !!sub && !!getPushRooms()[currentRoomId];
 }
 
-function refreshNotifyButton() {
-  if (!cfg.btnNotify) return;
-  isSubscribedForCurrentRoom()
-    .then(on => { cfg.btnNotify.textContent = on ? 'Notifications: On (tap to disable)' : 'Notifications: Off'; })
-    .catch(() => { cfg.btnNotify.textContent = 'Notifications'; });
+async function refreshNotifySwitch() {
+  if (!cfg.notifToggle) return;
+  // Disable until state computed
+  cfg.notifToggle.disabled = true;
+  // If no room, keep off/disabled
+  if (!currentRoomId) { cfg.notifToggle.checked = false; cfg.notifToggle.disabled = true; return; }
+  if (!isPushSupported()) { cfg.notifToggle.checked = false; cfg.notifToggle.disabled = true; return; }
+  // If permission denied, reflect off but enable to let user re-request (browser will block though)
+  const on = await isSubscribedForCurrentRoom();
+  cfg.notifToggle.checked = on;
+  cfg.notifToggle.disabled = false;
 }
 
-async function toggleNotifications() {
-  if (!currentRoomId) { alert('Join a room first'); return; }
-  if (!isPushSupported()) { alert('Push not supported in this browser'); return; }
-  const on = await isSubscribedForCurrentRoom();
-  if (on) {
-    await disableNotificationsForCurrentRoom();
-  } else {
+async function toggleNotifications(ev) {
+  if (!currentRoomId) { alert('Join a room first'); await refreshNotifySwitch(); return; }
+  if (!isPushSupported()) { alert('Push not supported in this browser'); await refreshNotifySwitch(); return; }
+  // User toggled ON
+  if (cfg.notifToggle.checked) {
     const perm = await Notification.requestPermission();
-    if (perm !== 'granted') { alert('Notifications not enabled'); return; }
+    if (perm !== 'granted') {
+      cfg.notifToggle.checked = false;
+      return;
+    }
     await subscribeToPushForCurrentRoom();
+  } else {
+    await disableNotificationsForCurrentRoom();
   }
-  refreshNotifyButton();
+  await refreshNotifySwitch();
 }
 
 async function subscribeToPushForCurrentRoom() {
@@ -2855,16 +2863,16 @@ async function disableNotificationsForCurrentRoom() {
   const reg = await navigator.serviceWorker.ready;
   const sub = await reg.pushManager.getSubscription();
   try {
-    // Remove server-side mapping (and subscription if server treats endpoint unique)
     if (sub && sub.endpoint) {
-      await fetch(`${normServer(VL.serverUrl)}/unsubscribe`, {
+      // Remove server mapping for this endpoint (idempotent; current server deletes by endpoint)
+      await fetch(`${RELAY_HTTP_BASE}/push/unsubscribe`, {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ endpoint: sub.endpoint })
       });
     }
   } catch (_) {}
   try {
-    // Also unsubscribe from the browser's push service (global to scope)
+    // Also unsubscribe the UA push subscription (affects all rooms for this origin)
     if (sub) await sub.unsubscribe();
   } catch (_) {}
   setPushRoom(currentRoomId, false);
