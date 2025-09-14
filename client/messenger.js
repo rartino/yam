@@ -1726,7 +1726,7 @@ function renderSegment(records, { placement = 'append', computeGaps = true, pers
         };
         const gapNode = renderBubble(gapRec);
         if (gapNode) frag.appendChild(gapNode);
-        if (persistGaps) { try { putGapRecord({ serverUrl, roomId, ts: rec.ts, fromSeq: prevSeq, toSeq: s }); } catch {} }
+        //if (persistGaps) { try { putGapRecord({ serverUrl, roomId, ts: rec.ts, fromSeq: prevSeq, toSeq: s }); } catch {} }
       }
 
       // gap vs *global last seen* (live)
@@ -1739,7 +1739,7 @@ function renderSegment(records, { placement = 'append', computeGaps = true, pers
         };
         const gapNode = renderBubble(gapRec);
         if (gapNode) frag.appendChild(gapNode);
-        if (persistGaps) { try { putGapRecord({ serverUrl, roomId, ts: rec.ts, fromSeq: prevSeenSeq, toSeq: s }); } catch {} }
+        //if (persistGaps) { try { putGapRecord({ serverUrl, roomId, ts: rec.ts, fromSeq: prevSeenSeq, toSeq: s }); } catch {} }
       }
 
       if (s !== null) {
@@ -1842,6 +1842,7 @@ async function msgListByRoom(serverUrl, roomId){
   });
 }
 
+/*
 async function putGapRecord({ serverUrl, roomId, ts, fromSeq, toSeq }) {
   const rKey = roomKey(serverUrl, roomId);
   const id = `${rKey}|gap|${fromSeq + 1}-${toSeq}`; // stable id
@@ -1856,7 +1857,8 @@ async function putGapRecord({ serverUrl, roomId, ts, fromSeq, toSeq }) {
   };
   try { await msgPut(rec); } catch {}
   return rec;
-}
+  }
+  */
 
 function scrollToEnd() {
   const el = ui.messages; if (!el) return;
@@ -2280,18 +2282,14 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
   }
 
   const tsVal  = m.ts ?? nowMs();
-  const seqVal = (typeof m.seq === 'number') ? m.seq : null;
 
-  // ---- Gap detection centralized here ----
-  if (seqVal !== null) {
-    const prev = await getPrevSeq(serverUrl, roomId);
-    if (prev >= -1 && seqVal > prev + 1) {
-      await putGapRecord({ serverUrl, roomId, ts: tsVal, fromSeq: prev, toSeq: seqVal });
-      const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
-      if (isActive) renderGapBubble(seqVal - prev - 1);
-    }
-    lastSeqSeen.set(rKey, seqVal);
+  const prev = await getPrevSeq(serverUrl, roomId);
+  if (prev >= -1 && m.seq > prev + 1) {
+    //await putGapRecord({ serverUrl, roomId, ts: tsVal, fromSeq: prev, toSeq: seqVal });
+    const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
+    if (isActive) renderGapBubble(seqVal - prev - 1);
   }
+  lastSeqSeen.set(rKey, seqVal);
 
   // Try to parse control/file messages
   try {
