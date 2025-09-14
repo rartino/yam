@@ -1,4 +1,7 @@
 *~
+server/messages.db
+server/messages.db-*
+.venvs
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

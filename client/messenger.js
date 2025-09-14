@@ -1,6 +1,15 @@
 import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId, sanitizeColorHex, pickTextColorOn,urlBase64ToUint8Array, b64uToBytes, bytesToB64u} from './utils.js';
 import {loadSettings, saveSettings} from './settings.js';
 
+const PROD_SERVER =  'https://rartino.pythonanywhere.com'
+const DEV_SERVER =  'http://localhost:5000'
+
+///////////////////////////////////////
+
+const isLocalHost = typeof window !== 'undefined' && /^(localhost|127(?:\.\d{1,3}){3}|\[?::1\]?)$/.test(window.location.hostname);
+
+export const home_server_url = isLocalHost ? DEV_SERVER : PROD_SERVER;
+
 async function ensureSodium() { await sodium.ready; }
 
 //////////////////////////////
@@ -716,7 +725,7 @@ function renderRoomMenu(){
 
 function openCreateRoomDialog(){
   cr.name.value = '';
-  cr.server.value = rooms[0]?.server || 'https://rartino.pythonanywhere.com';
+  cr.server.value = rooms[0]?.server || home_server_url;
   cr.dlg.showModal();
 }
 
@@ -2996,7 +3005,7 @@ async function openJoinDialog(){
   await ensureSodium();
 
   // Prefill server
-  join.server.value = rooms[0]?.server || 'https://rartino.pythonanywhere.com';
+  join.server.value = rooms[0]?.server || home_server_url;
 
   // Generate fresh Curve25519 pair and code
   const kp = sodium.crypto_box_keypair();

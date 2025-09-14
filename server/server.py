@@ -2,6 +2,7 @@ import os
 import json
 import time
 import sqlite3
+import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from flask_sock import Sock
@@ -107,7 +108,7 @@ def _sqlite_supports_returning() -> bool:
 
 SQLITE_HAS_RETURNING = _sqlite_supports_returning()
 
-def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, ciphertext: bytes, ref_seq=None):
+def insert_message_with_seq(conn, room_id: str, ts: int, nickname, sender_id, sig, ciphertext: bytes, ref_seq=None):
     """
     Atomically bump per-room counter and insert a message.
     Returns (seq) on success; returns None if ciphertext replay (unique violation).
@@ -128,28 +129,28 @@ def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, cip
         RETURNING seq
         """
         try:
-            cur = CONN.execute(sql, (room_id, ref_seq, ts, nickname, sender_id, sig, ciphertext))
+            cur = conn.execute(sql, (room_id, ref_seq, ts, nickname, sender_id, sig, ciphertext))
             row = cur.fetchone()
             return int(row["seq"])
         except sqlite3.IntegrityError as e:
             # UNIQUE(room_id, ciphertext) hit → replay: ignore
-            CONN.rollback()
+            conn.rollback()
             return None
     else:
         # Fallback for older SQLite (no RETURNING). Keep it strictly transactional.
         try:
-            with CONN:  # starts a transaction
+            with conn:  # starts a transaction
                 # Seed or bump next
-                CONN.execute("""
+                conn.execute("""
                     INSERT INTO room_counters(room_id, next) VALUES(?, 1)
                     ON CONFLICT(room_id) DO UPDATE SET next = next + 1
                 """, (room_id,))
                 # Read just-assigned seq = next - 1
-                row = CONN.execute("SELECT next - 1 AS seq FROM room_counters WHERE room_id=?",
+                row = conn.execute("SELECT next - 1 AS seq FROM room_counters WHERE room_id=?",
                                    (room_id,)).fetchone()
                 seq = int(row["seq"])
                 # Insert message at that seq
-                CONN.execute("""
+                conn.execute("""
                     INSERT INTO messages(room_id, seq, ref_seq, ts, nickname, sender_id, sig, ciphertext)
                     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                 """, (room_id, seq, ref_seq, ts, nickname, sender_id, sig, ciphertext))
@@ -159,9 +160,9 @@ def insert_message_with_seq(room_id: str, ts: int, nickname, sender_id, sig, cip
             # Either ciphertext replay or (rare) PK collision; treat as replay/ignore.
             return None
 
-def trigger_push(room_id: str, ts: int, nickname: str | None):
+def trigger_push(conn, room_id: str, ts: int, nickname: str | None):
     """Send a lightweight push to all subscribers of room_id."""
-    rows = CONN.execute(
+    rows = conn.execute(
         "SELECT endpoint, subscription_json, vapid_private_key FROM push_subscriptions WHERE room_id=?",
         (room_id,)
     ).fetchall()
@@ -195,8 +196,8 @@ def trigger_push(room_id: str, ts: int, nickname: str | None):
                     delete = True
             if delete:
                 LOG("Removing endpoint")
-                with CONN:
-                    CONN.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (subscription_info.get('endpoint'),))
+                with conn:
+                    conn.execute("DELETE FROM push_subscriptions WHERE endpoint=?", (subscription_info.get('endpoint'),))
 
         except requests.RequestException as ex:
             LOG("requests.RequestException on webpush",subscription_info,"::",ex)
@@ -328,7 +329,7 @@ def _invite_gc(now_ms):
 # ---------- WebSocket (no room in URL; subscribe per room) ----------
 @sock.route('/ws')
 def ws_handler(ws):
-    # Origin gate (defense-in-depth; keep your proxy checking too)
+    conn = get_db()
     origin = _ws_origin(ws)
     if ALLOWED_ORIGINS and origin not in ALLOWED_ORIGINS:
         LOG("WS reject origin", origin)
@@ -502,8 +503,8 @@ def ws_handler(ws):
                     continue
 
                 now = now_ms()
-                with CONN:
-                    CONN.execute("""
+                with conn:
+                    conn.execute("""
                         INSERT INTO profiles(room_id, sender_id, ciphertext, updated_ts)
                         VALUES (?,?,?,?)
                         ON CONFLICT(room_id, sender_id)
@@ -525,7 +526,7 @@ def ws_handler(ws):
                 if not isinstance(target, str):
                     ws.send(json.dumps({'type': 'error', 'room_id': room_id, 'error': 'bad_profile_args'}))
                     continue
-                row = CONN.execute(
+                row = conn.execute(
                     "SELECT ciphertext FROM profiles WHERE room_id=? AND sender_id=?",
                     (room_id, target)
                 ).fetchone()
@@ -547,7 +548,7 @@ def ws_handler(ws):
                     since = int(m.get('since', 0))
                 except Exception:
                     since = 0
-                cur = CONN.execute(
+                cur = conn.execute(
                     "SELECT seq, ref_seq, ts, nickname, sender_id, sig, ciphertext FROM messages "
                     "WHERE room_id=? AND ts>=? ORDER BY seq ASC",
                     (room_id, since)
@@ -619,7 +620,7 @@ def ws_handler(ws):
                 except Exception:
                     ts = now_ms()
 
-                seq = insert_message_with_seq(room_id, ts, nickname, sender_id, sig, ciphertext)
+                seq = insert_message_with_seq(conn, room_id, ts, nickname, sender_id, sig, ciphertext)
 
                 if seq is None:
                   # Replay (same ciphertext) → ignore silently (or send a soft notice)
@@ -641,7 +642,7 @@ def ws_handler(ws):
 
                 # Trigger web-push (no plaintext)
                 try:
-                    trigger_push(room_id, ts, nickname)
+                    trigger_push(conn, room_id, ts, nickname)
                 except Exception as e:
                     LOG("Exception on trigger_push:",type(e),e)
                     pass
@@ -703,7 +704,7 @@ def ws_handler(ws):
                     continue
 
                 # Load original owner at ref_seq (must exist and match sender)
-                orig = CONN.execute(
+                orig = conn.execute(
                     "SELECT sender_id FROM messages WHERE room_id=? AND seq=?",
                     (room_id, ref_seq)
                 ).fetchone()
@@ -720,9 +721,9 @@ def ws_handler(ws):
                 # 1) overwrite original row with tombstone (keep ts; update ciphertext + sig)
                 # 2) insert a control record as a new message (delete_ct)
                 try:
-                    with CONN:
+                    with conn:
                         # 1) Replace original row's ciphertext and sig
-                        CONN.execute(
+                        conn.execute(
                             "UPDATE messages SET ciphertext=?, sig=? WHERE room_id=? AND seq=?",
                             (tomb_ct, tomb_sig, room_id, ref_seq)
                         )
@@ -733,7 +734,7 @@ def ws_handler(ws):
                         except Exception:
                             ts = now_ms()
 
-                        seq_ctl = insert_message_with_seq(
+                        seq_ctl = insert_message_with_seq(conn,
                             room_id, ts,
                             nickname=None,            # optional: you could carry nickname if you want
                             sender_id=sender_id,
@@ -773,8 +774,8 @@ def ws_handler(ws):
                 if not endpoint or 'keys' not in sub or not vapid_prv:
                     ws.send(json.dumps({"type": "error", "error": "bad subscription payload"}))
                     continue
-                with CONN:
-                    CONN.execute(
+                with conn:
+                    conn.execute(
                         "INSERT OR REPLACE INTO push_subscriptions(room_id, endpoint, subscription_json, vapid_private_key, created_at) VALUES(?, ?, ?, ?, ?)",
                         (room_id, endpoint, json.dumps(sub), vapid_prv, now_ms())
                     )
@@ -785,8 +786,8 @@ def ws_handler(ws):
                 if not endpoint:
                     ws.send(json.dumps({"type": "error", "error": "endpoint required"}))
                     continue
-                with CONN:
-                    CONN.execute("DELETE FROM push_subscriptions WHERE room_id=? AND endpoint=?", (room_id, endpoint))
+                with conn:
+                    conn.execute("DELETE FROM push_subscriptions WHERE room_id=? AND endpoint=?", (room_id, endpoint))
                 ws.send(json.dumps({"type": "push_unsubscribed", "endpoint": endpoint}))
 
             # ---------- WebRTC signaling ----------
@@ -848,6 +849,7 @@ def ws_handler(ws):
 
     except Exception as e:
         LOG("WS error", str(e))
+        print(traceback.format_exc())
     finally:
         # remove any invites registered by this ws
         for h, (w, _exp) in list(INVITE_WAIT.items()):
