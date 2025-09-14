@@ -2287,9 +2287,9 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
   if (prev >= -1 && m.seq > prev + 1) {
     //await putGapRecord({ serverUrl, roomId, ts: tsVal, fromSeq: prev, toSeq: seqVal });
     const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
-    if (isActive) renderGapBubble(seqVal - prev - 1);
+    if (isActive) renderGapBubble(m.seq - prev - 1);
   }
-  lastSeqSeen.set(rKey, seqVal);
+  lastSeqSeen.set(rKey, m.seq);
 
   // Try to parse control/file messages
   try {
@@ -2300,12 +2300,12 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
       const meta = { ...obj, room_id: roomId };
       await msgPut({
         id, roomKey: rKey, roomId, serverUrl,
-        ts: tsVal, seq: seqVal, nickname: m.nickname,
+        ts: tsVal, seq: m.seq, nickname: m.nickname,
         senderId: m.sender_id, verified, kind: 'file', meta
       });
       const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
       if (isActive) {
-        const rec = { id, roomId, serverUrl, kind:'file', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, meta };
+        const rec = { id, roomId, serverUrl, kind:'file', ts: tsVal, seq: m.seq, nickname:m.nickname, senderId:m.sender_id, verified, meta };
         renderSegment([rec], { placement:'append', computeGaps:true, persistGaps:true });
       }
       return;
@@ -2346,14 +2346,14 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
   // TEXT
   await msgPut({
     id, roomKey: rKey, roomId, serverUrl,
-    ts: tsVal, seq: seqVal,
+    ts: tsVal, seq: m.seq,
     nickname: m.nickname, senderId: m.sender_id,
     verified, kind: 'text', text: pt
   });
 
   const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
   if (isActive) {
-    const rec = { id, roomId, serverUrl, kind:'text', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, text: pt };
+    const rec = { id, roomId, serverUrl, kind:'text', ts: tsVal, seq: m.seq, nickname:m.nickname, senderId:m.sender_id, verified, text: pt };
     renderSegment([rec], { placement:'append', computeGaps:true, persistGaps:true });
   }
 }
