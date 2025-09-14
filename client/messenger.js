@@ -3089,17 +3089,17 @@ async function generateJoinAnswer(){
   catch {}
 }
 
-// yam-v1:<host[:port]>:<pk_b64u>
+// yam-v1&<host[:port]>&<pk_b64u>
 function encodeInviteCode(host, pkB64u){
-  return `yam-v1:${host}:${pkB64u}`;
+  return `yam-v1&${host}&${pkB64u}`;
 }
 
 async function parseInviteCode(raw) {
   const s = (raw || '').trim();
-  const prefix = 'yam-v1:';
-  if (!s.toLowerCase().startsWith(prefix)) throw new Error('Code must start with yam-v1:');
+  const prefix = 'yam-v1&';
+  if (!s.toLowerCase().startsWith(prefix)) throw new Error('Code must start with yam-v1&');
   const rest = s.slice(prefix.length);
-  const i = rest.indexOf(':');
+  const i = rest.indexOf('&');
   if (i < 0) throw new Error('Missing server or key.');
   const serverPart = rest.slice(0, i).trim();
   const keyPart    = rest.slice(i + 1).trim();
@@ -3192,7 +3192,7 @@ async function deliverInvite() {
 
   // Enforce relay match to avoid accidental cross-server delivery
   const expected = normServer(room.server);
-  if (parsed.server !== expected) {
+  if (parsed.server.replace(/(^\w+:|^)\/\//, '') !== expected.replace(/(^\w+:|^)\/\//, '')) {
     alert(`Server mismatch.\nCode is for: ${parsed.server}\nCurrent room uses: ${expected}`);
     return;
   }
