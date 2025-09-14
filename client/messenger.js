@@ -1,6 +1,16 @@
 import {b64u, fromB64u, blobToU8, blobToB64u, sha256_b64u, sha256_b64u_string, sha256_b64u_bytes, utf8ToBytes, bytesToUtf8, normServer, dataUrlFromBlob, nowMs, sevenDaysAgoMs, hostFromUrl, shortId, sanitizeColorHex, pickTextColorOn,urlBase64ToUint8Array, b64uToBytes, bytesToB64u} from './utils.js';
 import {loadSettings, saveSettings} from './settings.js';
 
+const PROD_SERVER =  'https://rartino.pythonanywhere.com'
+const DEV_SERVER =  'http://localhost:5000'
+
+///////////////////////////////////////
+
+const isLocalHost = typeof window !== 'undefined'
+  && /^(localhost|127(?:\.\d{1,3}){3}|\[?::1\]?)$/.test(window.location.hostname);
+
+export const home_server_url = isLocalHost ? DEV_SERVER : PROD_SERVER;
+
 async function ensureSodium() { await sodium.ready; }
 
 //////////////////////////////
@@ -716,7 +726,7 @@ function renderRoomMenu(){
 
 function openCreateRoomDialog(){
   cr.name.value = '';
-  cr.server.value = rooms[0]?.server || 'https://rartino.pythonanywhere.com';
+  cr.server.value = rooms[0]?.server || home_server_url;
   cr.dlg.showModal();
 }
 
@@ -2296,6 +2306,10 @@ async function handleIncoming(serverUrl, m, fromHistory = false) {
         ts: tsVal, seq: seqVal, nickname: m.nickname,
         senderId: m.sender_id, verified, kind: 'file', meta
       });
+      if (!fromHistory) {
+        try { saveContextLine(roomId, m.sender_id, '[image]', m.ts); } catch(e) {}
+        try { updatePullState(roomId, m.ts); } catch(e) {}
+      }
       const isActive = VL && VL.serverUrl === serverUrl && VL.roomId === roomId && !fromHistory;
       if (isActive) {
         const rec = { id, roomId, serverUrl, kind:'file', ts: tsVal, seq: seqVal, nickname:m.nickname, senderId:m.sender_id, verified, meta };
@@ -2778,12 +2792,25 @@ function connect(sc) {
       scheduleProfileRetry(sc.url, m.room_id, m.sender_id);
 
     } else if (m.type === 'history') {
+
+      const lastRead = getLastReadTs(currentRoomId);
+      let firstUnseen = null;
+
       const serverUrl = sc.url;
       const rid = m.room_id;
 
       for (const item of (m.messages || [])) {
+        if (!firstUnseen && typeof item.ts === 'number' && item.ts > lastRead) firstUnseen = item;
 	// No DOM writes here; fromHistory=true
 	await handleIncoming(serverUrl, item, true);
+      }
+
+      // If app not visible and we have an unseen item, ask SW to show ONE pull notification (if none exists yet)
+      if (document.visibilityState !== 'visible' && firstUnseen && !(await hasPullNotification(currentRoomId))) {
+        const preview = decryptToString(firstUnseen.ciphertext).slice(0, 160);
+        if (preview && preview !== '[unable to decrypt]') {
+          postToSW({ type: 'show-pull', room_id: currentRoomId, body: preview, ts: firstUnseen.ts });
+        }
       }
 
       // If this is the active room, draw (from IDB) using your normal init
@@ -2968,6 +2995,57 @@ navigator.serviceWorker.addEventListener('message', (event) => {
 });
 
 ////////////////////////////
+// PULL NOTIFICATIONS
+////////////////////////////
+
+// ---- Last-read tracking per room (used to pick "first unseen")
+function getLastReadTs(roomId){ try { return parseInt(localStorage.getItem('secmsg_lastread_'+roomId)||'0',10)||0; } catch { return 0; } }
+function setLastReadTs(roomId, ts){ try { localStorage.setItem('secmsg_lastread_'+roomId, String(ts)); } catch {} }
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible' && currentRoomId) setLastReadTs(currentRoomId, Date.now());
+});
+
+// ---- Helpers for querying existing pull notifications from the page
+function pullTag(roomId){ return `pull:${roomId}`; }
+async function hasPullNotification(roomId){
+  try {
+    const reg = await navigator.serviceWorker.ready;
+    const list = await reg.getNotifications({ tag: pullTag(roomId), includeTriggered: true });
+    return (list && list.length > 0);
+  } catch { return false; }
+}
+function postToSW(msg){
+  if (navigator.serviceWorker.controller) {
+    navigator.serviceWorker.controller.postMessage(msg);
+  } else {
+    // fallback best-effort
+    navigator.serviceWorker.ready.then(reg => reg.active && reg.active.postMessage(msg)).catch(()=>{});
+  }
+}
+
+/*async function saveContextLine(room, senderId, line, ts) {
+  try{
+    const key = profileKeyLocal(room.server, room.id, senderId);
+    const cached = profileCache.get(key);
+    if (cached) {
+      line = cached.name+": "+line;
+      if (cached.avatarHash) {
+        const blob = await idbGet(cached.avatarHash);
+      }
+    }
+    const db = await pullDbOpen();
+    const tx = db.transaction('ctx','readwrite'); const os = tx.objectStore('ctx');
+    const getReq = os.get(roomId);
+    getReq.onsuccess = ()=>{
+      const prev = Array.isArray(getReq.result) ? getReq.result : [];
+      const next = prev.concat([{ t: ts||nowMs(), s: String(line).slice(0,120) }]).slice(-2);
+      os.put(next, roomId);
+    };
+  }catch(_){}
+  }
+  */
+
+////////////////////////////
 // INVITATIONS
 ////////////////////////////
 
@@ -2996,7 +3074,7 @@ async function openJoinDialog(){
   await ensureSodium();
 
   // Prefill server
-  join.server.value = rooms[0]?.server || 'https://rartino.pythonanywhere.com';
+  join.server.value = rooms[0]?.server || home_server_url;
 
   // Generate fresh Curve25519 pair and code
   const kp = sodium.crypto_box_keypair();
@@ -3082,15 +3160,15 @@ async function generateJoinAnswer(){
 
 // yam-v1:<host[:port]>:<pk_b64u>
 function encodeInviteCode(host, pkB64u){
-  return `yam-v1:${host}:${pkB64u}`;
+  return `yam-v1&${host}&${pkB64u}`;
 }
 
 async function parseInviteCode(raw) {
   const s = (raw || '').trim();
-  const prefix = 'yam-v1:';
-  if (!s.toLowerCase().startsWith(prefix)) throw new Error('Code must start with yam-v1:');
+  const prefix = 'yam-v1&';
+  if (!s.toLowerCase().startsWith(prefix)) throw new Error('Code must start with yam-v1&');
   const rest = s.slice(prefix.length);
-  const i = rest.indexOf(':');
+  const i = rest.indexOf('&');
   if (i < 0) throw new Error('Missing server or key.');
   const serverPart = rest.slice(0, i).trim();
   const keyPart    = rest.slice(i + 1).trim();
@@ -3183,7 +3261,7 @@ async function deliverInvite() {
 
   // Enforce relay match to avoid accidental cross-server delivery
   const expected = normServer(room.server);
-  if (parsed.server !== expected) {
+  if (parsed.server.replace(/(^\w+:|^)\/\//, '') !== expected.replace(/(^\w+:|^)\/\//, '')) {
     alert(`Server mismatch.\nCode is for: ${parsed.server}\nCurrent room uses: ${expected}`);
     return;
   }

@@ -197,3 +197,65 @@ self.addEventListener('notificationclick', event => {
     await self.clients.openWindow(targetUrl);
   })());
 });
+
+// ======== PULL NOTIFICATIONS (Periodic Background Sync) ========
+function pullTag(roomId){ return `pull:${roomId||'__'}`; }
+
+self.addEventListener('message', (event) => {
+  const data = event.data || {};
+  if (data.type !== 'show-pull' || !data.room_id) return;
+  const tag = pullTag(data.room_id);
+  event.waitUntil((async () => {
+    const existing = await self.registration.getNotifications({ tag, includeTriggered: true });
+    if (existing && existing.length) return;
+    const ts = data.ts || Date.now();
+    await self.registration.showNotification('Yam', {
+      body: data.body || 'New message',
+      tag,
+      data: { url: `/?room=${encodeURIComponent(data.room_id)}`, room_id: data.room_id, ts },
+      icon: './android-chrome-192x192.png',
+      badge: './android-chrome-192x192.png',
+      timestamp: ts
+    });
+  })());
+});
+
+self.addEventListener('periodicsync', (event) => {
+  // Expect tags like "pull:<roomId>" — must match the page's registration.
+  if (!event.tag || !event.tag.startsWith('pull:')) return;
+  const roomId = event.tag.slice('pull:'.length);
+  event.waitUntil((async () => {
+    const tag = pullTag(roomId);
+    // If a pull notification for this room is already up, don't re-trigger.
+    const existing = await self.registration.getNotifications({ tag, includeTriggered: true });
+    if (existing && existing.length) return;
+
+    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    if (clients.length) {
+      // Nudge any open page to fetch with WS 'history' and decide the first unseen.
+      clients.forEach(c => c.postMessage({ type: 'pull-tick', room_id: roomId }));
+      // Optional: lightweight engagement signal
+      try { if (self.registration.setAppBadge) await self.registration.setAppBadge(); } catch(e){}
+      return;
+    }
+    // No page is open. We cannot decrypt, so (optional) show a generic nudge.
+    // If you want *no* notification in this case, delete the block below.
+    await self.registration.showNotification('Secure Messenger', {
+      body: 'Open to sync new messages',
+      tag,
+      data: { url: `/?room=${encodeURIComponent(roomId)}`, room_id: roomId, ts: Date.now() },
+      icon: './android-chrome-192x192.png',
+      badge: './android-chrome-192x192.png'
+    });
+  })());
+});
+
+// Optional: let pages know a pull notification was dismissed
+self.addEventListener('notificationclose', (event) => {
+  const rid = event.notification?.data?.room_id;
+  if (!rid) return;
+  event.waitUntil((async () => {
+    const clients = await self.clients.matchAll({ type: 'window', includeUncontrolled: true });
+    clients.forEach(c => c.postMessage({ type: 'pull-closed', room_id: rid }));
+  })());
+});
